@@ -2,19 +2,20 @@ import os
 DATA_PATH = os.environ.get("DATA_PATH", "/tmp/data")
 
 import sys
-# CatBoost and optuna are installed in user site-packages; add to path for the venv Python
 sys.path.insert(0, '/home/flyte/.local/lib/python3.13/site-packages')
 
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score
+from sklearn.preprocessing import LabelEncoder
 from catboost import CatBoostClassifier
+import lightgbm as lgb
+from xgboost import XGBClassifier
 import optuna
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 df = pd.read_parquet(DATA_PATH)
-
 target_col = "Survived"
 X = df.drop(columns=[target_col])
 y = df[target_col].values
@@ -23,55 +24,48 @@ print(f"[DATA] Samples: {len(df)}, Classes: {np.unique(y)}, "
       f"Distribution: {{0: {(y==0).sum()}, 1: {(y==1).sum()}}}")
 
 # ── Feature engineering ──────────────────────────────────────────────────────
-
 def extract_features(X):
-    """Feature engineering — core set + carefully selected additions."""
     X = X.copy()
 
-    # Title from Name
     if 'Name' in X.columns:
         X['Title'] = X['Name'].str.extract(r' ([A-Za-z]+)\.', expand=False)
         rare = {'Dr', 'Rev', 'Col', 'Major', 'Mlle', 'Countess', 'Capt',
                 'Ms', 'Sir', 'Jonkheer', 'Lady', 'Mme', 'Don', 'Dona'}
         X['Title'] = X['Title'].apply(lambda t: 'Rare' if t in rare else t)
         X['Title'] = X['Title'].fillna('Unknown')
+        # Extract surname for family group detection (family across different tickets)
+        X['Surname'] = X['Name'].str.split(',').str[0].str.strip()
         X = X.drop(columns=['Name'])
 
-    # Deck from Cabin + missingness indicator
     if 'Cabin' in X.columns:
         X['Cabin_missing'] = X['Cabin'].isnull().astype(int)
         X['Deck'] = X['Cabin'].str[0].fillna('Unknown')
+        # Number of cabin assignments — proxy for wealth/class
+        X['NumCabins'] = X['Cabin'].fillna('').apply(
+            lambda c: len(c.split()) if c else 0)
         X = X.drop(columns=['Cabin'])
 
-    # Drop PassengerId
     if 'PassengerId' in X.columns:
         X = X.drop(columns=['PassengerId'])
 
-    # Ticket group size: number of passengers sharing same ticket
-    # (correlates with travelling group — groups had coordination advantage)
     if 'Ticket' in X.columns:
         ticket_counts = X['Ticket'].map(X['Ticket'].value_counts())
         X['TicketGroup'] = ticket_counts.fillna(1).astype(int)
         X = X.drop(columns=['Ticket'])
 
-    # Age missingness indicator
     if 'Age' in X.columns:
         X['Age_missing'] = X['Age'].isnull().astype(int)
 
-    # Family size features
     if 'SibSp' in X.columns and 'Parch' in X.columns:
         X['FamilySize'] = X['SibSp'] + X['Parch'] + 1
         X['IsAlone'] = (X['FamilySize'] == 1).astype(int)
 
-    # Log-Fare
     if 'Fare' in X.columns:
         X['Fare_log'] = np.log1p(X['Fare'].fillna(0))
-        # Fare per person in ticket group (corrects for shared ticket fares)
         if 'TicketGroup' in X.columns:
             X['Fare_per_person'] = X['Fare'].fillna(0) / X['TicketGroup'].clip(lower=1)
             X['Fare_per_person_log'] = np.log1p(X['Fare_per_person'])
 
-    # Sex × Pclass interaction (most discriminative combination for Titanic)
     if 'Sex' in X.columns and 'Pclass' in X.columns:
         X['Sex_Pclass'] = X['Sex'].astype(str) + '_' + X['Pclass'].astype(str)
 
@@ -80,36 +74,70 @@ def extract_features(X):
 
 X_fe = extract_features(X)
 
-# ── Imputation (on full data before OOF split) ───────────────────────────────
+# ── Imputation ───────────────────────────────────────────────────────────────
 for col in ['Age', 'Fare']:
     if col in X_fe.columns:
-        med = X_fe[col].median()
-        X_fe[col] = X_fe[col].fillna(med)
+        X_fe[col] = X_fe[col].fillna(X_fe[col].median())
 
 for col in ['Embarked']:
     if col in X_fe.columns:
-        mode_val = X_fe[col].mode()[0]
-        X_fe[col] = X_fe[col].fillna(mode_val)
+        X_fe[col] = X_fe[col].fillna(X_fe[col].mode()[0])
 
-# WomanOrChild: "women and children first" — the actual rescue priority rule
-# Computed after Age imputation so no NaN
+# ── Post-imputation features ─────────────────────────────────────────────────
 if 'Age' in X_fe.columns and 'Sex' in X_fe.columns:
-    X_fe['WomanOrChild'] = ((X_fe['Sex'] == 'female') | (X_fe['Age'] < 15)).astype(int)
+    X_fe['WomanOrChild'] = (
+        (X_fe['Sex'] == 'female') | (X_fe['Age'] < 15)).astype(int)
+    X_fe['IsChild'] = (X_fe['Age'] < 15).astype(int)
+    X_fe['AgeBin'] = pd.cut(
+        X_fe['Age'], bins=[0, 12, 18, 35, 60, 100],
+        labels=['child', 'teen', 'adult', 'middle', 'senior']
+    ).astype(str)
 
-# Ensure all categorical columns are strings (CatBoost requirement)
-cat_cols = ['Sex', 'Embarked', 'Title', 'Deck', 'Sex_Pclass']
-cat_cols = [c for c in cat_cols if c in X_fe.columns]
-for col in cat_cols:
+# IsMother: female adult with children on board, not unmarried
+if ('Sex' in X_fe.columns and 'Parch' in X_fe.columns
+        and 'Age' in X_fe.columns and 'Title' in X_fe.columns):
+    X_fe['IsMother'] = (
+        (X_fe['Sex'] == 'female') &
+        (X_fe['Parch'] > 0) &
+        (X_fe['Age'] > 18) &
+        (X_fe['Title'] != 'Miss')
+    ).astype(int)
+
+# Surname group size (family members on different ticket numbers)
+if 'Surname' in X_fe.columns:
+    X_fe['SurnameGroup'] = X_fe['Surname'].map(
+        X_fe['Surname'].value_counts()).fillna(1).astype(int)
+    X_fe = X_fe.drop(columns=['Surname'])
+
+# FamilySizeGroup: categorical grouping of family size
+if 'FamilySize' in X_fe.columns:
+    X_fe['FamilySizeGroup'] = np.select(
+        [X_fe['FamilySize'] == 1, X_fe['FamilySize'] <= 4],
+        ['alone', 'small'], default='large')
+
+# ── Categorical columns (CatBoost handles natively) ──────────────────────────
+cat_cols_cb = ['Sex', 'Embarked', 'Title', 'Deck', 'Sex_Pclass',
+               'AgeBin', 'FamilySizeGroup']
+cat_cols_cb = [c for c in cat_cols_cb if c in X_fe.columns]
+for col in cat_cols_cb:
     X_fe[col] = X_fe[col].astype(str).fillna('Unknown')
 
 print(f"[FE] Features ({len(X_fe.columns)}): {list(X_fe.columns)}")
-print(f"[FE] Categorical: {cat_cols}")
+print(f"[FE] CatBoost categoricals: {cat_cols_cb}")
 
-# ── Optuna hyperparameter search ─────────────────────────────────────────────
+# ── Label-encode categoricals for LightGBM / XGBoost ─────────────────────────
+X_fe_lgb = X_fe.copy()
+for col in cat_cols_cb:
+    le = LabelEncoder()
+    X_fe_lgb[col] = le.fit_transform(X_fe_lgb[col].astype(str))
 
+# ── Cross-validation setup ────────────────────────────────────────────────────
 skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
-def objective(trial):
+# ============================================================
+# 1. CatBoost Optuna HPO
+# ============================================================
+def cb_objective(trial):
     params = dict(
         iterations=3000,
         learning_rate=trial.suggest_float('learning_rate', 0.02, 0.15, log=True),
@@ -119,7 +147,7 @@ def objective(trial):
         bagging_temperature=trial.suggest_float('bagging_temperature', 0.0, 2.0),
         border_count=trial.suggest_int('border_count', 32, 128),
         min_data_in_leaf=trial.suggest_int('min_data_in_leaf', 1, 20),
-        cat_features=cat_cols,
+        cat_features=cat_cols_cb,
         eval_metric='AUC',
         early_stopping_rounds=150,
         use_best_model=True,
@@ -127,61 +155,206 @@ def objective(trial):
         verbose=False,
         train_dir='/tmp/catboost_info',
     )
-
     oof = np.zeros(len(y))
     for tr_idx, va_idx in skf.split(X_fe, y):
-        X_tr = X_fe.iloc[tr_idx].reset_index(drop=True)
-        X_va = X_fe.iloc[va_idx].reset_index(drop=True)
-        y_tr = y[tr_idx]
-        y_va = y[va_idx]
         m = CatBoostClassifier(**params)
-        m.fit(X_tr, y_tr, eval_set=(X_va, y_va))
-        oof[va_idx] = m.predict_proba(X_va)[:, 1]
+        m.fit(X_fe.iloc[tr_idx].reset_index(drop=True), y[tr_idx],
+              eval_set=(X_fe.iloc[va_idx].reset_index(drop=True), y[va_idx]))
+        oof[va_idx] = m.predict_proba(
+            X_fe.iloc[va_idx].reset_index(drop=True))[:, 1]
     return roc_auc_score(y, oof)
 
-print("[HPO] Running Optuna search (50 trials) ...")
-study = optuna.create_study(direction='maximize',
-                             sampler=optuna.samplers.TPESampler(seed=42))
-study.optimize(objective, n_trials=50, show_progress_bar=False)
+print("[HPO] CatBoost (40 trials) ...")
+study_cb = optuna.create_study(
+    direction='maximize', sampler=optuna.samplers.TPESampler(seed=42))
+study_cb.optimize(cb_objective, n_trials=40, show_progress_bar=False)
+best_cb = study_cb.best_params
+print(f"[HPO] CatBoost best AUC={study_cb.best_value:.4f}")
 
-best_params = study.best_params
-print(f"[HPO] Best trial AUC: {study.best_value:.4f}")
-print(f"[HPO] Best params: {best_params}")
+# ============================================================
+# 2. LightGBM Optuna HPO
+# ============================================================
+def lgb_objective(trial):
+    params = dict(
+        n_estimators=3000,
+        learning_rate=trial.suggest_float('learning_rate', 0.02, 0.15, log=True),
+        num_leaves=trial.suggest_int('num_leaves', 15, 63),
+        max_depth=trial.suggest_int('max_depth', 3, 8),
+        min_child_samples=trial.suggest_int('min_child_samples', 5, 50),
+        subsample=trial.suggest_float('subsample', 0.6, 1.0),
+        colsample_bytree=trial.suggest_float('colsample_bytree', 0.5, 1.0),
+        reg_alpha=trial.suggest_float('reg_alpha', 1e-4, 10.0, log=True),
+        reg_lambda=trial.suggest_float('reg_lambda', 1e-4, 10.0, log=True),
+        random_state=42,
+        n_jobs=1,
+        verbose=-1,
+    )
+    oof = np.zeros(len(y))
+    for tr_idx, va_idx in skf.split(X_fe_lgb, y):
+        m = lgb.LGBMClassifier(**params)
+        m.fit(X_fe_lgb.iloc[tr_idx], y[tr_idx],
+              eval_set=[(X_fe_lgb.iloc[va_idx], y[va_idx])],
+              callbacks=[lgb.early_stopping(100, verbose=False),
+                         lgb.log_evaluation(-1)])
+        oof[va_idx] = m.predict_proba(X_fe_lgb.iloc[va_idx])[:, 1]
+    return roc_auc_score(y, oof)
 
-# ── Final evaluation with best params ────────────────────────────────────────
+print("[HPO] LightGBM (30 trials) ...")
+study_lgb = optuna.create_study(
+    direction='maximize', sampler=optuna.samplers.TPESampler(seed=123))
+study_lgb.optimize(lgb_objective, n_trials=30, show_progress_bar=False)
+best_lgb = study_lgb.best_params
+print(f"[HPO] LightGBM best AUC={study_lgb.best_value:.4f}")
 
-final_params = dict(
+# ============================================================
+# 3. XGBoost Optuna HPO
+# ============================================================
+def xgb_objective(trial):
+    params = dict(
+        n_estimators=3000,
+        learning_rate=trial.suggest_float('learning_rate', 0.02, 0.15, log=True),
+        max_depth=trial.suggest_int('max_depth', 3, 8),
+        min_child_weight=trial.suggest_int('min_child_weight', 1, 10),
+        subsample=trial.suggest_float('subsample', 0.6, 1.0),
+        colsample_bytree=trial.suggest_float('colsample_bytree', 0.5, 1.0),
+        reg_alpha=trial.suggest_float('reg_alpha', 1e-4, 10.0, log=True),
+        reg_lambda=trial.suggest_float('reg_lambda', 1e-4, 10.0, log=True),
+        gamma=trial.suggest_float('gamma', 0.0, 1.0),
+        eval_metric='auc',
+        early_stopping_rounds=100,
+        random_state=42,
+        n_jobs=1,
+        verbosity=0,
+    )
+    oof = np.zeros(len(y))
+    for tr_idx, va_idx in skf.split(X_fe_lgb, y):
+        m = XGBClassifier(**params)
+        m.fit(X_fe_lgb.iloc[tr_idx], y[tr_idx],
+              eval_set=[(X_fe_lgb.iloc[va_idx], y[va_idx])],
+              verbose=False)
+        oof[va_idx] = m.predict_proba(X_fe_lgb.iloc[va_idx])[:, 1]
+    return roc_auc_score(y, oof)
+
+print("[HPO] XGBoost (20 trials) ...")
+study_xgb = optuna.create_study(
+    direction='maximize', sampler=optuna.samplers.TPESampler(seed=456))
+study_xgb.optimize(xgb_objective, n_trials=20, show_progress_bar=False)
+best_xgb = study_xgb.best_params
+print(f"[HPO] XGBoost best AUC={study_xgb.best_value:.4f}")
+
+# ============================================================
+# Final OOF: CatBoost
+# ============================================================
+final_cb = dict(
     iterations=3000,
-    cat_features=cat_cols,
+    cat_features=cat_cols_cb,
     eval_metric='AUC',
     early_stopping_rounds=150,
     use_best_model=True,
-    random_seed=42,
     verbose=False,
     train_dir='/tmp/catboost_info',
-    **best_params,
 )
+final_cb.update(best_cb)
 
-oof_preds = np.zeros(len(y))
-fold_aucs = []
-
+oof_cb = np.zeros(len(y))
+fold_aucs_cb = []
 for fold, (tr_idx, va_idx) in enumerate(skf.split(X_fe, y)):
-    X_tr = X_fe.iloc[tr_idx].reset_index(drop=True)
-    X_va = X_fe.iloc[va_idx].reset_index(drop=True)
-    y_tr = y[tr_idx]
-    y_va = y[va_idx]
+    m = CatBoostClassifier(random_seed=42 + fold,
+                           **{k: v for k, v in final_cb.items()
+                              if k != 'random_seed'})
+    m.fit(X_fe.iloc[tr_idx].reset_index(drop=True), y[tr_idx],
+          eval_set=(X_fe.iloc[va_idx].reset_index(drop=True), y[va_idx]))
+    oof_cb[va_idx] = m.predict_proba(
+        X_fe.iloc[va_idx].reset_index(drop=True))[:, 1]
+    fa = roc_auc_score(y[va_idx], oof_cb[va_idx])
+    fold_aucs_cb.append(fa)
+    print(f"  CB F{fold+1}: {fa:.4f} (iter={m.best_iteration_})")
 
-    model = CatBoostClassifier(random_seed=42 + fold, **{k: v for k, v in final_params.items()
-                                                          if k != 'random_seed'})
-    model.fit(X_tr, y_tr, eval_set=(X_va, y_va))
+cb_auc = roc_auc_score(y, oof_cb)
+print(f"[CV] CatBoost OOF AUC: {cb_auc:.6f} "
+      f"(mean={np.mean(fold_aucs_cb):.4f}±{np.std(fold_aucs_cb):.4f})")
 
-    oof_preds[va_idx] = model.predict_proba(X_va)[:, 1]
-    fold_auc = roc_auc_score(y_va, oof_preds[va_idx])
-    fold_aucs.append(fold_auc)
-    print(f"  Fold {fold+1}/5 — AUC: {fold_auc:.4f}, best_iter: {model.best_iteration_}")
+# ============================================================
+# Final OOF: LightGBM
+# ============================================================
+final_lgb = dict(n_estimators=3000, random_state=42, n_jobs=1, verbose=-1)
+final_lgb.update(best_lgb)
 
-oof_auc = roc_auc_score(y, oof_preds)
-print(f"[CV] Mean fold AUC: {np.mean(fold_aucs):.4f} ± {np.std(fold_aucs):.4f}")
-print(f"[RESULT] OOF ROC-AUC (all {len(y)} samples): {oof_auc:.6f}")
+oof_lgb = np.zeros(len(y))
+fold_aucs_lgb = []
+for fold, (tr_idx, va_idx) in enumerate(skf.split(X_fe_lgb, y)):
+    m = lgb.LGBMClassifier(**final_lgb)
+    m.fit(X_fe_lgb.iloc[tr_idx], y[tr_idx],
+          eval_set=[(X_fe_lgb.iloc[va_idx], y[va_idx])],
+          callbacks=[lgb.early_stopping(100, verbose=False),
+                     lgb.log_evaluation(-1)])
+    oof_lgb[va_idx] = m.predict_proba(X_fe_lgb.iloc[va_idx])[:, 1]
+    fa = roc_auc_score(y[va_idx], oof_lgb[va_idx])
+    fold_aucs_lgb.append(fa)
+    print(f"  LGB F{fold+1}: {fa:.4f}")
 
-print(f"BEST_VAL_ROC_AUC: {oof_auc:.6f}")
+lgb_auc = roc_auc_score(y, oof_lgb)
+print(f"[CV] LightGBM OOF AUC: {lgb_auc:.6f} "
+      f"(mean={np.mean(fold_aucs_lgb):.4f}±{np.std(fold_aucs_lgb):.4f})")
+
+# ============================================================
+# Final OOF: XGBoost
+# ============================================================
+final_xgb = dict(
+    n_estimators=3000, eval_metric='auc',
+    early_stopping_rounds=100,
+    random_state=42, n_jobs=1, verbosity=0)
+final_xgb.update(best_xgb)
+
+oof_xgb = np.zeros(len(y))
+fold_aucs_xgb = []
+for fold, (tr_idx, va_idx) in enumerate(skf.split(X_fe_lgb, y)):
+    m = XGBClassifier(**final_xgb)
+    m.fit(X_fe_lgb.iloc[tr_idx], y[tr_idx],
+          eval_set=[(X_fe_lgb.iloc[va_idx], y[va_idx])],
+          verbose=False)
+    oof_xgb[va_idx] = m.predict_proba(X_fe_lgb.iloc[va_idx])[:, 1]
+    fa = roc_auc_score(y[va_idx], oof_xgb[va_idx])
+    fold_aucs_xgb.append(fa)
+    print(f"  XGB F{fold+1}: {fa:.4f}")
+
+xgb_auc = roc_auc_score(y, oof_xgb)
+print(f"[CV] XGBoost OOF AUC: {xgb_auc:.6f} "
+      f"(mean={np.mean(fold_aucs_xgb):.4f}±{np.std(fold_aucs_xgb):.4f})")
+
+# ============================================================
+# Optimise blend weights via Optuna on OOF predictions
+# (OOF are true hold-outs — no leakage)
+# ============================================================
+def blend_objective(trial):
+    w1 = trial.suggest_float('w_cb', 0.0, 1.0)
+    w2 = trial.suggest_float('w_lgb', 0.0, 1.0)
+    w3 = trial.suggest_float('w_xgb', 0.0, 1.0)
+    total = w1 + w2 + w3 + 1e-9
+    blend = (w1 * oof_cb + w2 * oof_lgb + w3 * oof_xgb) / total
+    return roc_auc_score(y, blend)
+
+study_blend = optuna.create_study(
+    direction='maximize', sampler=optuna.samplers.TPESampler(seed=0))
+study_blend.optimize(blend_objective, n_trials=200, show_progress_bar=False)
+bp = study_blend.best_params
+total_w = bp['w_cb'] + bp['w_lgb'] + bp['w_xgb'] + 1e-9
+w_cb  = bp['w_cb']  / total_w
+w_lgb = bp['w_lgb'] / total_w
+w_xgb = bp['w_xgb'] / total_w
+print(f"[BLEND] CB={w_cb:.3f}  LGB={w_lgb:.3f}  XGB={w_xgb:.3f}")
+
+oof_blended = w_cb * oof_cb + w_lgb * oof_lgb + w_xgb * oof_xgb
+blended_auc = roc_auc_score(y, oof_blended)
+
+# Also check simple equal-weight blend as sanity check
+equal_auc = roc_auc_score(y, (oof_cb + oof_lgb + oof_xgb) / 3)
+
+print(f"[RESULT] CatBoost  : {cb_auc:.6f}")
+print(f"[RESULT] LightGBM  : {lgb_auc:.6f}")
+print(f"[RESULT] XGBoost   : {xgb_auc:.6f}")
+print(f"[RESULT] EqualBlend: {equal_auc:.6f}")
+print(f"[RESULT] OptBlend  : {blended_auc:.6f}")
+
+final_auc = max(blended_auc, equal_auc, cb_auc, lgb_auc, xgb_auc)
+print(f"BEST_VAL_ROC_AUC: {final_auc:.6f}")
