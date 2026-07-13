@@ -1,1 +1,2 @@
 experiment_id,description,model_name,metric_name,metric_value,improved,duration_s,commit,notes
+0,baseline: LightGBM with 5-fold stratified CV + ordinal-encoded categoricals + missingness flags — chosen because N=100 is firmly in the GBM regime (N < 10k) and CV is essential for reliable AUC at this tiny scale,,roc_auc,0.765833,true,2.5,e0ab0b0,
