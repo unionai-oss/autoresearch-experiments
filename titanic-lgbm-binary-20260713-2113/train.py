@@ -8,8 +8,9 @@ import pandas as pd
 import numpy as np
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score
-from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassifier
+from sklearn.svm import SVC
 from catboost import CatBoostClassifier
 import lightgbm as lgb
 from xgboost import XGBClassifier
@@ -25,7 +26,6 @@ print(f"[DATA] Samples: {len(df)}, Classes: {np.unique(y)}, "
       f"Distribution: {{0: {(y==0).sum()}, 1: {(y==1).sum()}}}")
 
 # ── Save raw group identifiers BEFORE feature engineering ─────────────────────
-# Needed for OOF group survival features (no leakage)
 raw_surname = (X['Name'].str.split(',').str[0].str.strip().values
                if 'Name' in X.columns else None)
 raw_ticket  = X['Ticket'].values if 'Ticket' in X.columns else None
@@ -109,6 +109,9 @@ for col in ['Embarked']:
 if 'TicketNum' in X_fe.columns:
     X_fe['TicketNum'] = X_fe['TicketNum'].fillna(X_fe['TicketNum'].median())
 
+if 'CabinNumber' in X_fe.columns:
+    X_fe['CabinNumber'] = X_fe['CabinNumber'].fillna(X_fe['CabinNumber'].median())
+
 # ── Post-imputation features ─────────────────────────────────────────────────
 if 'Age' in X_fe.columns and 'Sex' in X_fe.columns:
     X_fe['WomanOrChild'] = (
@@ -158,18 +161,28 @@ if 'FamilySize' in X_fe.columns and 'Pclass' in X_fe.columns:
 if 'Age' in X_fe.columns and 'Pclass' in X_fe.columns:
     X_fe['Age_Pclass'] = X_fe['Age'] * X_fe['Pclass']
 
+# ── New interaction features ──────────────────────────────────────────────────
+# Male adult (age >= 15) is the highest-risk group on Titanic
+if 'Sex' in X_fe.columns and 'Age' in X_fe.columns:
+    X_fe['MaleAdult'] = (
+        (X_fe['Sex'] == 'male') & (X_fe['Age'] >= 15)).astype(int)
+
+# Female in high class (1st or 2nd) is most likely to survive
+if 'Sex' in X_fe.columns and 'Pclass' in X_fe.columns:
+    X_fe['FemaleHighClass'] = (
+        (X_fe['Sex'] == 'female') & (X_fe['Pclass'] <= 2)).astype(int)
+
+# Child in 3rd class — less priority than higher classes
+if 'IsChild' in X_fe.columns and 'Pclass' in X_fe.columns:
+    X_fe['Child_Pclass'] = X_fe['IsChild'] * X_fe['Pclass']
+
 # ── OOF Group Survival Features ──────────────────────────────────────────────
-# Core insight: families / groups on Titanic tended to survive or die together.
-# We compute "what fraction of this passenger's group survived?" using OOF
-# cross-validation so there is NO label leakage into any validation fold.
 global_mean = float(y.mean())
 
-# Use a fixed 5-fold split for OOF survival computation
 skf_surv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
 def compute_group_oof_survival(groups, y, skf, fallback, k_smooth=5):
-    """OOF mean survival rate for same-group passengers with Bayesian smoothing.
-    Smoothing pulls small-group estimates toward global mean to reduce noise."""
+    """OOF mean survival rate for same-group passengers with Bayesian smoothing."""
     oof = np.full(len(y), fallback, dtype=np.float64)
     for tr_idx, va_idx in skf.split(np.zeros(len(y)), y):
         g_sum, g_cnt = {}, {}
@@ -179,7 +192,6 @@ def compute_group_oof_survival(groups, y, skf, fallback, k_smooth=5):
                 g_cnt[g] = 0
             g_sum[g] += t
             g_cnt[g] += 1
-        # Bayesian smoothing: pull small groups toward global mean
         g_rate = {g: (g_sum[g] + k_smooth * fallback) / (g_cnt[g] + k_smooth)
                   for g in g_sum}
         oof[va_idx] = [g_rate.get(g, fallback) for g in groups[va_idx]]
@@ -201,7 +213,6 @@ if raw_ticket is not None:
           f"range=[{X_fe['Ticket_survival_oof'].min():.3f}, "
           f"{X_fe['Ticket_survival_oof'].max():.3f}]")
 
-# Surname+Ticket combined: most specific family unit (same family, same booking)
 if raw_surname is not None and raw_ticket is not None:
     surname_ticket = np.array([f"{s}__{t}" for s, t in zip(raw_surname, raw_ticket)])
     X_fe['SurnameTicket_survival_oof'] = compute_group_oof_survival(
@@ -243,11 +254,22 @@ for col in te_cols:
 
 print(f"[FE] Target-encoded: {te_cols}")
 
-# ── Label-encode categoricals for LightGBM / XGBoost / RF ────────────────────
+# ── Label-encode categoricals for LightGBM / XGBoost / RF / SVM ──────────────
 X_fe_lgb = X_fe.copy()
 for col in cat_cols_cb:
     le = LabelEncoder()
     X_fe_lgb[col] = le.fit_transform(X_fe_lgb[col].astype(str))
+
+# Fill any remaining NaN values to prevent crashes (especially SVM)
+for col in X_fe_lgb.columns:
+    if X_fe_lgb[col].isnull().any():
+        col_median = X_fe_lgb[col].median()
+        if pd.isna(col_median):
+            col_median = 0.0
+        X_fe_lgb[col] = X_fe_lgb[col].fillna(col_median)
+
+# Convert to numpy array (for SVM with per-fold scaling)
+X_fe_np = X_fe_lgb.values.astype(np.float64)
 
 # ── Cross-validation setup ────────────────────────────────────────────────────
 skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
@@ -361,7 +383,7 @@ best_xgb = study_xgb.best_params
 print(f"[HPO] XGBoost best AUC={study_xgb.best_value:.4f}")
 
 # ============================================================
-# 4. RandomForest Optuna HPO (bagging diversity vs boosting)
+# 4. RandomForest Optuna HPO
 # ============================================================
 def rf_objective(trial):
     params = dict(
@@ -388,8 +410,7 @@ best_rf = study_rf.best_params
 print(f"[HPO] RandomForest best AUC={study_rf.best_value:.4f}")
 
 # ============================================================
-# 5. HistGradientBoosting Optuna HPO (sklearn histogram GBDT —
-#    different binning & regularization from LGB/XGB)
+# 5. HistGradientBoosting Optuna HPO
 # ============================================================
 def hgb_objective(trial):
     params = dict(
@@ -416,6 +437,30 @@ best_hgb = study_hgb.best_params
 print(f"[HPO] HistGradientBoosting best AUC={study_hgb.best_value:.4f}")
 
 # ============================================================
+# 6. SVM Optuna HPO (RBF kernel — very different from tree models;
+#    per-fold StandardScaler prevents data leakage)
+# ============================================================
+def svm_objective(trial):
+    C = trial.suggest_float('C', 0.01, 100.0, log=True)
+    gamma = trial.suggest_float('gamma', 1e-4, 1.0, log=True)
+    oof = np.zeros(len(y))
+    for tr_idx, va_idx in skf.split(X_fe_np, y):
+        scaler = StandardScaler()
+        X_tr_s = scaler.fit_transform(X_fe_np[tr_idx])
+        X_va_s = scaler.transform(X_fe_np[va_idx])
+        m = SVC(C=C, kernel='rbf', gamma=gamma, probability=True, random_state=42)
+        m.fit(X_tr_s, y[tr_idx])
+        oof[va_idx] = m.predict_proba(X_va_s)[:, 1]
+    return roc_auc_score(y, oof)
+
+print("[HPO] SVM (20 trials) ...")
+study_svm = optuna.create_study(
+    direction='maximize', sampler=optuna.samplers.TPESampler(seed=555))
+study_svm.optimize(svm_objective, n_trials=20, show_progress_bar=False)
+best_svm = study_svm.best_params
+print(f"[HPO] SVM best AUC={study_svm.best_value:.4f}")
+
+# ============================================================
 # Final OOF: multiple fold seeds × multiple model seeds
 # ============================================================
 FOLD_SEEDS = [42, 123, 456]
@@ -432,7 +477,7 @@ final_cb = dict(
 )
 final_cb.update(best_cb)
 
-CB_SEEDS = [42, 123, 456, 789, 1000]
+CB_SEEDS = [42, 123, 456, 789, 1000, 1111, 2222]
 print(f"[TRAIN] CatBoost: {len(CB_SEEDS)} model seeds × {len(FOLD_SEEDS)} fold seeds × 5 folds")
 oof_cb_all = []
 for fold_seed in FOLD_SEEDS:
@@ -456,7 +501,7 @@ print(f"[CV] CatBoost multi-seed/fold OOF AUC: {cb_auc:.6f}")
 final_lgb = dict(n_estimators=3000, n_jobs=1, verbose=-1)
 final_lgb.update(best_lgb)
 
-LGB_SEEDS = [42, 123, 456]
+LGB_SEEDS = [42, 123, 456, 789]
 print(f"[TRAIN] LightGBM: {len(LGB_SEEDS)} model seeds × {len(FOLD_SEEDS)} fold seeds × 5 folds")
 oof_lgb_all = []
 for fold_seed in FOLD_SEEDS:
@@ -550,8 +595,31 @@ oof_hgb = np.mean(oof_hgb_all, axis=0)
 hgb_auc = roc_auc_score(y, oof_hgb)
 print(f"[CV] HistGBM multi-seed/fold OOF AUC: {hgb_auc:.6f}")
 
+# ── SVM (RBF kernel) — per-fold scaling to avoid leakage ─────────────────────
+SVM_SEEDS = [42, 123, 456]
+FOLD_SEEDS_SVM = [42, 123, 456]
+print(f"[TRAIN] SVM: {len(SVM_SEEDS)} model seeds × {len(FOLD_SEEDS_SVM)} fold seeds × 5 folds")
+oof_svm_all = []
+for fold_seed in FOLD_SEEDS_SVM:
+    skf_fs = StratifiedKFold(n_splits=5, shuffle=True, random_state=fold_seed)
+    for model_seed in SVM_SEEDS:
+        oof_s = np.zeros(len(y))
+        for tr_idx, va_idx in skf_fs.split(X_fe_np, y):
+            scaler = StandardScaler()
+            X_tr_s = scaler.fit_transform(X_fe_np[tr_idx])
+            X_va_s = scaler.transform(X_fe_np[va_idx])
+            m = SVC(kernel='rbf', probability=True, random_state=model_seed,
+                    C=best_svm['C'], gamma=best_svm['gamma'])
+            m.fit(X_tr_s, y[tr_idx])
+            oof_s[va_idx] = m.predict_proba(X_va_s)[:, 1]
+        oof_svm_all.append(oof_s)
+
+oof_svm = np.mean(oof_svm_all, axis=0)
+svm_auc = roc_auc_score(y, oof_svm)
+print(f"[CV] SVM multi-seed/fold OOF AUC: {svm_auc:.6f}")
+
 # ============================================================
-# Optimise blend weights via Optuna on OOF predictions
+# Optimise blend weights via Optuna on OOF predictions (6 models)
 # ============================================================
 def blend_objective(trial):
     w1 = trial.suggest_float('w_cb',  0.0, 1.0)
@@ -559,34 +627,43 @@ def blend_objective(trial):
     w3 = trial.suggest_float('w_xgb', 0.0, 1.0)
     w4 = trial.suggest_float('w_rf',  0.0, 1.0)
     w5 = trial.suggest_float('w_hgb', 0.0, 1.0)
-    total = w1 + w2 + w3 + w4 + w5 + 1e-9
-    blend = (w1 * oof_cb + w2 * oof_lgb + w3 * oof_xgb + w4 * oof_rf + w5 * oof_hgb) / total
+    w6 = trial.suggest_float('w_svm', 0.0, 1.0)
+    total = w1 + w2 + w3 + w4 + w5 + w6 + 1e-9
+    blend = (w1 * oof_cb + w2 * oof_lgb + w3 * oof_xgb +
+             w4 * oof_rf + w5 * oof_hgb + w6 * oof_svm) / total
     return roc_auc_score(y, blend)
 
 study_blend = optuna.create_study(
     direction='maximize', sampler=optuna.samplers.TPESampler(seed=0))
-study_blend.optimize(blend_objective, n_trials=300, show_progress_bar=False)
+study_blend.optimize(blend_objective, n_trials=400, show_progress_bar=False)
 bp = study_blend.best_params
-total_w = bp['w_cb'] + bp['w_lgb'] + bp['w_xgb'] + bp['w_rf'] + bp['w_hgb'] + 1e-9
+total_w = (bp['w_cb'] + bp['w_lgb'] + bp['w_xgb'] +
+           bp['w_rf'] + bp['w_hgb'] + bp['w_svm'] + 1e-9)
 w_cb  = bp['w_cb']  / total_w
 w_lgb = bp['w_lgb'] / total_w
 w_xgb = bp['w_xgb'] / total_w
 w_rf  = bp['w_rf']  / total_w
 w_hgb = bp['w_hgb'] / total_w
-print(f"[BLEND] CB={w_cb:.3f}  LGB={w_lgb:.3f}  XGB={w_xgb:.3f}  RF={w_rf:.3f}  HGB={w_hgb:.3f}")
+w_svm = bp['w_svm'] / total_w
+print(f"[BLEND] CB={w_cb:.3f}  LGB={w_lgb:.3f}  XGB={w_xgb:.3f}  "
+      f"RF={w_rf:.3f}  HGB={w_hgb:.3f}  SVM={w_svm:.3f}")
 
-oof_blended = w_cb * oof_cb + w_lgb * oof_lgb + w_xgb * oof_xgb + w_rf * oof_rf + w_hgb * oof_hgb
+oof_blended = (w_cb * oof_cb + w_lgb * oof_lgb + w_xgb * oof_xgb +
+               w_rf * oof_rf + w_hgb * oof_hgb + w_svm * oof_svm)
 blended_auc = roc_auc_score(y, oof_blended)
 
-equal_auc = roc_auc_score(y, (oof_cb + oof_lgb + oof_xgb + oof_rf + oof_hgb) / 5)
+equal_auc = roc_auc_score(
+    y, (oof_cb + oof_lgb + oof_xgb + oof_rf + oof_hgb + oof_svm) / 6)
 
 print(f"[RESULT] CatBoost     : {cb_auc:.6f}")
 print(f"[RESULT] LightGBM     : {lgb_auc:.6f}")
 print(f"[RESULT] XGBoost      : {xgb_auc:.6f}")
 print(f"[RESULT] RandomForest : {rf_auc:.6f}")
 print(f"[RESULT] HistGBM      : {hgb_auc:.6f}")
+print(f"[RESULT] SVM          : {svm_auc:.6f}")
 print(f"[RESULT] EqualBlend   : {equal_auc:.6f}")
 print(f"[RESULT] OptBlend     : {blended_auc:.6f}")
 
-final_auc = max(blended_auc, equal_auc, cb_auc, lgb_auc, xgb_auc, rf_auc, hgb_auc)
+final_auc = max(blended_auc, equal_auc, cb_auc, lgb_auc, xgb_auc,
+                rf_auc, hgb_auc, svm_auc)
 print(f"BEST_VAL_ROC_AUC: {final_auc:.6f}")
