@@ -9,7 +9,7 @@ import numpy as np
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score
 from sklearn.preprocessing import LabelEncoder
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import RandomForestClassifier, HistGradientBoostingClassifier
 from catboost import CatBoostClassifier
 import lightgbm as lgb
 from xgboost import XGBClassifier
@@ -49,6 +49,7 @@ def extract_features(X):
         X['Deck'] = X['Cabin'].str[0].fillna('Unknown')
         X['NumCabins'] = X['Cabin'].fillna('').apply(
             lambda c: len(c.split()) if c else 0)
+        X['CabinNumber'] = X['Cabin'].str.extract(r'(\d+)', expand=False).astype(float)
         X = X.drop(columns=['Cabin'])
 
     if 'PassengerId' in X.columns:
@@ -166,8 +167,9 @@ global_mean = float(y.mean())
 # Use a fixed 5-fold split for OOF survival computation
 skf_surv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
-def compute_group_oof_survival(groups, y, skf, fallback):
-    """OOF mean survival rate for same-group passengers (train folds only)."""
+def compute_group_oof_survival(groups, y, skf, fallback, k_smooth=5):
+    """OOF mean survival rate for same-group passengers with Bayesian smoothing.
+    Smoothing pulls small-group estimates toward global mean to reduce noise."""
     oof = np.full(len(y), fallback, dtype=np.float64)
     for tr_idx, va_idx in skf.split(np.zeros(len(y)), y):
         g_sum, g_cnt = {}, {}
@@ -177,7 +179,9 @@ def compute_group_oof_survival(groups, y, skf, fallback):
                 g_cnt[g] = 0
             g_sum[g] += t
             g_cnt[g] += 1
-        g_rate = {g: g_sum[g] / g_cnt[g] for g in g_sum}
+        # Bayesian smoothing: pull small groups toward global mean
+        g_rate = {g: (g_sum[g] + k_smooth * fallback) / (g_cnt[g] + k_smooth)
+                  for g in g_sum}
         oof[va_idx] = [g_rate.get(g, fallback) for g in groups[va_idx]]
     return oof
 
@@ -196,6 +200,16 @@ if raw_ticket is not None:
           f"mean={X_fe['Ticket_survival_oof'].mean():.3f}  "
           f"range=[{X_fe['Ticket_survival_oof'].min():.3f}, "
           f"{X_fe['Ticket_survival_oof'].max():.3f}]")
+
+# Surname+Ticket combined: most specific family unit (same family, same booking)
+if raw_surname is not None and raw_ticket is not None:
+    surname_ticket = np.array([f"{s}__{t}" for s, t in zip(raw_surname, raw_ticket)])
+    X_fe['SurnameTicket_survival_oof'] = compute_group_oof_survival(
+        surname_ticket, y, skf_surv, global_mean)
+    print(f"[FE] SurnameTicket OOF: "
+          f"mean={X_fe['SurnameTicket_survival_oof'].mean():.3f}  "
+          f"range=[{X_fe['SurnameTicket_survival_oof'].min():.3f}, "
+          f"{X_fe['SurnameTicket_survival_oof'].max():.3f}]")
 
 # ── Categorical columns (CatBoost handles natively) ──────────────────────────
 cat_cols_cb = ['Sex', 'Embarked', 'Title', 'Deck', 'Sex_Pclass',
@@ -374,6 +388,34 @@ best_rf = study_rf.best_params
 print(f"[HPO] RandomForest best AUC={study_rf.best_value:.4f}")
 
 # ============================================================
+# 5. HistGradientBoosting Optuna HPO (sklearn histogram GBDT —
+#    different binning & regularization from LGB/XGB)
+# ============================================================
+def hgb_objective(trial):
+    params = dict(
+        max_iter=500,
+        learning_rate=trial.suggest_float('learning_rate', 0.02, 0.2, log=True),
+        max_leaf_nodes=trial.suggest_int('max_leaf_nodes', 15, 63),
+        max_depth=trial.suggest_int('max_depth', 3, 8),
+        min_samples_leaf=trial.suggest_int('min_samples_leaf', 5, 50),
+        l2_regularization=trial.suggest_float('l2_regularization', 1e-4, 10.0, log=True),
+        random_state=42,
+    )
+    oof = np.zeros(len(y))
+    for tr_idx, va_idx in skf.split(X_fe_lgb, y):
+        m = HistGradientBoostingClassifier(**params)
+        m.fit(X_fe_lgb.iloc[tr_idx], y[tr_idx])
+        oof[va_idx] = m.predict_proba(X_fe_lgb.iloc[va_idx])[:, 1]
+    return roc_auc_score(y, oof)
+
+print("[HPO] HistGradientBoosting (20 trials) ...")
+study_hgb = optuna.create_study(
+    direction='maximize', sampler=optuna.samplers.TPESampler(seed=321))
+study_hgb.optimize(hgb_objective, n_trials=20, show_progress_bar=False)
+best_hgb = study_hgb.best_params
+print(f"[HPO] HistGradientBoosting best AUC={study_hgb.best_value:.4f}")
+
+# ============================================================
 # Final OOF: multiple fold seeds × multiple model seeds
 # ============================================================
 FOLD_SEEDS = [42, 123, 456]
@@ -485,6 +527,29 @@ oof_rf = np.mean(oof_rf_all, axis=0)
 rf_auc = roc_auc_score(y, oof_rf)
 print(f"[CV] RandomForest multi-seed/fold OOF AUC: {rf_auc:.6f}")
 
+# ── HistGradientBoosting ───────────────────────────────────────────────────────
+final_hgb = dict(max_iter=500)
+final_hgb.update(best_hgb)
+
+HGB_SEEDS = [42, 123, 456]
+FOLD_SEEDS_HGB = [42, 123, 456]
+print(f"[TRAIN] HistGBM: {len(HGB_SEEDS)} model seeds × {len(FOLD_SEEDS_HGB)} fold seeds × 5 folds")
+oof_hgb_all = []
+for fold_seed in FOLD_SEEDS_HGB:
+    skf_fs = StratifiedKFold(n_splits=5, shuffle=True, random_state=fold_seed)
+    for model_seed in HGB_SEEDS:
+        oof_s = np.zeros(len(y))
+        params_s = dict(**final_hgb, random_state=model_seed)
+        for tr_idx, va_idx in skf_fs.split(X_fe_lgb, y):
+            m = HistGradientBoostingClassifier(**params_s)
+            m.fit(X_fe_lgb.iloc[tr_idx], y[tr_idx])
+            oof_s[va_idx] = m.predict_proba(X_fe_lgb.iloc[va_idx])[:, 1]
+        oof_hgb_all.append(oof_s)
+
+oof_hgb = np.mean(oof_hgb_all, axis=0)
+hgb_auc = roc_auc_score(y, oof_hgb)
+print(f"[CV] HistGBM multi-seed/fold OOF AUC: {hgb_auc:.6f}")
+
 # ============================================================
 # Optimise blend weights via Optuna on OOF predictions
 # ============================================================
@@ -493,32 +558,35 @@ def blend_objective(trial):
     w2 = trial.suggest_float('w_lgb', 0.0, 1.0)
     w3 = trial.suggest_float('w_xgb', 0.0, 1.0)
     w4 = trial.suggest_float('w_rf',  0.0, 1.0)
-    total = w1 + w2 + w3 + w4 + 1e-9
-    blend = (w1 * oof_cb + w2 * oof_lgb + w3 * oof_xgb + w4 * oof_rf) / total
+    w5 = trial.suggest_float('w_hgb', 0.0, 1.0)
+    total = w1 + w2 + w3 + w4 + w5 + 1e-9
+    blend = (w1 * oof_cb + w2 * oof_lgb + w3 * oof_xgb + w4 * oof_rf + w5 * oof_hgb) / total
     return roc_auc_score(y, blend)
 
 study_blend = optuna.create_study(
     direction='maximize', sampler=optuna.samplers.TPESampler(seed=0))
 study_blend.optimize(blend_objective, n_trials=300, show_progress_bar=False)
 bp = study_blend.best_params
-total_w = bp['w_cb'] + bp['w_lgb'] + bp['w_xgb'] + bp['w_rf'] + 1e-9
+total_w = bp['w_cb'] + bp['w_lgb'] + bp['w_xgb'] + bp['w_rf'] + bp['w_hgb'] + 1e-9
 w_cb  = bp['w_cb']  / total_w
 w_lgb = bp['w_lgb'] / total_w
 w_xgb = bp['w_xgb'] / total_w
 w_rf  = bp['w_rf']  / total_w
-print(f"[BLEND] CB={w_cb:.3f}  LGB={w_lgb:.3f}  XGB={w_xgb:.3f}  RF={w_rf:.3f}")
+w_hgb = bp['w_hgb'] / total_w
+print(f"[BLEND] CB={w_cb:.3f}  LGB={w_lgb:.3f}  XGB={w_xgb:.3f}  RF={w_rf:.3f}  HGB={w_hgb:.3f}")
 
-oof_blended = w_cb * oof_cb + w_lgb * oof_lgb + w_xgb * oof_xgb + w_rf * oof_rf
+oof_blended = w_cb * oof_cb + w_lgb * oof_lgb + w_xgb * oof_xgb + w_rf * oof_rf + w_hgb * oof_hgb
 blended_auc = roc_auc_score(y, oof_blended)
 
-equal_auc = roc_auc_score(y, (oof_cb + oof_lgb + oof_xgb + oof_rf) / 4)
+equal_auc = roc_auc_score(y, (oof_cb + oof_lgb + oof_xgb + oof_rf + oof_hgb) / 5)
 
-print(f"[RESULT] CatBoost   : {cb_auc:.6f}")
-print(f"[RESULT] LightGBM   : {lgb_auc:.6f}")
-print(f"[RESULT] XGBoost    : {xgb_auc:.6f}")
-print(f"[RESULT] RandomForest: {rf_auc:.6f}")
-print(f"[RESULT] EqualBlend : {equal_auc:.6f}")
-print(f"[RESULT] OptBlend   : {blended_auc:.6f}")
+print(f"[RESULT] CatBoost     : {cb_auc:.6f}")
+print(f"[RESULT] LightGBM     : {lgb_auc:.6f}")
+print(f"[RESULT] XGBoost      : {xgb_auc:.6f}")
+print(f"[RESULT] RandomForest : {rf_auc:.6f}")
+print(f"[RESULT] HistGBM      : {hgb_auc:.6f}")
+print(f"[RESULT] EqualBlend   : {equal_auc:.6f}")
+print(f"[RESULT] OptBlend     : {blended_auc:.6f}")
 
-final_auc = max(blended_auc, equal_auc, cb_auc, lgb_auc, xgb_auc, rf_auc)
+final_auc = max(blended_auc, equal_auc, cb_auc, lgb_auc, xgb_auc, rf_auc, hgb_auc)
 print(f"BEST_VAL_ROC_AUC: {final_auc:.6f}")
