@@ -1,1 +1,3 @@
 experiment_id,description,model_name,metric_name,metric_value,improved,duration_s,commit,notes
+0,"baseline: LightGBM binary classifier with 5-fold stratified CV (N=891 << 10k threshold), feature engineering (Title from Name, Deck from Cabin, FamilySize/IsAlone, log-Fare, Age missingness indicator), median/mode imputation, and native LightGBM categorical handling",,roc_auc,0.844137,true,106.1,4528332,
+1,"Enhanced feature engineering (TicketPrefix, IsChild, AgeBin, Fare_per_person, Sex_Pclass interaction, IsMother, FamilySizeGroup) + LightGBM+XGBoost ensemble with tuned hyperparameters",,roc_auc,0.835903,false,72.4,,
