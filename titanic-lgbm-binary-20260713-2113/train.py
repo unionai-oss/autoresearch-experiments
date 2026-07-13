@@ -33,14 +33,15 @@ def extract_features(X):
                 'Ms', 'Sir', 'Jonkheer', 'Lady', 'Mme', 'Don', 'Dona'}
         X['Title'] = X['Title'].apply(lambda t: 'Rare' if t in rare else t)
         X['Title'] = X['Title'].fillna('Unknown')
-        # Extract surname for family group detection (family across different tickets)
+        # Extract surname for family group detection
         X['Surname'] = X['Name'].str.split(',').str[0].str.strip()
+        # Name length (proxy for title/social status)
+        X['NameLength'] = X['Name'].str.len()
         X = X.drop(columns=['Name'])
 
     if 'Cabin' in X.columns:
         X['Cabin_missing'] = X['Cabin'].isnull().astype(int)
         X['Deck'] = X['Cabin'].str[0].fillna('Unknown')
-        # Number of cabin assignments — proxy for wealth/class
         X['NumCabins'] = X['Cabin'].fillna('').apply(
             lambda c: len(c.split()) if c else 0)
         X = X.drop(columns=['Cabin'])
@@ -51,6 +52,14 @@ def extract_features(X):
     if 'Ticket' in X.columns:
         ticket_counts = X['Ticket'].map(X['Ticket'].value_counts())
         X['TicketGroup'] = ticket_counts.fillna(1).astype(int)
+        # Ticket prefix: non-numeric leading part (encodes boarding/class info)
+        def get_prefix(t):
+            t_str = str(t).strip().upper().replace('.', '').replace('/', '').replace(' ', '')
+            prefix = ''.join(c for c in t_str if not c.isdigit()).strip()
+            return prefix if prefix else 'NONE'
+        X['TicketPrefix'] = X['Ticket'].apply(get_prefix)
+        # Ticket number: trailing numeric part (may encode boarding group/order)
+        X['TicketNum'] = X['Ticket'].str.extract(r'(\d+)$', expand=False).astype(float)
         X = X.drop(columns=['Ticket'])
 
     if 'Age' in X.columns:
@@ -74,14 +83,29 @@ def extract_features(X):
 
 X_fe = extract_features(X)
 
-# ── Imputation ───────────────────────────────────────────────────────────────
-for col in ['Age', 'Fare']:
+# ── Age imputation: Title-based median (far better than global median) ────────
+# Mr: ~29, Miss: ~21, Mrs: ~36, Master: ~3.5, Rare: varies
+if 'Age' in X_fe.columns and 'Title' in X_fe.columns:
+    title_age_med = X_fe.groupby('Title')['Age'].median()
+    global_age_med = X_fe['Age'].median()
+    def impute_age(row):
+        if pd.isna(row['Age']):
+            return title_age_med.get(row['Title'], global_age_med)
+        return row['Age']
+    X_fe['Age'] = X_fe.apply(impute_age, axis=1)
+
+# ── Other imputation ──────────────────────────────────────────────────────────
+for col in ['Fare']:
     if col in X_fe.columns:
         X_fe[col] = X_fe[col].fillna(X_fe[col].median())
 
 for col in ['Embarked']:
     if col in X_fe.columns:
         X_fe[col] = X_fe[col].fillna(X_fe[col].mode()[0])
+
+# ── TicketNum imputation (can have NaN for non-numeric tickets) ───────────────
+if 'TicketNum' in X_fe.columns:
+    X_fe['TicketNum'] = X_fe['TicketNum'].fillna(X_fe['TicketNum'].median())
 
 # ── Post-imputation features ─────────────────────────────────────────────────
 if 'Age' in X_fe.columns and 'Sex' in X_fe.columns:
@@ -92,6 +116,14 @@ if 'Age' in X_fe.columns and 'Sex' in X_fe.columns:
         X_fe['Age'], bins=[0, 12, 18, 35, 60, 100],
         labels=['child', 'teen', 'adult', 'middle', 'senior']
     ).astype(str)
+
+# Fare within Pclass z-score (relative wealth within cabin class)
+if 'Fare' in X_fe.columns and 'Pclass' in X_fe.columns:
+    fare_stats = X_fe.groupby('Pclass')['Fare'].agg(['mean', 'std'])
+    X_fe['Fare_class_z'] = X_fe.apply(
+        lambda r: (r['Fare'] - fare_stats.loc[r['Pclass'], 'mean']) /
+                  (fare_stats.loc[r['Pclass'], 'std'] + 1e-6), axis=1
+    )
 
 # IsMother: female adult with children on board, not unmarried
 if ('Sex' in X_fe.columns and 'Parch' in X_fe.columns
@@ -115,28 +147,56 @@ if 'FamilySize' in X_fe.columns:
         [X_fe['FamilySize'] == 1, X_fe['FamilySize'] <= 4],
         ['alone', 'small'], default='large')
 
-# ── New interaction features ──────────────────────────────────────────────────
-# Being alone differs sharply by class: 1st/2nd-class loners had better odds
+# ── Interaction features ──────────────────────────────────────────────────────
 if 'IsAlone' in X_fe.columns and 'Pclass' in X_fe.columns:
     X_fe['IsAlone_Pclass'] = X_fe['IsAlone'] * X_fe['Pclass']
 
-# WomanOrChild in 3rd class had markedly lower survival than 1st/2nd class
 if 'WomanOrChild' in X_fe.columns and 'Pclass' in X_fe.columns:
     X_fe['WomanOrChild_Pclass'] = X_fe['WomanOrChild'] * X_fe['Pclass']
 
-# FamilySize × Pclass: large families in 3rd class had very different outcomes
 if 'FamilySize' in X_fe.columns and 'Pclass' in X_fe.columns:
     X_fe['FamilySize_Pclass'] = X_fe['FamilySize'] * X_fe['Pclass']
 
+# Age × Pclass: elderly 3rd-class passengers faced very different outcomes
+if 'Age' in X_fe.columns and 'Pclass' in X_fe.columns:
+    X_fe['Age_Pclass'] = X_fe['Age'] * X_fe['Pclass']
+
 # ── Categorical columns (CatBoost handles natively) ──────────────────────────
 cat_cols_cb = ['Sex', 'Embarked', 'Title', 'Deck', 'Sex_Pclass',
-               'AgeBin', 'FamilySizeGroup']
+               'AgeBin', 'FamilySizeGroup', 'TicketPrefix']
 cat_cols_cb = [c for c in cat_cols_cb if c in X_fe.columns]
 for col in cat_cols_cb:
     X_fe[col] = X_fe[col].astype(str).fillna('Unknown')
 
 print(f"[FE] Features ({len(X_fe.columns)}): {list(X_fe.columns)}")
 print(f"[FE] CatBoost categoricals: {cat_cols_cb}")
+
+# ── K-fold target encoding (no leakage) ──────────────────────────────────────
+# For each categorical, compute mean target using complementary fold (cross-validated)
+# This benefits LGB/XGB which can't natively use CatBoost-style ordered encoding
+te_cols = [c for c in ['Title', 'Deck', 'Sex_Pclass', 'AgeBin',
+                        'FamilySizeGroup', 'Embarked', 'TicketPrefix']
+           if c in X_fe.columns]
+skf_te = StratifiedKFold(n_splits=5, shuffle=True, random_state=99)
+global_mean = float(y.mean())
+for col in te_cols:
+    encoded = np.zeros(len(X_fe))
+    for tr_i, va_i in skf_te.split(X_fe, y):
+        cat_tr = X_fe[col].iloc[tr_i].values
+        y_tr = y[tr_i]
+        # compute per-category mean on training fold
+        means = {}
+        for cat_val, target_val in zip(cat_tr, y_tr):
+            if cat_val not in means:
+                means[cat_val] = []
+            means[cat_val].append(target_val)
+        means = {k: float(np.mean(v)) for k, v in means.items()}
+        # apply to validation fold
+        encoded[va_i] = [means.get(v, global_mean)
+                         for v in X_fe[col].iloc[va_i].values]
+    X_fe[f'{col}_te'] = encoded
+
+print(f"[FE] Target-encoded: {te_cols}")
 
 # ── Label-encode categoricals for LightGBM / XGBoost ─────────────────────────
 X_fe_lgb = X_fe.copy()
@@ -256,8 +316,13 @@ best_xgb = study_xgb.best_params
 print(f"[HPO] XGBoost best AUC={study_xgb.best_value:.4f}")
 
 # ============================================================
-# Final OOF: CatBoost — multi-seed average for variance reduction
+# Final OOF: multiple fold seeds × multiple model seeds
+# Each sample predicted by (n_fold_seeds × n_model_seeds) independent models
+# → much smoother and more stable OOF estimate
 # ============================================================
+FOLD_SEEDS = [42, 123, 456]   # 3 different CV configurations
+
+# ── CatBoost ──────────────────────────────────────────────────────────────────
 final_cb = dict(
     iterations=3000,
     cat_features=cat_cols_cb,
@@ -270,56 +335,51 @@ final_cb = dict(
 final_cb.update(best_cb)
 
 CB_SEEDS = [42, 123, 456, 789, 1000]
-print(f"[TRAIN] CatBoost final: {len(CB_SEEDS)} seeds × {skf.n_splits} folds")
-oof_cb_seeds = np.zeros((len(CB_SEEDS), len(y)))
-for si, seed in enumerate(CB_SEEDS):
-    oof_s = np.zeros(len(y))
-    for fold, (tr_idx, va_idx) in enumerate(skf.split(X_fe, y)):
-        m = CatBoostClassifier(
-            random_seed=seed,
-            **{k: v for k, v in final_cb.items() if k != 'random_seed'})
-        m.fit(X_fe.iloc[tr_idx].reset_index(drop=True), y[tr_idx],
-              eval_set=(X_fe.iloc[va_idx].reset_index(drop=True), y[va_idx]))
-        oof_s[va_idx] = m.predict_proba(
-            X_fe.iloc[va_idx].reset_index(drop=True))[:, 1]
-    auc_s = roc_auc_score(y, oof_s)
-    print(f"  CB seed={seed}: OOF AUC={auc_s:.4f}")
-    oof_cb_seeds[si] = oof_s
+print(f"[TRAIN] CatBoost: {len(CB_SEEDS)} model seeds × {len(FOLD_SEEDS)} fold seeds × 5 folds")
+oof_cb_all = []
+for fold_seed in FOLD_SEEDS:
+    skf_fs = StratifiedKFold(n_splits=5, shuffle=True, random_state=fold_seed)
+    for model_seed in CB_SEEDS:
+        oof_s = np.zeros(len(y))
+        m_params = {k: v for k, v in final_cb.items() if k != 'random_seed'}
+        for tr_idx, va_idx in skf_fs.split(X_fe, y):
+            m = CatBoostClassifier(random_seed=model_seed, **m_params)
+            m.fit(X_fe.iloc[tr_idx].reset_index(drop=True), y[tr_idx],
+                  eval_set=(X_fe.iloc[va_idx].reset_index(drop=True), y[va_idx]))
+            oof_s[va_idx] = m.predict_proba(
+                X_fe.iloc[va_idx].reset_index(drop=True))[:, 1]
+        oof_cb_all.append(oof_s)
 
-oof_cb = oof_cb_seeds.mean(axis=0)
+oof_cb = np.mean(oof_cb_all, axis=0)
 cb_auc = roc_auc_score(y, oof_cb)
-print(f"[CV] CatBoost multi-seed OOF AUC: {cb_auc:.6f}")
+print(f"[CV] CatBoost multi-seed/fold OOF AUC: {cb_auc:.6f}")
 
-# ============================================================
-# Final OOF: LightGBM — multi-seed average
-# ============================================================
+# ── LightGBM ──────────────────────────────────────────────────────────────────
 final_lgb = dict(n_estimators=3000, n_jobs=1, verbose=-1)
 final_lgb.update(best_lgb)
 
 LGB_SEEDS = [42, 123, 456]
-print(f"[TRAIN] LightGBM final: {len(LGB_SEEDS)} seeds × {skf.n_splits} folds")
-oof_lgb_seeds = np.zeros((len(LGB_SEEDS), len(y)))
-for si, seed in enumerate(LGB_SEEDS):
-    oof_s = np.zeros(len(y))
-    params_s = dict(**final_lgb, random_state=seed)
-    for fold, (tr_idx, va_idx) in enumerate(skf.split(X_fe_lgb, y)):
-        m = lgb.LGBMClassifier(**params_s)
-        m.fit(X_fe_lgb.iloc[tr_idx], y[tr_idx],
-              eval_set=[(X_fe_lgb.iloc[va_idx], y[va_idx])],
-              callbacks=[lgb.early_stopping(100, verbose=False),
-                         lgb.log_evaluation(-1)])
-        oof_s[va_idx] = m.predict_proba(X_fe_lgb.iloc[va_idx])[:, 1]
-    auc_s = roc_auc_score(y, oof_s)
-    print(f"  LGB seed={seed}: OOF AUC={auc_s:.4f}")
-    oof_lgb_seeds[si] = oof_s
+print(f"[TRAIN] LightGBM: {len(LGB_SEEDS)} model seeds × {len(FOLD_SEEDS)} fold seeds × 5 folds")
+oof_lgb_all = []
+for fold_seed in FOLD_SEEDS:
+    skf_fs = StratifiedKFold(n_splits=5, shuffle=True, random_state=fold_seed)
+    for model_seed in LGB_SEEDS:
+        oof_s = np.zeros(len(y))
+        params_s = dict(**final_lgb, random_state=model_seed)
+        for tr_idx, va_idx in skf_fs.split(X_fe_lgb, y):
+            m = lgb.LGBMClassifier(**params_s)
+            m.fit(X_fe_lgb.iloc[tr_idx], y[tr_idx],
+                  eval_set=[(X_fe_lgb.iloc[va_idx], y[va_idx])],
+                  callbacks=[lgb.early_stopping(100, verbose=False),
+                             lgb.log_evaluation(-1)])
+            oof_s[va_idx] = m.predict_proba(X_fe_lgb.iloc[va_idx])[:, 1]
+        oof_lgb_all.append(oof_s)
 
-oof_lgb = oof_lgb_seeds.mean(axis=0)
+oof_lgb = np.mean(oof_lgb_all, axis=0)
 lgb_auc = roc_auc_score(y, oof_lgb)
-print(f"[CV] LightGBM multi-seed OOF AUC: {lgb_auc:.6f}")
+print(f"[CV] LightGBM multi-seed/fold OOF AUC: {lgb_auc:.6f}")
 
-# ============================================================
-# Final OOF: XGBoost — multi-seed average
-# ============================================================
+# ── XGBoost ───────────────────────────────────────────────────────────────────
 final_xgb = dict(
     n_estimators=3000, eval_metric='auc',
     early_stopping_rounds=100,
@@ -327,28 +387,27 @@ final_xgb = dict(
 final_xgb.update(best_xgb)
 
 XGB_SEEDS = [42, 123, 456]
-print(f"[TRAIN] XGBoost final: {len(XGB_SEEDS)} seeds × {skf.n_splits} folds")
-oof_xgb_seeds = np.zeros((len(XGB_SEEDS), len(y)))
-for si, seed in enumerate(XGB_SEEDS):
-    oof_s = np.zeros(len(y))
-    params_s = dict(**final_xgb, random_state=seed)
-    for fold, (tr_idx, va_idx) in enumerate(skf.split(X_fe_lgb, y)):
-        m = XGBClassifier(**params_s)
-        m.fit(X_fe_lgb.iloc[tr_idx], y[tr_idx],
-              eval_set=[(X_fe_lgb.iloc[va_idx], y[va_idx])],
-              verbose=False)
-        oof_s[va_idx] = m.predict_proba(X_fe_lgb.iloc[va_idx])[:, 1]
-    auc_s = roc_auc_score(y, oof_s)
-    print(f"  XGB seed={seed}: OOF AUC={auc_s:.4f}")
-    oof_xgb_seeds[si] = oof_s
+print(f"[TRAIN] XGBoost: {len(XGB_SEEDS)} model seeds × {len(FOLD_SEEDS)} fold seeds × 5 folds")
+oof_xgb_all = []
+for fold_seed in FOLD_SEEDS:
+    skf_fs = StratifiedKFold(n_splits=5, shuffle=True, random_state=fold_seed)
+    for model_seed in XGB_SEEDS:
+        oof_s = np.zeros(len(y))
+        params_s = dict(**final_xgb, random_state=model_seed)
+        for tr_idx, va_idx in skf_fs.split(X_fe_lgb, y):
+            m = XGBClassifier(**params_s)
+            m.fit(X_fe_lgb.iloc[tr_idx], y[tr_idx],
+                  eval_set=[(X_fe_lgb.iloc[va_idx], y[va_idx])],
+                  verbose=False)
+            oof_s[va_idx] = m.predict_proba(X_fe_lgb.iloc[va_idx])[:, 1]
+        oof_xgb_all.append(oof_s)
 
-oof_xgb = oof_xgb_seeds.mean(axis=0)
+oof_xgb = np.mean(oof_xgb_all, axis=0)
 xgb_auc = roc_auc_score(y, oof_xgb)
-print(f"[CV] XGBoost multi-seed OOF AUC: {xgb_auc:.6f}")
+print(f"[CV] XGBoost multi-seed/fold OOF AUC: {xgb_auc:.6f}")
 
 # ============================================================
 # Optimise blend weights via Optuna on OOF predictions
-# (OOF are true hold-outs — no leakage)
 # ============================================================
 def blend_objective(trial):
     w1 = trial.suggest_float('w_cb', 0.0, 1.0)
