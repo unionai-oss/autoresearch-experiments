@@ -9,6 +9,7 @@ import numpy as np
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score
 from sklearn.preprocessing import LabelEncoder
+from sklearn.ensemble import RandomForestClassifier
 from catboost import CatBoostClassifier
 import lightgbm as lgb
 from xgboost import XGBClassifier
@@ -23,6 +24,12 @@ y = df[target_col].values
 print(f"[DATA] Samples: {len(df)}, Classes: {np.unique(y)}, "
       f"Distribution: {{0: {(y==0).sum()}, 1: {(y==1).sum()}}}")
 
+# ── Save raw group identifiers BEFORE feature engineering ─────────────────────
+# Needed for OOF group survival features (no leakage)
+raw_surname = (X['Name'].str.split(',').str[0].str.strip().values
+               if 'Name' in X.columns else None)
+raw_ticket  = X['Ticket'].values if 'Ticket' in X.columns else None
+
 # ── Feature engineering ──────────────────────────────────────────────────────
 def extract_features(X):
     X = X.copy()
@@ -33,9 +40,7 @@ def extract_features(X):
                 'Ms', 'Sir', 'Jonkheer', 'Lady', 'Mme', 'Don', 'Dona'}
         X['Title'] = X['Title'].apply(lambda t: 'Rare' if t in rare else t)
         X['Title'] = X['Title'].fillna('Unknown')
-        # Extract surname for family group detection
         X['Surname'] = X['Name'].str.split(',').str[0].str.strip()
-        # Name length (proxy for title/social status)
         X['NameLength'] = X['Name'].str.len()
         X = X.drop(columns=['Name'])
 
@@ -52,13 +57,11 @@ def extract_features(X):
     if 'Ticket' in X.columns:
         ticket_counts = X['Ticket'].map(X['Ticket'].value_counts())
         X['TicketGroup'] = ticket_counts.fillna(1).astype(int)
-        # Ticket prefix: non-numeric leading part (encodes boarding/class info)
         def get_prefix(t):
             t_str = str(t).strip().upper().replace('.', '').replace('/', '').replace(' ', '')
             prefix = ''.join(c for c in t_str if not c.isdigit()).strip()
             return prefix if prefix else 'NONE'
         X['TicketPrefix'] = X['Ticket'].apply(get_prefix)
-        # Ticket number: trailing numeric part (may encode boarding group/order)
         X['TicketNum'] = X['Ticket'].str.extract(r'(\d+)$', expand=False).astype(float)
         X = X.drop(columns=['Ticket'])
 
@@ -83,8 +86,7 @@ def extract_features(X):
 
 X_fe = extract_features(X)
 
-# ── Age imputation: Title-based median (far better than global median) ────────
-# Mr: ~29, Miss: ~21, Mrs: ~36, Master: ~3.5, Rare: varies
+# ── Age imputation: Title-based median ───────────────────────────────────────
 if 'Age' in X_fe.columns and 'Title' in X_fe.columns:
     title_age_med = X_fe.groupby('Title')['Age'].median()
     global_age_med = X_fe['Age'].median()
@@ -103,7 +105,6 @@ for col in ['Embarked']:
     if col in X_fe.columns:
         X_fe[col] = X_fe[col].fillna(X_fe[col].mode()[0])
 
-# ── TicketNum imputation (can have NaN for non-numeric tickets) ───────────────
 if 'TicketNum' in X_fe.columns:
     X_fe['TicketNum'] = X_fe['TicketNum'].fillna(X_fe['TicketNum'].median())
 
@@ -117,7 +118,6 @@ if 'Age' in X_fe.columns and 'Sex' in X_fe.columns:
         labels=['child', 'teen', 'adult', 'middle', 'senior']
     ).astype(str)
 
-# Fare within Pclass z-score (relative wealth within cabin class)
 if 'Fare' in X_fe.columns and 'Pclass' in X_fe.columns:
     fare_stats = X_fe.groupby('Pclass')['Fare'].agg(['mean', 'std'])
     X_fe['Fare_class_z'] = X_fe.apply(
@@ -125,7 +125,6 @@ if 'Fare' in X_fe.columns and 'Pclass' in X_fe.columns:
                   (fare_stats.loc[r['Pclass'], 'std'] + 1e-6), axis=1
     )
 
-# IsMother: female adult with children on board, not unmarried
 if ('Sex' in X_fe.columns and 'Parch' in X_fe.columns
         and 'Age' in X_fe.columns and 'Title' in X_fe.columns):
     X_fe['IsMother'] = (
@@ -135,13 +134,11 @@ if ('Sex' in X_fe.columns and 'Parch' in X_fe.columns
         (X_fe['Title'] != 'Miss')
     ).astype(int)
 
-# Surname group size (family members on different ticket numbers)
 if 'Surname' in X_fe.columns:
     X_fe['SurnameGroup'] = X_fe['Surname'].map(
         X_fe['Surname'].value_counts()).fillna(1).astype(int)
     X_fe = X_fe.drop(columns=['Surname'])
 
-# FamilySizeGroup: categorical grouping of family size
 if 'FamilySize' in X_fe.columns:
     X_fe['FamilySizeGroup'] = np.select(
         [X_fe['FamilySize'] == 1, X_fe['FamilySize'] <= 4],
@@ -157,9 +154,48 @@ if 'WomanOrChild' in X_fe.columns and 'Pclass' in X_fe.columns:
 if 'FamilySize' in X_fe.columns and 'Pclass' in X_fe.columns:
     X_fe['FamilySize_Pclass'] = X_fe['FamilySize'] * X_fe['Pclass']
 
-# Age × Pclass: elderly 3rd-class passengers faced very different outcomes
 if 'Age' in X_fe.columns and 'Pclass' in X_fe.columns:
     X_fe['Age_Pclass'] = X_fe['Age'] * X_fe['Pclass']
+
+# ── OOF Group Survival Features ──────────────────────────────────────────────
+# Core insight: families / groups on Titanic tended to survive or die together.
+# We compute "what fraction of this passenger's group survived?" using OOF
+# cross-validation so there is NO label leakage into any validation fold.
+global_mean = float(y.mean())
+
+# Use a fixed 5-fold split for OOF survival computation
+skf_surv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+def compute_group_oof_survival(groups, y, skf, fallback):
+    """OOF mean survival rate for same-group passengers (train folds only)."""
+    oof = np.full(len(y), fallback, dtype=np.float64)
+    for tr_idx, va_idx in skf.split(np.zeros(len(y)), y):
+        g_sum, g_cnt = {}, {}
+        for g, t in zip(groups[tr_idx], y[tr_idx]):
+            if g not in g_sum:
+                g_sum[g] = 0
+                g_cnt[g] = 0
+            g_sum[g] += t
+            g_cnt[g] += 1
+        g_rate = {g: g_sum[g] / g_cnt[g] for g in g_sum}
+        oof[va_idx] = [g_rate.get(g, fallback) for g in groups[va_idx]]
+    return oof
+
+if raw_surname is not None:
+    X_fe['Surname_survival_oof'] = compute_group_oof_survival(
+        raw_surname, y, skf_surv, global_mean)
+    print(f"[FE] Surname survival OOF: "
+          f"mean={X_fe['Surname_survival_oof'].mean():.3f}  "
+          f"range=[{X_fe['Surname_survival_oof'].min():.3f}, "
+          f"{X_fe['Surname_survival_oof'].max():.3f}]")
+
+if raw_ticket is not None:
+    X_fe['Ticket_survival_oof'] = compute_group_oof_survival(
+        raw_ticket, y, skf_surv, global_mean)
+    print(f"[FE] Ticket  survival OOF: "
+          f"mean={X_fe['Ticket_survival_oof'].mean():.3f}  "
+          f"range=[{X_fe['Ticket_survival_oof'].min():.3f}, "
+          f"{X_fe['Ticket_survival_oof'].max():.3f}]")
 
 # ── Categorical columns (CatBoost handles natively) ──────────────────────────
 cat_cols_cb = ['Sex', 'Embarked', 'Title', 'Deck', 'Sex_Pclass',
@@ -172,33 +208,28 @@ print(f"[FE] Features ({len(X_fe.columns)}): {list(X_fe.columns)}")
 print(f"[FE] CatBoost categoricals: {cat_cols_cb}")
 
 # ── K-fold target encoding (no leakage) ──────────────────────────────────────
-# For each categorical, compute mean target using complementary fold (cross-validated)
-# This benefits LGB/XGB which can't natively use CatBoost-style ordered encoding
 te_cols = [c for c in ['Title', 'Deck', 'Sex_Pclass', 'AgeBin',
                         'FamilySizeGroup', 'Embarked', 'TicketPrefix']
            if c in X_fe.columns]
 skf_te = StratifiedKFold(n_splits=5, shuffle=True, random_state=99)
-global_mean = float(y.mean())
 for col in te_cols:
     encoded = np.zeros(len(X_fe))
     for tr_i, va_i in skf_te.split(X_fe, y):
         cat_tr = X_fe[col].iloc[tr_i].values
         y_tr = y[tr_i]
-        # compute per-category mean on training fold
         means = {}
         for cat_val, target_val in zip(cat_tr, y_tr):
             if cat_val not in means:
                 means[cat_val] = []
             means[cat_val].append(target_val)
         means = {k: float(np.mean(v)) for k, v in means.items()}
-        # apply to validation fold
         encoded[va_i] = [means.get(v, global_mean)
                          for v in X_fe[col].iloc[va_i].values]
     X_fe[f'{col}_te'] = encoded
 
 print(f"[FE] Target-encoded: {te_cols}")
 
-# ── Label-encode categoricals for LightGBM / XGBoost ─────────────────────────
+# ── Label-encode categoricals for LightGBM / XGBoost / RF ────────────────────
 X_fe_lgb = X_fe.copy()
 for col in cat_cols_cb:
     le = LabelEncoder()
@@ -316,11 +347,36 @@ best_xgb = study_xgb.best_params
 print(f"[HPO] XGBoost best AUC={study_xgb.best_value:.4f}")
 
 # ============================================================
-# Final OOF: multiple fold seeds × multiple model seeds
-# Each sample predicted by (n_fold_seeds × n_model_seeds) independent models
-# → much smoother and more stable OOF estimate
+# 4. RandomForest Optuna HPO (bagging diversity vs boosting)
 # ============================================================
-FOLD_SEEDS = [42, 123, 456]   # 3 different CV configurations
+def rf_objective(trial):
+    params = dict(
+        n_estimators=trial.suggest_int('n_estimators', 300, 1000),
+        max_depth=trial.suggest_int('max_depth', 4, 20),
+        min_samples_split=trial.suggest_int('min_samples_split', 2, 20),
+        min_samples_leaf=trial.suggest_int('min_samples_leaf', 1, 10),
+        max_features=trial.suggest_float('max_features', 0.1, 0.9),
+        random_state=42,
+        n_jobs=-1,
+    )
+    oof = np.zeros(len(y))
+    for tr_idx, va_idx in skf.split(X_fe_lgb, y):
+        m = RandomForestClassifier(**params)
+        m.fit(X_fe_lgb.iloc[tr_idx], y[tr_idx])
+        oof[va_idx] = m.predict_proba(X_fe_lgb.iloc[va_idx])[:, 1]
+    return roc_auc_score(y, oof)
+
+print("[HPO] RandomForest (25 trials) ...")
+study_rf = optuna.create_study(
+    direction='maximize', sampler=optuna.samplers.TPESampler(seed=789))
+study_rf.optimize(rf_objective, n_trials=25, show_progress_bar=False)
+best_rf = study_rf.best_params
+print(f"[HPO] RandomForest best AUC={study_rf.best_value:.4f}")
+
+# ============================================================
+# Final OOF: multiple fold seeds × multiple model seeds
+# ============================================================
+FOLD_SEEDS = [42, 123, 456]
 
 # ── CatBoost ──────────────────────────────────────────────────────────────────
 final_cb = dict(
@@ -406,38 +462,63 @@ oof_xgb = np.mean(oof_xgb_all, axis=0)
 xgb_auc = roc_auc_score(y, oof_xgb)
 print(f"[CV] XGBoost multi-seed/fold OOF AUC: {xgb_auc:.6f}")
 
+# ── RandomForest ──────────────────────────────────────────────────────────────
+final_rf = dict(n_jobs=-1)
+final_rf.update(best_rf)
+
+RF_SEEDS = [42, 123, 456]
+FOLD_SEEDS_RF = [42, 123, 456]
+print(f"[TRAIN] RandomForest: {len(RF_SEEDS)} model seeds × {len(FOLD_SEEDS_RF)} fold seeds × 5 folds")
+oof_rf_all = []
+for fold_seed in FOLD_SEEDS_RF:
+    skf_fs = StratifiedKFold(n_splits=5, shuffle=True, random_state=fold_seed)
+    for model_seed in RF_SEEDS:
+        oof_s = np.zeros(len(y))
+        params_s = dict(**final_rf, random_state=model_seed)
+        for tr_idx, va_idx in skf_fs.split(X_fe_lgb, y):
+            m = RandomForestClassifier(**params_s)
+            m.fit(X_fe_lgb.iloc[tr_idx], y[tr_idx])
+            oof_s[va_idx] = m.predict_proba(X_fe_lgb.iloc[va_idx])[:, 1]
+        oof_rf_all.append(oof_s)
+
+oof_rf = np.mean(oof_rf_all, axis=0)
+rf_auc = roc_auc_score(y, oof_rf)
+print(f"[CV] RandomForest multi-seed/fold OOF AUC: {rf_auc:.6f}")
+
 # ============================================================
 # Optimise blend weights via Optuna on OOF predictions
 # ============================================================
 def blend_objective(trial):
-    w1 = trial.suggest_float('w_cb', 0.0, 1.0)
+    w1 = trial.suggest_float('w_cb',  0.0, 1.0)
     w2 = trial.suggest_float('w_lgb', 0.0, 1.0)
     w3 = trial.suggest_float('w_xgb', 0.0, 1.0)
-    total = w1 + w2 + w3 + 1e-9
-    blend = (w1 * oof_cb + w2 * oof_lgb + w3 * oof_xgb) / total
+    w4 = trial.suggest_float('w_rf',  0.0, 1.0)
+    total = w1 + w2 + w3 + w4 + 1e-9
+    blend = (w1 * oof_cb + w2 * oof_lgb + w3 * oof_xgb + w4 * oof_rf) / total
     return roc_auc_score(y, blend)
 
 study_blend = optuna.create_study(
     direction='maximize', sampler=optuna.samplers.TPESampler(seed=0))
-study_blend.optimize(blend_objective, n_trials=200, show_progress_bar=False)
+study_blend.optimize(blend_objective, n_trials=300, show_progress_bar=False)
 bp = study_blend.best_params
-total_w = bp['w_cb'] + bp['w_lgb'] + bp['w_xgb'] + 1e-9
+total_w = bp['w_cb'] + bp['w_lgb'] + bp['w_xgb'] + bp['w_rf'] + 1e-9
 w_cb  = bp['w_cb']  / total_w
 w_lgb = bp['w_lgb'] / total_w
 w_xgb = bp['w_xgb'] / total_w
-print(f"[BLEND] CB={w_cb:.3f}  LGB={w_lgb:.3f}  XGB={w_xgb:.3f}")
+w_rf  = bp['w_rf']  / total_w
+print(f"[BLEND] CB={w_cb:.3f}  LGB={w_lgb:.3f}  XGB={w_xgb:.3f}  RF={w_rf:.3f}")
 
-oof_blended = w_cb * oof_cb + w_lgb * oof_lgb + w_xgb * oof_xgb
+oof_blended = w_cb * oof_cb + w_lgb * oof_lgb + w_xgb * oof_xgb + w_rf * oof_rf
 blended_auc = roc_auc_score(y, oof_blended)
 
-# Also check simple equal-weight blend as sanity check
-equal_auc = roc_auc_score(y, (oof_cb + oof_lgb + oof_xgb) / 3)
+equal_auc = roc_auc_score(y, (oof_cb + oof_lgb + oof_xgb + oof_rf) / 4)
 
-print(f"[RESULT] CatBoost  : {cb_auc:.6f}")
-print(f"[RESULT] LightGBM  : {lgb_auc:.6f}")
-print(f"[RESULT] XGBoost   : {xgb_auc:.6f}")
-print(f"[RESULT] EqualBlend: {equal_auc:.6f}")
-print(f"[RESULT] OptBlend  : {blended_auc:.6f}")
+print(f"[RESULT] CatBoost   : {cb_auc:.6f}")
+print(f"[RESULT] LightGBM   : {lgb_auc:.6f}")
+print(f"[RESULT] XGBoost    : {xgb_auc:.6f}")
+print(f"[RESULT] RandomForest: {rf_auc:.6f}")
+print(f"[RESULT] EqualBlend : {equal_auc:.6f}")
+print(f"[RESULT] OptBlend   : {blended_auc:.6f}")
 
-final_auc = max(blended_auc, equal_auc, cb_auc, lgb_auc, xgb_auc)
+final_auc = max(blended_auc, equal_auc, cb_auc, lgb_auc, xgb_auc, rf_auc)
 print(f"BEST_VAL_ROC_AUC: {final_auc:.6f}")
