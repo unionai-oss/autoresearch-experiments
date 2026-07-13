@@ -115,6 +115,19 @@ if 'FamilySize' in X_fe.columns:
         [X_fe['FamilySize'] == 1, X_fe['FamilySize'] <= 4],
         ['alone', 'small'], default='large')
 
+# ── New interaction features ──────────────────────────────────────────────────
+# Being alone differs sharply by class: 1st/2nd-class loners had better odds
+if 'IsAlone' in X_fe.columns and 'Pclass' in X_fe.columns:
+    X_fe['IsAlone_Pclass'] = X_fe['IsAlone'] * X_fe['Pclass']
+
+# WomanOrChild in 3rd class had markedly lower survival than 1st/2nd class
+if 'WomanOrChild' in X_fe.columns and 'Pclass' in X_fe.columns:
+    X_fe['WomanOrChild_Pclass'] = X_fe['WomanOrChild'] * X_fe['Pclass']
+
+# FamilySize × Pclass: large families in 3rd class had very different outcomes
+if 'FamilySize' in X_fe.columns and 'Pclass' in X_fe.columns:
+    X_fe['FamilySize_Pclass'] = X_fe['FamilySize'] * X_fe['Pclass']
+
 # ── Categorical columns (CatBoost handles natively) ──────────────────────────
 cat_cols_cb = ['Sex', 'Embarked', 'Title', 'Deck', 'Sex_Pclass',
                'AgeBin', 'FamilySizeGroup']
@@ -164,10 +177,10 @@ def cb_objective(trial):
             X_fe.iloc[va_idx].reset_index(drop=True))[:, 1]
     return roc_auc_score(y, oof)
 
-print("[HPO] CatBoost (40 trials) ...")
+print("[HPO] CatBoost (60 trials) ...")
 study_cb = optuna.create_study(
     direction='maximize', sampler=optuna.samplers.TPESampler(seed=42))
-study_cb.optimize(cb_objective, n_trials=40, show_progress_bar=False)
+study_cb.optimize(cb_objective, n_trials=60, show_progress_bar=False)
 best_cb = study_cb.best_params
 print(f"[HPO] CatBoost best AUC={study_cb.best_value:.4f}")
 
@@ -243,7 +256,7 @@ best_xgb = study_xgb.best_params
 print(f"[HPO] XGBoost best AUC={study_xgb.best_value:.4f}")
 
 # ============================================================
-# Final OOF: CatBoost
+# Final OOF: CatBoost — multi-seed average for variance reduction
 # ============================================================
 final_cb = dict(
     iterations=3000,
@@ -256,71 +269,82 @@ final_cb = dict(
 )
 final_cb.update(best_cb)
 
-oof_cb = np.zeros(len(y))
-fold_aucs_cb = []
-for fold, (tr_idx, va_idx) in enumerate(skf.split(X_fe, y)):
-    m = CatBoostClassifier(random_seed=42 + fold,
-                           **{k: v for k, v in final_cb.items()
-                              if k != 'random_seed'})
-    m.fit(X_fe.iloc[tr_idx].reset_index(drop=True), y[tr_idx],
-          eval_set=(X_fe.iloc[va_idx].reset_index(drop=True), y[va_idx]))
-    oof_cb[va_idx] = m.predict_proba(
-        X_fe.iloc[va_idx].reset_index(drop=True))[:, 1]
-    fa = roc_auc_score(y[va_idx], oof_cb[va_idx])
-    fold_aucs_cb.append(fa)
-    print(f"  CB F{fold+1}: {fa:.4f} (iter={m.best_iteration_})")
+CB_SEEDS = [42, 123, 456, 789, 1000]
+print(f"[TRAIN] CatBoost final: {len(CB_SEEDS)} seeds × {skf.n_splits} folds")
+oof_cb_seeds = np.zeros((len(CB_SEEDS), len(y)))
+for si, seed in enumerate(CB_SEEDS):
+    oof_s = np.zeros(len(y))
+    for fold, (tr_idx, va_idx) in enumerate(skf.split(X_fe, y)):
+        m = CatBoostClassifier(
+            random_seed=seed,
+            **{k: v for k, v in final_cb.items() if k != 'random_seed'})
+        m.fit(X_fe.iloc[tr_idx].reset_index(drop=True), y[tr_idx],
+              eval_set=(X_fe.iloc[va_idx].reset_index(drop=True), y[va_idx]))
+        oof_s[va_idx] = m.predict_proba(
+            X_fe.iloc[va_idx].reset_index(drop=True))[:, 1]
+    auc_s = roc_auc_score(y, oof_s)
+    print(f"  CB seed={seed}: OOF AUC={auc_s:.4f}")
+    oof_cb_seeds[si] = oof_s
 
+oof_cb = oof_cb_seeds.mean(axis=0)
 cb_auc = roc_auc_score(y, oof_cb)
-print(f"[CV] CatBoost OOF AUC: {cb_auc:.6f} "
-      f"(mean={np.mean(fold_aucs_cb):.4f}±{np.std(fold_aucs_cb):.4f})")
+print(f"[CV] CatBoost multi-seed OOF AUC: {cb_auc:.6f}")
 
 # ============================================================
-# Final OOF: LightGBM
+# Final OOF: LightGBM — multi-seed average
 # ============================================================
-final_lgb = dict(n_estimators=3000, random_state=42, n_jobs=1, verbose=-1)
+final_lgb = dict(n_estimators=3000, n_jobs=1, verbose=-1)
 final_lgb.update(best_lgb)
 
-oof_lgb = np.zeros(len(y))
-fold_aucs_lgb = []
-for fold, (tr_idx, va_idx) in enumerate(skf.split(X_fe_lgb, y)):
-    m = lgb.LGBMClassifier(**final_lgb)
-    m.fit(X_fe_lgb.iloc[tr_idx], y[tr_idx],
-          eval_set=[(X_fe_lgb.iloc[va_idx], y[va_idx])],
-          callbacks=[lgb.early_stopping(100, verbose=False),
-                     lgb.log_evaluation(-1)])
-    oof_lgb[va_idx] = m.predict_proba(X_fe_lgb.iloc[va_idx])[:, 1]
-    fa = roc_auc_score(y[va_idx], oof_lgb[va_idx])
-    fold_aucs_lgb.append(fa)
-    print(f"  LGB F{fold+1}: {fa:.4f}")
+LGB_SEEDS = [42, 123, 456]
+print(f"[TRAIN] LightGBM final: {len(LGB_SEEDS)} seeds × {skf.n_splits} folds")
+oof_lgb_seeds = np.zeros((len(LGB_SEEDS), len(y)))
+for si, seed in enumerate(LGB_SEEDS):
+    oof_s = np.zeros(len(y))
+    params_s = dict(**final_lgb, random_state=seed)
+    for fold, (tr_idx, va_idx) in enumerate(skf.split(X_fe_lgb, y)):
+        m = lgb.LGBMClassifier(**params_s)
+        m.fit(X_fe_lgb.iloc[tr_idx], y[tr_idx],
+              eval_set=[(X_fe_lgb.iloc[va_idx], y[va_idx])],
+              callbacks=[lgb.early_stopping(100, verbose=False),
+                         lgb.log_evaluation(-1)])
+        oof_s[va_idx] = m.predict_proba(X_fe_lgb.iloc[va_idx])[:, 1]
+    auc_s = roc_auc_score(y, oof_s)
+    print(f"  LGB seed={seed}: OOF AUC={auc_s:.4f}")
+    oof_lgb_seeds[si] = oof_s
 
+oof_lgb = oof_lgb_seeds.mean(axis=0)
 lgb_auc = roc_auc_score(y, oof_lgb)
-print(f"[CV] LightGBM OOF AUC: {lgb_auc:.6f} "
-      f"(mean={np.mean(fold_aucs_lgb):.4f}±{np.std(fold_aucs_lgb):.4f})")
+print(f"[CV] LightGBM multi-seed OOF AUC: {lgb_auc:.6f}")
 
 # ============================================================
-# Final OOF: XGBoost
+# Final OOF: XGBoost — multi-seed average
 # ============================================================
 final_xgb = dict(
     n_estimators=3000, eval_metric='auc',
     early_stopping_rounds=100,
-    random_state=42, n_jobs=1, verbosity=0)
+    n_jobs=1, verbosity=0)
 final_xgb.update(best_xgb)
 
-oof_xgb = np.zeros(len(y))
-fold_aucs_xgb = []
-for fold, (tr_idx, va_idx) in enumerate(skf.split(X_fe_lgb, y)):
-    m = XGBClassifier(**final_xgb)
-    m.fit(X_fe_lgb.iloc[tr_idx], y[tr_idx],
-          eval_set=[(X_fe_lgb.iloc[va_idx], y[va_idx])],
-          verbose=False)
-    oof_xgb[va_idx] = m.predict_proba(X_fe_lgb.iloc[va_idx])[:, 1]
-    fa = roc_auc_score(y[va_idx], oof_xgb[va_idx])
-    fold_aucs_xgb.append(fa)
-    print(f"  XGB F{fold+1}: {fa:.4f}")
+XGB_SEEDS = [42, 123, 456]
+print(f"[TRAIN] XGBoost final: {len(XGB_SEEDS)} seeds × {skf.n_splits} folds")
+oof_xgb_seeds = np.zeros((len(XGB_SEEDS), len(y)))
+for si, seed in enumerate(XGB_SEEDS):
+    oof_s = np.zeros(len(y))
+    params_s = dict(**final_xgb, random_state=seed)
+    for fold, (tr_idx, va_idx) in enumerate(skf.split(X_fe_lgb, y)):
+        m = XGBClassifier(**params_s)
+        m.fit(X_fe_lgb.iloc[tr_idx], y[tr_idx],
+              eval_set=[(X_fe_lgb.iloc[va_idx], y[va_idx])],
+              verbose=False)
+        oof_s[va_idx] = m.predict_proba(X_fe_lgb.iloc[va_idx])[:, 1]
+    auc_s = roc_auc_score(y, oof_s)
+    print(f"  XGB seed={seed}: OOF AUC={auc_s:.4f}")
+    oof_xgb_seeds[si] = oof_s
 
+oof_xgb = oof_xgb_seeds.mean(axis=0)
 xgb_auc = roc_auc_score(y, oof_xgb)
-print(f"[CV] XGBoost OOF AUC: {xgb_auc:.6f} "
-      f"(mean={np.mean(fold_aucs_xgb):.4f}±{np.std(fold_aucs_xgb):.4f})")
+print(f"[CV] XGBoost multi-seed OOF AUC: {xgb_auc:.6f}")
 
 # ============================================================
 # Optimise blend weights via Optuna on OOF predictions
