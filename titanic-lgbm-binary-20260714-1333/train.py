@@ -10,7 +10,7 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import LabelEncoder, StandardScaler, PolynomialFeatures
 from sklearn.metrics import roc_auc_score
 from sklearn.ensemble import (ExtraTreesClassifier, RandomForestClassifier,
-                               HistGradientBoostingClassifier)
+                               HistGradientBoostingClassifier, GradientBoostingClassifier)
 from sklearn.svm import SVC
 from sklearn.linear_model import LogisticRegression
 from sklearn.neighbors import KNeighborsClassifier
@@ -70,7 +70,7 @@ def engineer_features(df_in):
         d["Deck"] = d["Cabin"].str[0].fillna("U")
         # Extract cabin number (position along ship = survival advantage)
         d["CabinNum"] = d["Cabin"].str.extract(r'(\d+)', expand=False).fillna(-1).astype(float)
-        # NEW: number of cabins assigned (multi-cabin → high-status passenger)
+        # Number of cabins assigned (multi-cabin → high-status passenger)
         d["CabinCount"] = d["Cabin"].fillna("").apply(
             lambda x: len(x.split()) if x else 0
         )
@@ -118,7 +118,7 @@ def engineer_features(df_in):
         if "FamilySize" in d.columns:
             d["FarePerPerson"] = d["Fare"] / d["FamilySize"]
             d["LogFarePerPerson"] = np.log1p(d["FarePerPerson"])
-        # NEW: fare per ticket group member (more accurate for mixed family/friend groups)
+        # fare per ticket group member (more accurate for mixed family/friend groups)
         if "TicketGroupSize" in d.columns:
             d["FarePerTicketMate"] = d["Fare"] / d["TicketGroupSize"]
             d["LogFarePerTicketMate"] = np.log1p(d["FarePerTicketMate"])
@@ -140,7 +140,7 @@ def engineer_features(df_in):
     # Binary sex for numeric interactions
     if "Sex" in d.columns:
         d["Sex_bin"] = (d["Sex"] == "male").astype(int)
-        d["IsFemale"] = 1 - d["Sex_bin"]  # NEW: explicit female indicator
+        d["IsFemale"] = 1 - d["Sex_bin"]
 
     # Age × Pclass
     if "Age" in d.columns and "Pclass" in d.columns:
@@ -198,17 +198,35 @@ def engineer_features(df_in):
     if "FamilySize" in d.columns and "Pclass" in d.columns:
         d["FamilySize_Pclass"] = d["FamilySize"] * d["Pclass"]
 
-    # NEW: Non-family ticket mates (friends traveling together = positive survival signal)
+    # Non-family ticket mates (friends traveling together = positive survival signal)
     if "TicketGroupSize" in d.columns and "FamilySize" in d.columns:
         d["NonFamilyTicketMates"] = (d["TicketGroupSize"] - d["FamilySize"]).clip(lower=0)
 
-    # NEW: IsChild × Pclass (poor children had lower survival than 1st class children)
+    # IsChild × Pclass (poor children had lower survival than 1st class children)
     if "IsChild" in d.columns and "Pclass" in d.columns:
         d["IsChild_Pclass"] = d["IsChild"] * d["Pclass"]
 
-    # NEW: IsFemale × Pclass (women in 1st class had very high survival vs 3rd class)
+    # IsFemale × Pclass (women in 1st class had very high survival vs 3rd class)
     if "IsFemale" in d.columns and "Pclass" in d.columns:
         d["IsFemale_Pclass"] = d["IsFemale"] * d["Pclass"]
+
+    # ── Ticket group composition (pure structural — no target, no leakage) ─────
+    # These tell each passenger who they're traveling with on the same ticket
+    if all(c in d.columns for c in ['TicketID', 'IsFemale', 'IsChild', 'IsWomanOrChild', 'Age']):
+        d['TG_FemRatio'] = d.groupby('TicketID')['IsFemale'].transform('mean')
+        d['TG_ChildRatio'] = d.groupby('TicketID')['IsChild'].transform('mean')
+        d['TG_WCRatio'] = d.groupby('TicketID')['IsWomanOrChild'].transform('mean')
+        d['TG_MeanAge'] = d.groupby('TicketID')['Age'].transform('mean')
+        # Adult male surrounded by women/children: survival different from all-male groups
+        if 'IsAdultMale' in d.columns:
+            d['TG_AdultMaleRatio'] = d.groupby('TicketID')['IsAdultMale'].transform('mean')
+
+    # ── Family group composition (structural — no target, no leakage) ──────────
+    # These tell each passenger about their family composition
+    if all(c in d.columns for c in ['FamilyID', 'IsFemale', 'IsChild', 'IsWomanOrChild']):
+        d['Fam_FemRatio'] = d.groupby('FamilyID')['IsFemale'].transform('mean')
+        d['Fam_ChildRatio'] = d.groupby('FamilyID')['IsChild'].transform('mean')
+        d['Fam_WCRatio'] = d.groupby('FamilyID')['IsWomanOrChild'].transform('mean')
 
     # Fill remaining NaN
     for col in d.select_dtypes(include=["object", "category"]).columns:
@@ -434,7 +452,8 @@ def cat_objective(trial):
 
 study_cat = optuna.create_study(direction="maximize",
                                   sampler=optuna.samplers.TPESampler(seed=42))
-study_cat.optimize(cat_objective, n_trials=10, show_progress_bar=False)
+# Increased from 10 to 25 trials for better CatBoost tuning
+study_cat.optimize(cat_objective, n_trials=25, show_progress_bar=False)
 best_cat_params = dict(
     verbose=False,
     train_dir='/tmp/catboost_info',
@@ -446,7 +465,7 @@ best_cat_params = dict(
 print(f"Best CatBoost params: {study_cat.best_params}")
 
 # ── Multi-seed CatBoost ───────────────────────────────────────────────────────
-cat_seeds = [42, 123]
+cat_seeds = [42, 123, 456]
 oof_cat_list = []
 for seed in cat_seeds:
     oof_seed = np.zeros(len(X_arr))
@@ -460,7 +479,7 @@ for seed in cat_seeds:
 
 oof_cat = np.mean(oof_cat_list, axis=0)
 auc_cat = roc_auc_score(y_encoded, oof_cat)
-print(f"CAT (2-seed, Optuna) OOF AUC: {auc_cat:.4f}")
+print(f"CAT (3-seed, Optuna) OOF AUC: {auc_cat:.4f}")
 
 # ── ExtraTrees ────────────────────────────────────────────────────────────────
 oof_et = np.zeros(len(X_arr))
@@ -659,35 +678,83 @@ for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
 auc_lr_poly = roc_auc_score(y_encoded, oof_lr_poly)
 print(f"LR-Poly OOF AUC: {auc_lr_poly:.4f}")
 
-# ── Equal-weight blend of all 11 models ───────────────────────────────────────
+# ── Sklearn GradientBoostingClassifier (diverse from XGB/LGB family) ─────────
+# sklearn's native GBDT implementation has different regularization; adds diversity
+oof_gbm = np.zeros(len(X_arr))
+for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
+    X_tr, X_va = X_arr[tr_idx], X_arr[va_idx]
+    y_tr, y_va = y_encoded[tr_idx], y_encoded[va_idx]
+    model = GradientBoostingClassifier(
+        n_estimators=600,
+        learning_rate=0.05,
+        max_depth=4,
+        subsample=0.8,
+        max_features='sqrt',
+        min_samples_leaf=3,
+        random_state=42,
+        n_iter_no_change=30,
+        validation_fraction=0.1,
+    )
+    model.fit(X_tr, y_tr)
+    oof_gbm[va_idx] = model.predict_proba(X_va)[:, 1]
+
+auc_gbm = roc_auc_score(y_encoded, oof_gbm)
+print(f"GBM (sklearn) OOF AUC: {auc_gbm:.4f}")
+
+# ── Equal-weight blend of all 12 models ───────────────────────────────────────
 all_oofs = [oof_lgb, oof_xgb, oof_cat, oof_et, oof_rf, oof_svm, oof_hgb,
-            oof_knn, oof_mlp, oof_dart, oof_lr_poly]
-oof_blend11 = np.mean(all_oofs, axis=0)
-auc_blend11 = roc_auc_score(y_encoded, oof_blend11)
-print(f"Blend-11 OOF AUC: {auc_blend11:.4f}")
+            oof_knn, oof_mlp, oof_dart, oof_lr_poly, oof_gbm]
+all_aucs_arr = np.array([auc_lgb, auc_xgb, auc_cat, auc_et, auc_rf, auc_svm, auc_hgb,
+                          auc_knn, auc_mlp, auc_dart, auc_lr_poly, auc_gbm])
+
+oof_blend12 = np.mean(all_oofs, axis=0)
+auc_blend12 = roc_auc_score(y_encoded, oof_blend12)
+print(f"Blend-12 OOF AUC: {auc_blend12:.4f}")
+
+# Weighted blend by individual AUC^4 (emphasize stronger models)
+w = all_aucs_arr ** 4
+w /= w.sum()
+oof_mat = np.column_stack(all_oofs)  # (N, 12)
+oof_blend_wt = oof_mat @ w
+auc_blend_wt = roc_auc_score(y_encoded, oof_blend_wt)
+print(f"Blend-12 (weighted) OOF AUC: {auc_blend_wt:.4f}")
+
+# Rank-average blend (more robust to probability calibration differences)
+from scipy.stats import rankdata
+oof_ranks_mat = np.column_stack([rankdata(oof) / len(oof) for oof in all_oofs])
+oof_blend_rank = np.mean(oof_ranks_mat, axis=1)
+auc_blend_rank = roc_auc_score(y_encoded, oof_blend_rank)
+print(f"Blend-12 (rank) OOF AUC: {auc_blend_rank:.4f}")
 
 # ── Stacking: Logistic Regression meta-learner ────────────────────────────────
-meta_11 = np.column_stack(all_oofs)
+meta_12 = np.column_stack(all_oofs)
 
 oof_meta_lr = np.zeros(len(X_arr))
 for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
     meta_model = LogisticRegression(C=1.0, random_state=42, max_iter=1000)
-    meta_model.fit(meta_11[tr_idx], y_encoded[tr_idx])
-    oof_meta_lr[va_idx] = meta_model.predict_proba(meta_11[va_idx])[:, 1]
+    meta_model.fit(meta_12[tr_idx], y_encoded[tr_idx])
+    oof_meta_lr[va_idx] = meta_model.predict_proba(meta_12[va_idx])[:, 1]
 
 auc_meta_lr = roc_auc_score(y_encoded, oof_meta_lr)
 print(f"Stack-LR OOF AUC: {auc_meta_lr:.4f}")
 
 # ── Stacking: LightGBM meta-learner with key original + all TE features ───────
 all_te_cols = [c for c in X_all.columns if c.endswith('_te')]
+# Include new group composition features + TE features
 meta_key_cols = [c for c in ['Pclass', 'Sex_bin', 'AgeBin', 'IsAdultMale',
                                'IsWomanOrChild', 'LogFare', 'HasCabin', 'FamilySize',
                                'FareRank_Pclass', 'IsAlone', 'TicketGroupSize',
                                'IsFemale', 'IsFemale_Pclass', 'IsChild_Pclass',
-                               'FarePerTicketMate'] + all_te_cols
+                               'FarePerTicketMate',
+                               'TG_FemRatio', 'TG_WCRatio', 'TG_ChildRatio', 'TG_MeanAge',
+                               'Fam_FemRatio', 'Fam_WCRatio', 'Fam_ChildRatio'] + all_te_cols
                  if c in X_all.columns]
 meta_orig = X_all[meta_key_cols].values.astype(np.float32)
-meta_11_ext = np.column_stack([meta_11, meta_orig])
+
+# Add rank-normalized OOF predictions as additional meta features
+# (calibration-invariant signal for the meta-learner)
+meta_ranks = np.column_stack([rankdata(oof) / len(oof) for oof in all_oofs])
+meta_12_ext = np.column_stack([meta_12, meta_ranks, meta_orig])
 
 oof_meta_lgb = np.zeros(len(X_arr))
 for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
@@ -708,12 +775,39 @@ for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
         verbose=-1,
         random_state=42,
     )
-    meta_model.fit(meta_11_ext[tr_idx], y_encoded[tr_idx])
-    oof_meta_lgb[va_idx] = meta_model.predict_proba(meta_11_ext[va_idx])[:, 1]
+    meta_model.fit(meta_12_ext[tr_idx], y_encoded[tr_idx])
+    oof_meta_lgb[va_idx] = meta_model.predict_proba(meta_12_ext[va_idx])[:, 1]
 
 auc_meta_lgb = roc_auc_score(y_encoded, oof_meta_lgb)
 print(f"Stack-LGB OOF AUC: {auc_meta_lgb:.4f}")
 
+# ── Stacking: XGBoost meta-learner ────────────────────────────────────────────
+oof_meta_xgb = np.zeros(len(X_arr))
+for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
+    meta_model = xgb.XGBClassifier(
+        objective="binary:logistic",
+        n_estimators=300,
+        max_depth=2,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        reg_alpha=1.0,
+        reg_lambda=2.0,
+        verbosity=0,
+        random_state=42,
+    )
+    meta_model.fit(meta_12_ext[tr_idx], y_encoded[tr_idx])
+    oof_meta_xgb[va_idx] = meta_model.predict_proba(meta_12_ext[va_idx])[:, 1]
+
+auc_meta_xgb = roc_auc_score(y_encoded, oof_meta_xgb)
+print(f"Stack-XGB OOF AUC: {auc_meta_xgb:.4f}")
+
+# ── Meta-ensemble: average LGB and XGB meta predictions ──────────────────────
+oof_meta_avg = (oof_meta_lgb + oof_meta_xgb) / 2
+auc_meta_avg = roc_auc_score(y_encoded, oof_meta_avg)
+print(f"Stack-LGB+XGB OOF AUC: {auc_meta_avg:.4f}")
+
 # Report the best across all ensembling strategies
-best_val_roc_auc = max(auc_blend11, auc_meta_lr, auc_meta_lgb)
+best_val_roc_auc = max(auc_blend12, auc_blend_wt, auc_blend_rank,
+                        auc_meta_lr, auc_meta_lgb, auc_meta_xgb, auc_meta_avg)
 print(f"BEST_VAL_ROC_AUC: {best_val_roc_auc:.6f}")
