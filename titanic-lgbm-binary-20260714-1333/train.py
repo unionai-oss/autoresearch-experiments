@@ -9,12 +9,17 @@ import numpy as np
 from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.metrics import roc_auc_score
-from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier
+from sklearn.ensemble import (ExtraTreesClassifier, RandomForestClassifier,
+                               HistGradientBoostingClassifier)
 from sklearn.svm import SVC
 from sklearn.linear_model import LogisticRegression
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.neural_network import MLPClassifier
 import lightgbm as lgb
 import xgboost as xgb
 from catboost import CatBoostClassifier
+import optuna
+optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 df = pd.read_parquet(DATA_PATH)
 
@@ -63,6 +68,8 @@ def engineer_features(df_in):
     if "Cabin" in d.columns:
         d["HasCabin"] = d["Cabin"].notna().astype(int)
         d["Deck"] = d["Cabin"].str[0].fillna("U")
+        # Extract cabin number (position along ship = survival advantage)
+        d["CabinNum"] = d["Cabin"].str.extract(r'(\d+)', expand=False).fillna(-1).astype(float)
         d = d.drop(columns=["Cabin"])
 
     # Ticket: prefix + group size + keep full TicketID for group survival encoding
@@ -171,9 +178,16 @@ def engineer_features(df_in):
         d["Age_Sex"] = d["Age"] * d["Sex_bin"]
 
     # Title+Pclass combined category — captures survival by title within each class
-    # (e.g., Mrs in 1st class vs Mrs in 3rd class have very different survival rates)
     if "Title" in d.columns and "Pclass" in d.columns:
         d["Title_Pclass"] = d["Title"].astype(str) + "_" + d["Pclass"].astype(str)
+
+    # TicketGroupSize × IsAlone interaction (ticket alone vs family on same ticket)
+    if "TicketGroupSize" in d.columns and "IsAlone" in d.columns:
+        d["TicketSize_IsAlone"] = d["TicketGroupSize"] * d["IsAlone"]
+
+    # FamilySize × Pclass (large families in 3rd class fare worse)
+    if "FamilySize" in d.columns and "Pclass" in d.columns:
+        d["FamilySize_Pclass"] = d["FamilySize"] * d["Pclass"]
 
     # Fill remaining NaN
     for col in d.select_dtypes(include=["object", "category"]).columns:
@@ -187,8 +201,6 @@ def engineer_features(df_in):
 X_all_raw = engineer_features(X_raw)
 
 # Identify categorical columns for OOF target encoding
-# TicketID captures full ticket-group survival rate (people on same ticket often evacuated together)
-# Title_Pclass captures survival by title within each passenger class
 CAT_COLS_FOR_TE = [c for c in ["Title", "Pclass_Sex", "Deck", "TicketPrefix", "FamilyID",
                                 "Embarked", "TicketID", "Title_Pclass"]
                    if c in X_all_raw.columns]
@@ -247,39 +259,71 @@ for col in X_all.select_dtypes(include=["object", "category"]).columns:
 X_arr = X_all.values.astype(np.float32)
 print(f"Features ({X_arr.shape[1]}): {list(X_all.columns)}")
 
-# ── LightGBM ─────────────────────────────────────────────────────────────────
-lgb_params = dict(
+# ── Optuna-tuned LightGBM ─────────────────────────────────────────────────────
+print("Tuning LightGBM with Optuna...")
+
+def lgb_objective(trial):
+    params = dict(
+        objective="binary",
+        metric="auc",
+        boosting_type="gbdt",
+        num_leaves=trial.suggest_int("num_leaves", 20, 127),
+        max_depth=-1,
+        learning_rate=trial.suggest_float("learning_rate", 0.01, 0.08, log=True),
+        n_estimators=3000,
+        feature_fraction=trial.suggest_float("feature_fraction", 0.5, 1.0),
+        bagging_fraction=trial.suggest_float("bagging_fraction", 0.5, 1.0),
+        bagging_freq=5,
+        min_child_samples=trial.suggest_int("min_child_samples", 3, 30),
+        reg_alpha=trial.suggest_float("reg_alpha", 0.01, 2.0, log=True),
+        reg_lambda=trial.suggest_float("reg_lambda", 0.01, 2.0, log=True),
+        verbose=-1,
+        random_state=42,
+    )
+    oof = np.zeros(len(X_arr))
+    for tr_idx, va_idx in skf.split(X_arr, y_encoded):
+        m = lgb.LGBMClassifier(**params)
+        m.fit(X_arr[tr_idx], y_encoded[tr_idx],
+              eval_set=[(X_arr[va_idx], y_encoded[va_idx])],
+              callbacks=[lgb.early_stopping(80, verbose=False), lgb.log_evaluation(-1)])
+        oof[va_idx] = m.predict_proba(X_arr[va_idx])[:, 1]
+    return roc_auc_score(y_encoded, oof)
+
+study_lgb = optuna.create_study(direction="maximize",
+                                 sampler=optuna.samplers.TPESampler(seed=42))
+study_lgb.optimize(lgb_objective, n_trials=50, show_progress_bar=False)
+best_lgb_params = dict(
     objective="binary",
     metric="auc",
     boosting_type="gbdt",
-    num_leaves=63,
-    max_depth=-1,
-    learning_rate=0.02,
-    n_estimators=3000,
-    feature_fraction=0.8,
-    bagging_fraction=0.8,
-    bagging_freq=5,
-    min_child_samples=5,
-    reg_alpha=0.05,
-    reg_lambda=0.05,
     verbose=-1,
     random_state=42,
+    n_estimators=3000,
+    bagging_freq=5,
+    **study_lgb.best_params
 )
+print(f"Best LGB params: {study_lgb.best_params}")
 
-oof_lgb = np.zeros(len(X_arr))
-for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
-    X_tr, X_va = X_arr[tr_idx], X_arr[va_idx]
-    y_tr, y_va = y_encoded[tr_idx], y_encoded[va_idx]
-    model = lgb.LGBMClassifier(**lgb_params)
-    model.fit(
-        X_tr, y_tr,
-        eval_set=[(X_va, y_va)],
-        callbacks=[lgb.early_stopping(100, verbose=False), lgb.log_evaluation(-1)],
-    )
-    oof_lgb[va_idx] = model.predict_proba(X_va)[:, 1]
+# ── Multi-seed LightGBM ───────────────────────────────────────────────────────
+lgb_seeds = [42, 123, 456]
+oof_lgb_list = []
+for seed in lgb_seeds:
+    oof_seed = np.zeros(len(X_arr))
+    for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
+        X_tr, X_va = X_arr[tr_idx], X_arr[va_idx]
+        y_tr, y_va = y_encoded[tr_idx], y_encoded[va_idx]
+        model = lgb.LGBMClassifier(**{**best_lgb_params, 'random_state': seed})
+        model.fit(
+            X_tr, y_tr,
+            eval_set=[(X_va, y_va)],
+            callbacks=[lgb.early_stopping(100, verbose=False), lgb.log_evaluation(-1)],
+        )
+        oof_seed[va_idx] = model.predict_proba(X_va)[:, 1]
+    oof_lgb_list.append(oof_seed)
 
+oof_lgb = np.mean(oof_lgb_list, axis=0)
 auc_lgb = roc_auc_score(y_encoded, oof_lgb)
-print(f"LGB OOF AUC: {auc_lgb:.4f}")
+print(f"LGB (3-seed, Optuna) OOF AUC: {auc_lgb:.4f}")
 
 # ── XGBoost ──────────────────────────────────────────────────────────────────
 oof_xgb = np.zeros(len(X_arr))
@@ -333,7 +377,7 @@ for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
 auc_cat = roc_auc_score(y_encoded, oof_cat)
 print(f"CAT OOF AUC: {auc_cat:.4f}")
 
-# ── ExtraTrees (maximum diversity from GBMs) ──────────────────────────────────
+# ── ExtraTrees ────────────────────────────────────────────────────────────────
 oof_et = np.zeros(len(X_arr))
 for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
     X_tr, X_va = X_arr[tr_idx], X_arr[va_idx]
@@ -352,7 +396,6 @@ auc_et = roc_auc_score(y_encoded, oof_et)
 print(f"ET OOF AUC: {auc_et:.4f}")
 
 # ── Random Forest ─────────────────────────────────────────────────────────────
-# Different from ExtraTrees: uses best split from random subset (not fully random)
 oof_rf = np.zeros(len(X_arr))
 for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
     X_tr, X_va = X_arr[tr_idx], X_arr[va_idx]
@@ -372,12 +415,10 @@ auc_rf = roc_auc_score(y_encoded, oof_rf)
 print(f"RF OOF AUC: {auc_rf:.4f}")
 
 # ── SVM with RBF kernel ───────────────────────────────────────────────────────
-# Very different inductive bias from tree models: smooth kernel-based decision boundary
 oof_svm = np.zeros(len(X_arr))
 for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
     X_tr, X_va = X_arr[tr_idx], X_arr[va_idx]
     y_tr, y_va = y_encoded[tr_idx], y_encoded[va_idx]
-    # SVM requires feature scaling; scale inside fold to avoid leakage
     scaler = StandardScaler()
     X_tr_sc = scaler.fit_transform(X_tr)
     X_va_sc = scaler.transform(X_va)
@@ -388,33 +429,103 @@ for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
 auc_svm = roc_auc_score(y_encoded, oof_svm)
 print(f"SVM OOF AUC: {auc_svm:.4f}")
 
-# ── Equal-weight blend of all 6 models ────────────────────────────────────────
-oof_blend6 = (oof_lgb + oof_xgb + oof_cat + oof_et + oof_rf + oof_svm) / 6.0
-auc_blend6 = roc_auc_score(y_encoded, oof_blend6)
-print(f"Blend-6 OOF AUC: {auc_blend6:.4f}")
+# ── HistGradientBoostingClassifier (sklearn) ──────────────────────────────────
+# Different algorithm: native NaN handling, depth-wise growth
+oof_hgb = np.zeros(len(X_arr))
+for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
+    X_tr, X_va = X_arr[tr_idx], X_arr[va_idx]
+    y_tr, y_va = y_encoded[tr_idx], y_encoded[va_idx]
+    model = HistGradientBoostingClassifier(
+        max_iter=1000,
+        learning_rate=0.05,
+        max_leaf_nodes=31,
+        min_samples_leaf=5,
+        l2_regularization=0.1,
+        max_bins=255,
+        random_state=42,
+        early_stopping=True,
+        validation_fraction=0.1,
+        n_iter_no_change=30,
+    )
+    model.fit(X_tr, y_tr)
+    oof_hgb[va_idx] = model.predict_proba(X_va)[:, 1]
+
+auc_hgb = roc_auc_score(y_encoded, oof_hgb)
+print(f"HGB OOF AUC: {auc_hgb:.4f}")
+
+# ── KNN (averaged over multiple k values) ────────────────────────────────────
+# Instance-based: very different inductive bias from tree models
+oof_knn = np.zeros(len(X_arr))
+for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
+    X_tr, X_va = X_arr[tr_idx], X_arr[va_idx]
+    y_tr, y_va = y_encoded[tr_idx], y_encoded[va_idx]
+    scaler = StandardScaler()
+    X_tr_sc = scaler.fit_transform(X_tr)
+    X_va_sc = scaler.transform(X_va)
+    knn_preds = []
+    for k in [5, 10, 15, 20, 30]:
+        model = KNeighborsClassifier(n_neighbors=k, metric='euclidean', weights='distance', n_jobs=-1)
+        model.fit(X_tr_sc, y_tr)
+        knn_preds.append(model.predict_proba(X_va_sc)[:, 1])
+    oof_knn[va_idx] = np.mean(knn_preds, axis=0)
+
+auc_knn = roc_auc_score(y_encoded, oof_knn)
+print(f"KNN OOF AUC: {auc_knn:.4f}")
+
+# ── MLP (sklearn neural network) ─────────────────────────────────────────────
+# Non-linear decision boundaries, different from tree-based models
+oof_mlp = np.zeros(len(X_arr))
+for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
+    X_tr, X_va = X_arr[tr_idx], X_arr[va_idx]
+    y_tr, y_va = y_encoded[tr_idx], y_encoded[va_idx]
+    scaler = StandardScaler()
+    X_tr_sc = scaler.fit_transform(X_tr)
+    X_va_sc = scaler.transform(X_va)
+    model = MLPClassifier(
+        hidden_layer_sizes=(128, 64, 32),
+        activation='relu',
+        alpha=0.5,       # L2 regularization — crucial for small N
+        batch_size=64,
+        learning_rate='adaptive',
+        learning_rate_init=0.001,
+        max_iter=500,
+        random_state=42,
+        early_stopping=True,
+        validation_fraction=0.1,
+        n_iter_no_change=20,
+    )
+    model.fit(X_tr_sc, y_tr)
+    oof_mlp[va_idx] = model.predict_proba(X_va_sc)[:, 1]
+
+auc_mlp = roc_auc_score(y_encoded, oof_mlp)
+print(f"MLP OOF AUC: {auc_mlp:.4f}")
+
+# ── Equal-weight blend of all 9 models ────────────────────────────────────────
+all_oofs = [oof_lgb, oof_xgb, oof_cat, oof_et, oof_rf, oof_svm, oof_hgb, oof_knn, oof_mlp]
+oof_blend9 = np.mean(all_oofs, axis=0)
+auc_blend9 = roc_auc_score(y_encoded, oof_blend9)
+print(f"Blend-9 OOF AUC: {auc_blend9:.4f}")
 
 # ── Stacking: Logistic Regression meta-learner ────────────────────────────────
-meta_6 = np.column_stack([oof_lgb, oof_xgb, oof_cat, oof_et, oof_rf, oof_svm])
+meta_9 = np.column_stack(all_oofs)
 
 oof_meta_lr = np.zeros(len(X_arr))
 for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
     meta_model = LogisticRegression(C=1.0, random_state=42, max_iter=1000)
-    meta_model.fit(meta_6[tr_idx], y_encoded[tr_idx])
-    oof_meta_lr[va_idx] = meta_model.predict_proba(meta_6[va_idx])[:, 1]
+    meta_model.fit(meta_9[tr_idx], y_encoded[tr_idx])
+    oof_meta_lr[va_idx] = meta_model.predict_proba(meta_9[va_idx])[:, 1]
 
 auc_meta_lr = roc_auc_score(y_encoded, oof_meta_lr)
 print(f"Stack-LR OOF AUC: {auc_meta_lr:.4f}")
 
-# ── Stacking: LightGBM meta-learner with key original features ────────────────
-# Augment OOF predictions with key original features so meta-learner can weight
-# base models differently by passenger type (e.g., trust tree models less for
-# passengers with very unusual fare+class combinations)
+# ── Stacking: LightGBM meta-learner with key original + all TE features ───────
+all_te_cols = [c for c in X_all.columns if c.endswith('_te')]
 meta_key_cols = [c for c in ['Pclass', 'Sex_bin', 'AgeBin', 'IsAdultMale',
                                'IsWomanOrChild', 'LogFare', 'HasCabin', 'FamilySize',
-                               'Title_te', 'Pclass_Sex_te']
+                               'FareRank_Pclass', 'IsAlone', 'TicketGroupSize'] + all_te_cols
                  if c in X_all.columns]
 meta_orig = X_all[meta_key_cols].values.astype(np.float32)
-meta_6_ext = np.column_stack([meta_6, meta_orig])
+meta_9_ext = np.column_stack([meta_9, meta_orig])
 
 oof_meta_lgb = np.zeros(len(X_arr))
 for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
@@ -425,7 +536,7 @@ for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
         num_leaves=7,
         max_depth=3,
         learning_rate=0.05,
-        n_estimators=200,
+        n_estimators=300,
         feature_fraction=1.0,
         bagging_fraction=0.8,
         bagging_freq=5,
@@ -435,12 +546,12 @@ for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
         verbose=-1,
         random_state=42,
     )
-    meta_model.fit(meta_6_ext[tr_idx], y_encoded[tr_idx])
-    oof_meta_lgb[va_idx] = meta_model.predict_proba(meta_6_ext[va_idx])[:, 1]
+    meta_model.fit(meta_9_ext[tr_idx], y_encoded[tr_idx])
+    oof_meta_lgb[va_idx] = meta_model.predict_proba(meta_9_ext[va_idx])[:, 1]
 
 auc_meta_lgb = roc_auc_score(y_encoded, oof_meta_lgb)
 print(f"Stack-LGB OOF AUC: {auc_meta_lgb:.4f}")
 
 # Report the best across all ensembling strategies
-best_val_roc_auc = max(auc_blend6, auc_meta_lr, auc_meta_lgb)
+best_val_roc_auc = max(auc_blend9, auc_meta_lr, auc_meta_lgb)
 print(f"BEST_VAL_ROC_AUC: {best_val_roc_auc:.6f}")
