@@ -7,9 +7,10 @@ sys.path.insert(0, '/home/flyte/.local/lib/python3.13/site-packages')
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import StratifiedKFold
-from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.metrics import roc_auc_score
-from sklearn.ensemble import ExtraTreesClassifier
+from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier
+from sklearn.svm import SVC
 from sklearn.linear_model import LogisticRegression
 import lightgbm as lgb
 import xgboost as xgb
@@ -64,7 +65,7 @@ def engineer_features(df_in):
         d["Deck"] = d["Cabin"].str[0].fillna("U")
         d = d.drop(columns=["Cabin"])
 
-    # Ticket: prefix + group size
+    # Ticket: prefix + group size + keep full TicketID for group survival encoding
     if "Ticket" in d.columns:
         d["TicketGroupSize"] = d["Ticket"].map(d["Ticket"].value_counts())
         cleaned = d["Ticket"].str.upper().str.replace(r'[\./\s]', '', regex=True)
@@ -74,6 +75,8 @@ def engineer_features(df_in):
         d["TicketPrefix"] = d["TicketPrefix"].map(
             lambda x: x if prefix_counts.get(x, 0) >= 5 else "RARE"
         )
+        # Keep full ticket number for OOF group survival encoding (ticket-mates' survival)
+        d["TicketID"] = d["Ticket"].astype(str)
         d = d.drop(columns=["Ticket"])
 
     # Drop IDs
@@ -96,7 +99,7 @@ def engineer_features(df_in):
         d["AgeBin"] = pd.cut(d["Age"], bins=[0, 12, 18, 35, 60, 200],
                              labels=[0, 1, 2, 3, 4]).astype(float).fillna(2)
 
-    # Fare: imputation + per-person + log
+    # Fare: imputation + per-person + log + rank within Pclass
     if "Fare" in d.columns:
         fare_med = d.loc[d["Fare"] > 0, "Fare"].median()
         d["Fare"] = d["Fare"].fillna(fare_med)
@@ -105,6 +108,9 @@ def engineer_features(df_in):
             d["FarePerPerson"] = d["Fare"] / d["FamilySize"]
             d["LogFarePerPerson"] = np.log1p(d["FarePerPerson"])
         d["LogFare"] = np.log1p(d["Fare"])
+        # Percentile rank of fare within Pclass — captures relative wealth within class
+        if "Pclass" in d.columns:
+            d["FareRank_Pclass"] = d.groupby("Pclass")["Fare"].rank(pct=True)
 
     # Embarked imputation
     if "Embarked" in d.columns:
@@ -132,7 +138,7 @@ def engineer_features(df_in):
     if "Pclass" in d.columns and "LogFarePerPerson" in d.columns:
         d["Pclass_LogFPP"] = d["Pclass"] * d["LogFarePerPerson"]
 
-    # ── NEW: "Women and children first" semantic features ──────────────────
+    # ── "Women and children first" semantic features ───────────────────────────
     if "Age" in d.columns and "Sex" in d.columns:
         d["IsChild"] = (d["Age"] < 15).astype(int)
         d["IsWomanOrChild"] = ((d["Sex"] == "female") | (d["Age"] < 15)).astype(int)
@@ -155,6 +161,20 @@ def engineer_features(df_in):
     if "Pclass" in d.columns and "IsAdultMale" in d.columns:
         d["Pclass_AdultMale"] = d["Pclass"] * d["IsAdultMale"]
 
+    # ── Additional interaction features ───────────────────────────────────────
+    # Pclass × IsAlone (being alone in 3rd class is particularly bad)
+    if "Pclass" in d.columns and "IsAlone" in d.columns:
+        d["Pclass_IsAlone"] = d["Pclass"] * d["IsAlone"]
+
+    # Age × Sex_bin (captures that boys and girls have similar survival, men much lower)
+    if "Age" in d.columns and "Sex_bin" in d.columns:
+        d["Age_Sex"] = d["Age"] * d["Sex_bin"]
+
+    # Title+Pclass combined category — captures survival by title within each class
+    # (e.g., Mrs in 1st class vs Mrs in 3rd class have very different survival rates)
+    if "Title" in d.columns and "Pclass" in d.columns:
+        d["Title_Pclass"] = d["Title"].astype(str) + "_" + d["Pclass"].astype(str)
+
     # Fill remaining NaN
     for col in d.select_dtypes(include=["object", "category"]).columns:
         d[col] = d[col].fillna("Unknown")
@@ -167,7 +187,10 @@ def engineer_features(df_in):
 X_all_raw = engineer_features(X_raw)
 
 # Identify categorical columns for OOF target encoding
-CAT_COLS_FOR_TE = [c for c in ["Title", "Pclass_Sex", "Deck", "TicketPrefix", "FamilyID", "Embarked"]
+# TicketID captures full ticket-group survival rate (people on same ticket often evacuated together)
+# Title_Pclass captures survival by title within each passenger class
+CAT_COLS_FOR_TE = [c for c in ["Title", "Pclass_Sex", "Deck", "TicketPrefix", "FamilyID",
+                                "Embarked", "TicketID", "Title_Pclass"]
                    if c in X_all_raw.columns]
 print(f"Categorical cols for target encoding: {CAT_COLS_FOR_TE}")
 
@@ -328,27 +351,96 @@ for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
 auc_et = roc_auc_score(y_encoded, oof_et)
 print(f"ET OOF AUC: {auc_et:.4f}")
 
-# ── Equal-weight blend of all 4 models ───────────────────────────────────────
-oof_blend4 = (oof_lgb + oof_xgb + oof_cat + oof_et) / 4.0
-auc_blend4 = roc_auc_score(y_encoded, oof_blend4)
-print(f"Blend-4 OOF AUC: {auc_blend4:.4f}")
-
-# ── Stacking meta-learner (Logistic Regression) ───────────────────────────────
-# Use OOF predictions as features; proper 10-fold CV prevents leakage.
-# For each fold k: meta-LR is trained on OOF preds from folds ≠k and evaluated on fold k.
-meta_features = np.column_stack([oof_lgb, oof_xgb, oof_cat, oof_et])
-
-oof_meta = np.zeros(len(X_arr))
+# ── Random Forest ─────────────────────────────────────────────────────────────
+# Different from ExtraTrees: uses best split from random subset (not fully random)
+oof_rf = np.zeros(len(X_arr))
 for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
-    meta_tr = meta_features[tr_idx]
-    meta_va = meta_features[va_idx]
+    X_tr, X_va = X_arr[tr_idx], X_arr[va_idx]
+    y_tr, y_va = y_encoded[tr_idx], y_encoded[va_idx]
+    model = RandomForestClassifier(
+        n_estimators=1000,
+        max_features='sqrt',
+        min_samples_leaf=1,
+        max_depth=None,
+        random_state=42,
+        n_jobs=-1,
+    )
+    model.fit(X_tr, y_tr)
+    oof_rf[va_idx] = model.predict_proba(X_va)[:, 1]
+
+auc_rf = roc_auc_score(y_encoded, oof_rf)
+print(f"RF OOF AUC: {auc_rf:.4f}")
+
+# ── SVM with RBF kernel ───────────────────────────────────────────────────────
+# Very different inductive bias from tree models: smooth kernel-based decision boundary
+oof_svm = np.zeros(len(X_arr))
+for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
+    X_tr, X_va = X_arr[tr_idx], X_arr[va_idx]
+    y_tr, y_va = y_encoded[tr_idx], y_encoded[va_idx]
+    # SVM requires feature scaling; scale inside fold to avoid leakage
+    scaler = StandardScaler()
+    X_tr_sc = scaler.fit_transform(X_tr)
+    X_va_sc = scaler.transform(X_va)
+    model = SVC(kernel='rbf', C=10.0, gamma='scale', probability=True, random_state=42)
+    model.fit(X_tr_sc, y_tr)
+    oof_svm[va_idx] = model.predict_proba(X_va_sc)[:, 1]
+
+auc_svm = roc_auc_score(y_encoded, oof_svm)
+print(f"SVM OOF AUC: {auc_svm:.4f}")
+
+# ── Equal-weight blend of all 6 models ────────────────────────────────────────
+oof_blend6 = (oof_lgb + oof_xgb + oof_cat + oof_et + oof_rf + oof_svm) / 6.0
+auc_blend6 = roc_auc_score(y_encoded, oof_blend6)
+print(f"Blend-6 OOF AUC: {auc_blend6:.4f}")
+
+# ── Stacking: Logistic Regression meta-learner ────────────────────────────────
+meta_6 = np.column_stack([oof_lgb, oof_xgb, oof_cat, oof_et, oof_rf, oof_svm])
+
+oof_meta_lr = np.zeros(len(X_arr))
+for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
     meta_model = LogisticRegression(C=1.0, random_state=42, max_iter=1000)
-    meta_model.fit(meta_tr, y_encoded[tr_idx])
-    oof_meta[va_idx] = meta_model.predict_proba(meta_va)[:, 1]
+    meta_model.fit(meta_6[tr_idx], y_encoded[tr_idx])
+    oof_meta_lr[va_idx] = meta_model.predict_proba(meta_6[va_idx])[:, 1]
 
-auc_meta = roc_auc_score(y_encoded, oof_meta)
-print(f"Stack OOF AUC: {auc_meta:.4f}")
+auc_meta_lr = roc_auc_score(y_encoded, oof_meta_lr)
+print(f"Stack-LR OOF AUC: {auc_meta_lr:.4f}")
 
-# Report the best of equal-weight blend vs stacking meta-learner
-best_val_roc_auc = max(auc_blend4, auc_meta)
+# ── Stacking: LightGBM meta-learner with key original features ────────────────
+# Augment OOF predictions with key original features so meta-learner can weight
+# base models differently by passenger type (e.g., trust tree models less for
+# passengers with very unusual fare+class combinations)
+meta_key_cols = [c for c in ['Pclass', 'Sex_bin', 'AgeBin', 'IsAdultMale',
+                               'IsWomanOrChild', 'LogFare', 'HasCabin', 'FamilySize',
+                               'Title_te', 'Pclass_Sex_te']
+                 if c in X_all.columns]
+meta_orig = X_all[meta_key_cols].values.astype(np.float32)
+meta_6_ext = np.column_stack([meta_6, meta_orig])
+
+oof_meta_lgb = np.zeros(len(X_arr))
+for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
+    meta_model = lgb.LGBMClassifier(
+        objective="binary",
+        metric="auc",
+        boosting_type="gbdt",
+        num_leaves=7,
+        max_depth=3,
+        learning_rate=0.05,
+        n_estimators=200,
+        feature_fraction=1.0,
+        bagging_fraction=0.8,
+        bagging_freq=5,
+        min_child_samples=10,
+        reg_alpha=1.0,
+        reg_lambda=1.0,
+        verbose=-1,
+        random_state=42,
+    )
+    meta_model.fit(meta_6_ext[tr_idx], y_encoded[tr_idx])
+    oof_meta_lgb[va_idx] = meta_model.predict_proba(meta_6_ext[va_idx])[:, 1]
+
+auc_meta_lgb = roc_auc_score(y_encoded, oof_meta_lgb)
+print(f"Stack-LGB OOF AUC: {auc_meta_lgb:.4f}")
+
+# Report the best across all ensembling strategies
+best_val_roc_auc = max(auc_blend6, auc_meta_lr, auc_meta_lgb)
 print(f"BEST_VAL_ROC_AUC: {best_val_roc_auc:.6f}")
