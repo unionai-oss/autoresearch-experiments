@@ -9,6 +9,8 @@ import numpy as np
 from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import roc_auc_score
+from sklearn.ensemble import ExtraTreesClassifier
+from sklearn.linear_model import LogisticRegression
 import lightgbm as lgb
 import xgboost as xgb
 from catboost import CatBoostClassifier
@@ -44,7 +46,6 @@ def engineer_features(df_in):
     if "SibSp" in d.columns and "Parch" in d.columns:
         d["FamilySize"] = d["SibSp"] + d["Parch"] + 1
         d["IsAlone"] = (d["FamilySize"] == 1).astype(int)
-        # Family size groups: alone(1), small(2-4), large(5+)
         d["FamilySizeGroup"] = pd.cut(d["FamilySize"], bins=[0, 1, 4, 20],
                                       labels=[0, 1, 2]).astype(float)
 
@@ -65,13 +66,10 @@ def engineer_features(df_in):
 
     # Ticket: prefix + group size
     if "Ticket" in d.columns:
-        # Group size = how many passengers share the same ticket
         d["TicketGroupSize"] = d["Ticket"].map(d["Ticket"].value_counts())
-        # Extract alphabetic prefix; pure-number tickets → "NUM"
         cleaned = d["Ticket"].str.upper().str.replace(r'[\./\s]', '', regex=True)
         prefix = cleaned.str.extract(r'^([A-Z]+)', expand=False)
         d["TicketPrefix"] = prefix.fillna("NUM")
-        # Compress rare prefixes (< 5 occurrences)
         prefix_counts = d["TicketPrefix"].value_counts()
         d["TicketPrefix"] = d["TicketPrefix"].map(
             lambda x: x if prefix_counts.get(x, 0) >= 5 else "RARE"
@@ -134,29 +132,99 @@ def engineer_features(df_in):
     if "Pclass" in d.columns and "LogFarePerPerson" in d.columns:
         d["Pclass_LogFPP"] = d["Pclass"] * d["LogFarePerPerson"]
 
+    # ── NEW: "Women and children first" semantic features ──────────────────
+    if "Age" in d.columns and "Sex" in d.columns:
+        d["IsChild"] = (d["Age"] < 15).astype(int)
+        d["IsWomanOrChild"] = ((d["Sex"] == "female") | (d["Age"] < 15)).astype(int)
+        d["IsAdultMale"] = ((d["Sex"] == "male") & (d["Age"] >= 18)).astype(int)
+
+    if "Sex" in d.columns and "Parch" in d.columns and "Age" in d.columns:
+        d["IsMother"] = ((d["Sex"] == "female") &
+                         (d["Parch"] > 0) &
+                         (d["Age"] > 18)).astype(int)
+
+    # Age squared (nonlinear effect near age extremes)
+    if "Age" in d.columns:
+        d["Age_sq"] = d["Age"] ** 2
+
+    # LogFare × WomanOrChild (women+children paid much more for 1st class)
+    if "LogFare" in d.columns and "IsWomanOrChild" in d.columns:
+        d["Fare_WomanChild"] = d["LogFare"] * d["IsWomanOrChild"]
+
+    # Pclass × IsAdultMale (3rd class adult males had worst survival)
+    if "Pclass" in d.columns and "IsAdultMale" in d.columns:
+        d["Pclass_AdultMale"] = d["Pclass"] * d["IsAdultMale"]
+
     # Fill remaining NaN
     for col in d.select_dtypes(include=["object", "category"]).columns:
         d[col] = d[col].fillna("Unknown")
     for col in d.select_dtypes(include="number").columns:
         d[col] = d[col].fillna(d[col].median())
 
-    # Label encode all categoricals
-    for col in d.select_dtypes(include=["object", "category"]).columns:
-        le = LabelEncoder()
-        d[col] = le.fit_transform(d[col].astype(str))
-
     return d
 
 
-X_all = engineer_features(X_raw)
-X_arr = X_all.values.astype(np.float32)
+X_all_raw = engineer_features(X_raw)
 
-print(f"Features ({X_arr.shape[1]}): {list(X_all.columns)}")
+# Identify categorical columns for OOF target encoding
+CAT_COLS_FOR_TE = [c for c in ["Title", "Pclass_Sex", "Deck", "TicketPrefix", "FamilyID", "Embarked"]
+                   if c in X_all_raw.columns]
+print(f"Categorical cols for target encoding: {CAT_COLS_FOR_TE}")
 
 n_folds = 10
 skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
 
-# ── LightGBM ────────────────────────────────────────────────────────────────
+
+def add_oof_target_encoding(X_df, y_arr, skf, cat_cols, alpha=5):
+    """
+    OOF target encoding: for each fold, compute per-category survival rate
+    using only the training fold, then apply to the validation fold.
+    Prevents leakage while capturing survival rates per category.
+    """
+    global_mean = float(y_arr.mean())
+    new_features = {}
+
+    for col in cat_cols:
+        if col not in X_df.columns:
+            continue
+        encoded = np.full(len(X_df), global_mean, dtype=np.float64)
+
+        for tr_idx, va_idx in skf.split(np.zeros(len(X_df)), y_arr):
+            train_vals = X_df[col].astype(str).values[tr_idx]
+            train_y = y_arr[tr_idx]
+
+            # Compute smoothed per-category mean on training fold
+            cat_stats = {}
+            for cat_val in np.unique(train_vals):
+                mask = train_vals == cat_val
+                n = int(mask.sum())
+                mean = float(train_y[mask].mean())
+                # Additive smoothing towards global mean
+                cat_stats[cat_val] = (n * mean + alpha * global_mean) / (n + alpha)
+
+            # Apply to validation fold (unseen categories fall back to global mean)
+            val_vals = X_df[col].astype(str).values[va_idx]
+            for i, va_i in enumerate(va_idx):
+                encoded[va_i] = cat_stats.get(val_vals[i], global_mean)
+
+        new_features[f"{col}_te"] = encoded
+
+    return pd.DataFrame(new_features, index=X_df.index)
+
+
+# Compute and concatenate OOF target-encoded features
+te_df = add_oof_target_encoding(X_all_raw, y_encoded, skf, CAT_COLS_FOR_TE, alpha=5)
+X_all = pd.concat([X_all_raw, te_df], axis=1)
+
+# Label encode all remaining categoricals
+for col in X_all.select_dtypes(include=["object", "category"]).columns:
+    le = LabelEncoder()
+    X_all[col] = le.fit_transform(X_all[col].astype(str))
+
+X_arr = X_all.values.astype(np.float32)
+print(f"Features ({X_arr.shape[1]}): {list(X_all.columns)}")
+
+# ── LightGBM ─────────────────────────────────────────────────────────────────
 lgb_params = dict(
     objective="binary",
     metric="auc",
@@ -190,7 +258,7 @@ for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
 auc_lgb = roc_auc_score(y_encoded, oof_lgb)
 print(f"LGB OOF AUC: {auc_lgb:.4f}")
 
-# ── XGBoost ─────────────────────────────────────────────────────────────────
+# ── XGBoost ──────────────────────────────────────────────────────────────────
 oof_xgb = np.zeros(len(X_arr))
 for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
     X_tr, X_va = X_arr[tr_idx], X_arr[va_idx]
@@ -220,7 +288,7 @@ for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
 auc_xgb = roc_auc_score(y_encoded, oof_xgb)
 print(f"XGB OOF AUC: {auc_xgb:.4f}")
 
-# ── CatBoost ─────────────────────────────────────────────────────────────────
+# ── CatBoost ──────────────────────────────────────────────────────────────────
 oof_cat = np.zeros(len(X_arr))
 for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
     X_tr, X_va = X_arr[tr_idx], X_arr[va_idx]
@@ -242,8 +310,45 @@ for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
 auc_cat = roc_auc_score(y_encoded, oof_cat)
 print(f"CAT OOF AUC: {auc_cat:.4f}")
 
-# ── Ensemble (simple average) ────────────────────────────────────────────────
-oof_blend = (oof_lgb + oof_xgb + oof_cat) / 3.0
-best_val_roc_auc = roc_auc_score(y_encoded, oof_blend)
-print(f"Ensemble OOF AUC: {best_val_roc_auc:.4f}")
+# ── ExtraTrees (maximum diversity from GBMs) ──────────────────────────────────
+oof_et = np.zeros(len(X_arr))
+for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
+    X_tr, X_va = X_arr[tr_idx], X_arr[va_idx]
+    y_tr, y_va = y_encoded[tr_idx], y_encoded[va_idx]
+    model = ExtraTreesClassifier(
+        n_estimators=1000,
+        max_features='sqrt',
+        min_samples_leaf=2,
+        random_state=42,
+        n_jobs=-1,
+    )
+    model.fit(X_tr, y_tr)
+    oof_et[va_idx] = model.predict_proba(X_va)[:, 1]
+
+auc_et = roc_auc_score(y_encoded, oof_et)
+print(f"ET OOF AUC: {auc_et:.4f}")
+
+# ── Equal-weight blend of all 4 models ───────────────────────────────────────
+oof_blend4 = (oof_lgb + oof_xgb + oof_cat + oof_et) / 4.0
+auc_blend4 = roc_auc_score(y_encoded, oof_blend4)
+print(f"Blend-4 OOF AUC: {auc_blend4:.4f}")
+
+# ── Stacking meta-learner (Logistic Regression) ───────────────────────────────
+# Use OOF predictions as features; proper 10-fold CV prevents leakage.
+# For each fold k: meta-LR is trained on OOF preds from folds ≠k and evaluated on fold k.
+meta_features = np.column_stack([oof_lgb, oof_xgb, oof_cat, oof_et])
+
+oof_meta = np.zeros(len(X_arr))
+for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
+    meta_tr = meta_features[tr_idx]
+    meta_va = meta_features[va_idx]
+    meta_model = LogisticRegression(C=1.0, random_state=42, max_iter=1000)
+    meta_model.fit(meta_tr, y_encoded[tr_idx])
+    oof_meta[va_idx] = meta_model.predict_proba(meta_va)[:, 1]
+
+auc_meta = roc_auc_score(y_encoded, oof_meta)
+print(f"Stack OOF AUC: {auc_meta:.4f}")
+
+# Report the best of equal-weight blend vs stacking meta-learner
+best_val_roc_auc = max(auc_blend4, auc_meta)
 print(f"BEST_VAL_ROC_AUC: {best_val_roc_auc:.6f}")

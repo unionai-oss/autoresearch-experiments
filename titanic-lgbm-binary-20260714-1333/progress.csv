@@ -1,3 +1,4 @@
 experiment_id,description,model_name,metric_name,metric_value,improved,duration_s,commit,notes
 0,"baseline: LightGBM with 5-fold stratified CV + feature engineering (Title extraction, FamilySize, HasCabin/Deck, missingness indicators) chosen because N=891 < 10k tabular data with mixed numeric/categorical features strongly favors gradient boosting over deep learning",,roc_auc,0.838538,true,3.1,f9cfc74,
 1,"Switch to OOF 10-fold CV on all 891 samples (vs 178-sample holdout), add title-based age imputation, AgeBin, FarePerPerson/LogFare, Pclass×Sex interaction, and tune LightGBM params (num_leaves=63, lr=0.02, 3000 trees)",,roc_auc,0.862227,true,5.1,1e75090,
+2,Add Ticket/Family/Name features + blend LightGBM+XGBoost+CatBoost OOF ensemble for model diversity,,roc_auc,0.887659,true,10.9,78c0c79,
