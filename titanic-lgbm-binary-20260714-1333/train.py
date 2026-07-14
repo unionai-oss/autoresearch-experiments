@@ -20,6 +20,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
+import torch.nn.functional as F
 import lightgbm as lgb
 import xgboost as xgb
 from catboost import CatBoostClassifier
@@ -621,22 +622,46 @@ for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
 auc_knn = roc_auc_score(y_encoded, oof_knn)
 print(f"KNN OOF AUC: {auc_knn:.4f}")
 
-# ── PyTorch MLP (3-seed, BatchNorm + Dropout, early stopping on val AUC) ─────
-print("Training PyTorch MLP (3-seed)...")
+# ── PyTorch ResNet MLP (3-seed, skip connections + BatchNorm + Dropout) ──────
+print("Training PyTorch ResNet MLP (3-seed)...")
 
 class _PyMLP(nn.Module):
+    """ResNet-style MLP with skip connections for better gradient flow."""
     def __init__(self, n_in):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(n_in, 128),
-            nn.BatchNorm1d(128),
+        H = 128
+
+        # Input projection: n_in → H
+        self.input_proj = nn.Sequential(
+            nn.Linear(n_in, H),
+            nn.BatchNorm1d(H),
             nn.ReLU(),
             nn.Dropout(0.3),
-            nn.Linear(128, 64),
-            nn.BatchNorm1d(64),
+        )
+
+        # ResNet block 1: H → H with skip
+        self.res1 = nn.Sequential(
+            nn.Linear(H, H),
+            nn.BatchNorm1d(H),
             nn.ReLU(),
             nn.Dropout(0.3),
-            nn.Linear(64, 32),
+            nn.Linear(H, H),
+            nn.BatchNorm1d(H),
+        )
+
+        # ResNet block 2: H → H with skip
+        self.res2 = nn.Sequential(
+            nn.Linear(H, H),
+            nn.BatchNorm1d(H),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(H, H),
+            nn.BatchNorm1d(H),
+        )
+
+        # Output head: H → 32 → 1
+        self.output = nn.Sequential(
+            nn.Linear(H, 32),
             nn.BatchNorm1d(32),
             nn.ReLU(),
             nn.Dropout(0.2),
@@ -644,7 +669,10 @@ class _PyMLP(nn.Module):
         )
 
     def forward(self, x):
-        return self.net(x).squeeze(-1)
+        x = self.input_proj(x)
+        x = F.relu(x + self.res1(x))   # skip connection 1
+        x = F.relu(x + self.res2(x))   # skip connection 2
+        return self.output(x).squeeze(-1)
 
 
 _device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -663,8 +691,11 @@ for _seed in mlp_seeds:
         _sc = StandardScaler()
         X_tr_sc = _sc.fit_transform(X_tr).astype(np.float32)
         X_va_sc = _sc.transform(X_va).astype(np.float32)
+        # Label smoothing: reduces overconfidence, improves generalization on small N
+        _smooth_eps = 0.05
+        y_tr_smooth = y_tr.astype(np.float32) * (1.0 - _smooth_eps) + _smooth_eps / 2.0
         Xtr_t = torch.from_numpy(X_tr_sc).to(_device)
-        ytr_t = torch.from_numpy(y_tr.astype(np.float32)).to(_device)
+        ytr_t = torch.from_numpy(y_tr_smooth).to(_device)
         Xva_t = torch.from_numpy(X_va_sc).to(_device)
         _mlp = _PyMLP(_n_feat).to(_device)
         _opt = optim.Adam(_mlp.parameters(), lr=1e-3, weight_decay=1e-3)
@@ -679,13 +710,15 @@ for _seed in mlp_seeds:
             _mlp.train()
             for _xb, _yb in _dl:
                 _opt.zero_grad()
-                _crit(_mlp(_xb), _yb).backward()
+                _loss = _crit(_mlp(_xb), _yb)
+                _loss.backward()
+                torch.nn.utils.clip_grad_norm_(_mlp.parameters(), max_norm=1.0)
                 _opt.step()
             _sched.step()
             _mlp.eval()
             with torch.no_grad():
                 _vp = torch.sigmoid(_mlp(Xva_t)).cpu().numpy()
-            _vauc = roc_auc_score(y_va, _vp)
+            _vauc = roc_auc_score(y_va, _vp)  # use original labels for eval
             if _vauc > best_auc_pt:
                 best_auc_pt = _vauc
                 best_state_pt = {k: v.clone() for k, v in _mlp.state_dict().items()}
