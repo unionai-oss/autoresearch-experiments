@@ -16,7 +16,10 @@ from sklearn.tree import DecisionTreeClassifier
 from sklearn.svm import SVC
 from sklearn.linear_model import LogisticRegression
 from sklearn.neighbors import KNeighborsClassifier
-from sklearn.neural_network import MLPClassifier
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
 import lightgbm as lgb
 import xgboost as xgb
 from catboost import CatBoostClassifier
@@ -39,7 +42,6 @@ print(f"[DATA] Samples: {len(df)}, Classes: {n_cls}, Distribution: {class_dist}"
 def engineer_features(df_in):
     d = df_in.copy()
 
-    # Title from Name + extract last name + name length
     if "Name" in d.columns:
         d["Title"] = d["Name"].str.extract(r" ([A-Za-z]+)\.", expand=False)
         rare = ["Lady", "Countess", "Capt", "Col", "Don", "Dr",
@@ -50,14 +52,12 @@ def engineer_features(df_in):
         d["LastName"] = d["Name"].str.split(",").str[0].str.strip()
         d = d.drop(columns=["Name"])
 
-    # Family features
     if "SibSp" in d.columns and "Parch" in d.columns:
         d["FamilySize"] = d["SibSp"] + d["Parch"] + 1
         d["IsAlone"] = (d["FamilySize"] == 1).astype(int)
         d["FamilySizeGroup"] = pd.cut(d["FamilySize"], bins=[0, 1, 4, 20],
                                       labels=[0, 1, 2]).astype(float)
 
-    # Family ID (last name + family size — collapses singletons)
     if "LastName" in d.columns and "FamilySize" in d.columns:
         d["FamilyID"] = d["LastName"] + "_" + d["FamilySize"].astype(str)
         family_counts = d["FamilyID"].value_counts()
@@ -66,24 +66,18 @@ def engineer_features(df_in):
         )
         d = d.drop(columns=["LastName"])
 
-    # Cabin: extract all info before dropping
     if "Cabin" in d.columns:
         d["HasCabin"] = d["Cabin"].notna().astype(int)
         d["Deck"] = d["Cabin"].str[0].fillna("U")
-        # Extract cabin number (position along ship = survival advantage)
         d["CabinNum"] = d["Cabin"].str.extract(r'(\d+)', expand=False).fillna(-1).astype(float)
-        # Number of cabins assigned (multi-cabin → high-status passenger)
         d["CabinCount"] = d["Cabin"].fillna("").apply(
             lambda x: len(x.split()) if x else 0
         )
-        # Cabin parity: odd = starboard side (more lifeboats launched from starboard)
         d["CabinOdd"] = np.where(d["CabinNum"] > 0, (d["CabinNum"] % 2).astype(int), -1)
-        # Deck as ordinal number (A=1 top/closest to lifeboats, G=7 bottom)
         _deck_order = {'A': 1, 'B': 2, 'C': 3, 'D': 4, 'E': 5, 'F': 6, 'G': 7, 'T': 3}
         d["DeckNum"] = d["Deck"].map(_deck_order).fillna(0)
         d = d.drop(columns=["Cabin"])
 
-    # Ticket: prefix + group size + keep full TicketID for group survival encoding
     if "Ticket" in d.columns:
         d["TicketGroupSize"] = d["Ticket"].map(d["Ticket"].value_counts())
         cleaned = d["Ticket"].str.upper().str.replace(r'[\./\s]', '', regex=True)
@@ -93,20 +87,16 @@ def engineer_features(df_in):
         d["TicketPrefix"] = d["TicketPrefix"].map(
             lambda x: x if prefix_counts.get(x, 0) >= 5 else "RARE"
         )
-        # Extract raw ticket number (purchase sequence / booking time signal)
         _tick_num = d["Ticket"].str.extract(r'(\d+)$', expand=False)
         d["TicketNum"] = pd.to_numeric(_tick_num, errors='coerce').fillna(0)
         d["TicketNumLog"] = np.log1p(d["TicketNum"])
-        # Keep full ticket number for OOF group survival encoding (ticket-mates' survival)
         d["TicketID"] = d["Ticket"].astype(str)
         d = d.drop(columns=["Ticket"])
 
-    # Drop IDs
     for col in ["PassengerId"]:
         if col in d.columns:
             d = d.drop(columns=[col])
 
-    # Age: missingness flag + title-based imputation + bin
     if "Age" in d.columns and "Title" in d.columns:
         d["Age_missing"] = d["Age"].isna().astype(int)
         title_age_med = d.groupby("Title")["Age"].median()
@@ -120,12 +110,9 @@ def engineer_features(df_in):
         d["Age"] = d.apply(fill_age, axis=1)
         d["AgeBin"] = pd.cut(d["Age"], bins=[0, 12, 18, 35, 60, 200],
                              labels=[0, 1, 2, 3, 4]).astype(float).fillna(2)
-        # Very young children (<5) had unique survival dynamics (never left behind)
         d["IsVeryYoung"] = (d["Age"] < 5).astype(int)
-        # Seniors (60+) had lower mobility / priority
         d["IsSenior"] = (d["Age"] >= 60).astype(int)
 
-    # Fare: imputation + per-person + per ticket mate + log + rank within Pclass
     if "Fare" in d.columns:
         fare_med = d.loc[d["Fare"] > 0, "Fare"].median()
         d["Fare"] = d["Fare"].fillna(fare_med)
@@ -133,47 +120,37 @@ def engineer_features(df_in):
         if "FamilySize" in d.columns:
             d["FarePerPerson"] = d["Fare"] / d["FamilySize"]
             d["LogFarePerPerson"] = np.log1p(d["FarePerPerson"])
-        # fare per ticket group member (more accurate for mixed family/friend groups)
         if "TicketGroupSize" in d.columns:
             d["FarePerTicketMate"] = d["Fare"] / d["TicketGroupSize"]
             d["LogFarePerTicketMate"] = np.log1p(d["FarePerTicketMate"])
         d["LogFare"] = np.log1p(d["Fare"])
-        # Percentile rank of fare within Pclass — captures relative wealth within class
         if "Pclass" in d.columns:
             d["FareRank_Pclass"] = d.groupby("Pclass")["Fare"].rank(pct=True)
-        # Fare per person relative to class median (relative wealth within class)
         if "FarePerPerson" in d.columns and "Pclass" in d.columns:
             _class_fpp_med = d.groupby("Pclass")["FarePerPerson"].transform("median")
             d["FarePP_RelToClass"] = d["FarePerPerson"] / (_class_fpp_med + 0.01)
 
-    # Embarked imputation
     if "Embarked" in d.columns:
         mode_val = d["Embarked"].mode()
         embarked_mode = mode_val.iloc[0] if len(mode_val) > 0 else "S"
         d["Embarked"] = d["Embarked"].fillna(embarked_mode)
 
-    # Pclass × Sex interaction
     if "Pclass" in d.columns and "Sex" in d.columns:
         d["Pclass_Sex"] = d["Pclass"].astype(str) + "_" + d["Sex"].astype(str)
 
-    # Binary sex for numeric interactions
     if "Sex" in d.columns:
         d["Sex_bin"] = (d["Sex"] == "male").astype(int)
         d["IsFemale"] = 1 - d["Sex_bin"]
 
-    # Age × Pclass
     if "Age" in d.columns and "Pclass" in d.columns:
         d["Age_Pclass"] = d["Age"] * d["Pclass"]
 
-    # Male × LogFare (female fare is much more predictive of survival)
     if "Sex_bin" in d.columns and "LogFare" in d.columns:
         d["Male_LogFare"] = d["Sex_bin"] * d["LogFare"]
 
-    # Pclass × LogFarePerPerson
     if "Pclass" in d.columns and "LogFarePerPerson" in d.columns:
         d["Pclass_LogFPP"] = d["Pclass"] * d["LogFarePerPerson"]
 
-    # ── "Women and children first" semantic features ───────────────────────────
     if "Age" in d.columns and "Sex" in d.columns:
         d["IsChild"] = (d["Age"] < 15).astype(int)
         d["IsWomanOrChild"] = ((d["Sex"] == "female") | (d["Age"] < 15)).astype(int)
@@ -184,88 +161,66 @@ def engineer_features(df_in):
                          (d["Parch"] > 0) &
                          (d["Age"] > 18)).astype(int)
 
-    # Age squared (nonlinear effect near age extremes)
     if "Age" in d.columns:
         d["Age_sq"] = d["Age"] ** 2
 
-    # LogFare × WomanOrChild (women+children paid much more for 1st class)
     if "LogFare" in d.columns and "IsWomanOrChild" in d.columns:
         d["Fare_WomanChild"] = d["LogFare"] * d["IsWomanOrChild"]
 
-    # Pclass × IsAdultMale (3rd class adult males had worst survival)
     if "Pclass" in d.columns and "IsAdultMale" in d.columns:
         d["Pclass_AdultMale"] = d["Pclass"] * d["IsAdultMale"]
 
-    # ── Additional interaction features ───────────────────────────────────────
-    # Pclass × IsAlone (being alone in 3rd class is particularly bad)
     if "Pclass" in d.columns and "IsAlone" in d.columns:
         d["Pclass_IsAlone"] = d["Pclass"] * d["IsAlone"]
 
-    # Age × Sex_bin (captures that boys and girls have similar survival, men much lower)
     if "Age" in d.columns and "Sex_bin" in d.columns:
         d["Age_Sex"] = d["Age"] * d["Sex_bin"]
 
-    # Title+Pclass combined category — captures survival by title within each class
     if "Title" in d.columns and "Pclass" in d.columns:
         d["Title_Pclass"] = d["Title"].astype(str) + "_" + d["Pclass"].astype(str)
 
-    # TicketGroupSize × IsAlone interaction (ticket alone vs family on same ticket)
     if "TicketGroupSize" in d.columns and "IsAlone" in d.columns:
         d["TicketSize_IsAlone"] = d["TicketGroupSize"] * d["IsAlone"]
 
-    # FamilySize × Pclass (large families in 3rd class fare worse)
     if "FamilySize" in d.columns and "Pclass" in d.columns:
         d["FamilySize_Pclass"] = d["FamilySize"] * d["Pclass"]
 
-    # Non-family ticket mates (friends traveling together = positive survival signal)
     if "TicketGroupSize" in d.columns and "FamilySize" in d.columns:
         d["NonFamilyTicketMates"] = (d["TicketGroupSize"] - d["FamilySize"]).clip(lower=0)
 
-    # IsChild × Pclass (poor children had lower survival than 1st class children)
     if "IsChild" in d.columns and "Pclass" in d.columns:
         d["IsChild_Pclass"] = d["IsChild"] * d["Pclass"]
 
-    # IsFemale × Pclass (women in 1st class had very high survival vs 3rd class)
     if "IsFemale" in d.columns and "Pclass" in d.columns:
         d["IsFemale_Pclass"] = d["IsFemale"] * d["Pclass"]
 
-    # Female with cabin (1st class women with cabin assignment had highest survival)
     if "IsFemale" in d.columns and "HasCabin" in d.columns:
         d["IsFemale_HasCabin"] = d["IsFemale"] * d["HasCabin"]
 
-    # Worst case: 3rd class alone adult male (lowest survival group)
     if all(c in d.columns for c in ["IsAdultMale", "IsAlone", "Pclass"]):
         d["WorstCase"] = ((d["IsAdultMale"] == 1) & (d["IsAlone"] == 1) &
                           (d["Pclass"] == 3)).astype(int)
 
-    # Best case: 1st class female with cabin (highest survival group)
     if all(c in d.columns for c in ["IsFemale", "HasCabin", "Pclass"]):
         d["BestCase"] = ((d["IsFemale"] == 1) & (d["Pclass"] == 1) &
                          (d["HasCabin"] == 1)).astype(int)
 
-    # IsVeryYoung × Pclass (very young children in 1st class near certain to survive)
     if "IsVeryYoung" in d.columns and "Pclass" in d.columns:
         d["IsVeryYoung_Pclass"] = d["IsVeryYoung"] * d["Pclass"]
 
-    # ── Ticket group composition (pure structural — no target, no leakage) ─────
-    # These tell each passenger who they're traveling with on the same ticket
     if all(c in d.columns for c in ['TicketID', 'IsFemale', 'IsChild', 'IsWomanOrChild', 'Age']):
         d['TG_FemRatio'] = d.groupby('TicketID')['IsFemale'].transform('mean')
         d['TG_ChildRatio'] = d.groupby('TicketID')['IsChild'].transform('mean')
         d['TG_WCRatio'] = d.groupby('TicketID')['IsWomanOrChild'].transform('mean')
         d['TG_MeanAge'] = d.groupby('TicketID')['Age'].transform('mean')
-        # Adult male surrounded by women/children: survival different from all-male groups
         if 'IsAdultMale' in d.columns:
             d['TG_AdultMaleRatio'] = d.groupby('TicketID')['IsAdultMale'].transform('mean')
 
-    # ── Family group composition (structural — no target, no leakage) ──────────
-    # These tell each passenger about their family composition
     if all(c in d.columns for c in ['FamilyID', 'IsFemale', 'IsChild', 'IsWomanOrChild']):
         d['Fam_FemRatio'] = d.groupby('FamilyID')['IsFemale'].transform('mean')
         d['Fam_ChildRatio'] = d.groupby('FamilyID')['IsChild'].transform('mean')
         d['Fam_WCRatio'] = d.groupby('FamilyID')['IsWomanOrChild'].transform('mean')
 
-    # Fill remaining NaN
     for col in d.select_dtypes(include=["object", "category"]).columns:
         d[col] = d[col].fillna("Unknown")
     for col in d.select_dtypes(include="number").columns:
@@ -276,7 +231,6 @@ def engineer_features(df_in):
 
 X_all_raw = engineer_features(X_raw)
 
-# Identify categorical columns for OOF target encoding
 CAT_COLS_FOR_TE = [c for c in ["Title", "Pclass_Sex", "Deck", "TicketPrefix", "FamilyID",
                                 "Embarked", "TicketID", "Title_Pclass", "SibSp", "Parch"]
                    if c in X_all_raw.columns]
@@ -287,11 +241,6 @@ skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
 
 
 def add_oof_target_encoding(X_df, y_arr, skf, cat_cols, alpha=5):
-    """
-    OOF target encoding: for each fold, compute per-category survival rate
-    using only the training fold, then apply to the validation fold.
-    Prevents leakage while capturing survival rates per category.
-    """
     global_mean = float(y_arr.mean())
     new_features = {}
 
@@ -304,16 +253,13 @@ def add_oof_target_encoding(X_df, y_arr, skf, cat_cols, alpha=5):
             train_vals = X_df[col].astype(str).values[tr_idx]
             train_y = y_arr[tr_idx]
 
-            # Compute smoothed per-category mean on training fold
             cat_stats = {}
             for cat_val in np.unique(train_vals):
                 mask = train_vals == cat_val
                 n = int(mask.sum())
                 mean = float(train_y[mask].mean())
-                # Additive smoothing towards global mean
                 cat_stats[cat_val] = (n * mean + alpha * global_mean) / (n + alpha)
 
-            # Apply to validation fold (unseen categories fall back to global mean)
             val_vals = X_df[col].astype(str).values[va_idx]
             for i, va_i in enumerate(va_idx):
                 encoded[va_i] = cat_stats.get(val_vals[i], global_mean)
@@ -323,11 +269,9 @@ def add_oof_target_encoding(X_df, y_arr, skf, cat_cols, alpha=5):
     return pd.DataFrame(new_features, index=X_df.index)
 
 
-# Compute and concatenate OOF target-encoded features
 te_df = add_oof_target_encoding(X_all_raw, y_encoded, skf, CAT_COLS_FOR_TE, alpha=5)
 X_all = pd.concat([X_all_raw, te_df], axis=1)
 
-# Label encode all remaining categoricals
 for col in X_all.select_dtypes(include=["object", "category"]).columns:
     le = LabelEncoder()
     X_all[col] = le.fit_transform(X_all[col].astype(str))
@@ -399,7 +343,7 @@ for seed in lgb_seeds:
 
 oof_lgb = np.mean(oof_lgb_list, axis=0)
 auc_lgb = roc_auc_score(y_encoded, oof_lgb)
-print(f"LGB (3-seed, Optuna) OOF AUC: {auc_lgb:.4f}")
+print(f"LGB (5-seed, Optuna) OOF AUC: {auc_lgb:.4f}")
 
 # ── Optuna-tuned XGBoost ──────────────────────────────────────────────────────
 print("Tuning XGBoost with Optuna...")
@@ -459,7 +403,7 @@ for seed in xgb_seeds:
 
 oof_xgb = np.mean(oof_xgb_list, axis=0)
 auc_xgb = roc_auc_score(y_encoded, oof_xgb)
-print(f"XGB (3-seed, Optuna) OOF AUC: {auc_xgb:.4f}")
+print(f"XGB (5-seed, Optuna) OOF AUC: {auc_xgb:.4f}")
 
 # ── Optuna-tuned CatBoost ─────────────────────────────────────────────────────
 print("Tuning CatBoost with Optuna...")
@@ -489,7 +433,6 @@ def cat_objective(trial):
 
 study_cat = optuna.create_study(direction="maximize",
                                   sampler=optuna.samplers.TPESampler(seed=42))
-# Increased from 10 to 25 trials for better CatBoost tuning
 study_cat.optimize(cat_objective, n_trials=25, show_progress_bar=False)
 best_cat_params = dict(
     verbose=False,
@@ -516,7 +459,7 @@ for seed in cat_seeds:
 
 oof_cat = np.mean(oof_cat_list, axis=0)
 auc_cat = roc_auc_score(y_encoded, oof_cat)
-print(f"CAT (3-seed, Optuna) OOF AUC: {auc_cat:.4f}")
+print(f"CAT (5-seed, Optuna) OOF AUC: {auc_cat:.4f}")
 
 # ── Optuna-tuned ExtraTrees ───────────────────────────────────────────────────
 print("Tuning ExtraTrees with Optuna...")
@@ -678,35 +621,91 @@ for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
 auc_knn = roc_auc_score(y_encoded, oof_knn)
 print(f"KNN OOF AUC: {auc_knn:.4f}")
 
-# ── MLP (sklearn neural network) ─────────────────────────────────────────────
-oof_mlp = np.zeros(len(X_arr))
-for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
-    X_tr, X_va = X_arr[tr_idx], X_arr[va_idx]
-    y_tr, y_va = y_encoded[tr_idx], y_encoded[va_idx]
-    scaler = StandardScaler()
-    X_tr_sc = scaler.fit_transform(X_tr)
-    X_va_sc = scaler.transform(X_va)
-    model = MLPClassifier(
-        hidden_layer_sizes=(128, 64, 32),
-        activation='relu',
-        alpha=0.5,       # L2 regularization — crucial for small N
-        batch_size=64,
-        learning_rate='adaptive',
-        learning_rate_init=0.001,
-        max_iter=500,
-        random_state=42,
-        early_stopping=True,
-        validation_fraction=0.1,
-        n_iter_no_change=20,
-    )
-    model.fit(X_tr_sc, y_tr)
-    oof_mlp[va_idx] = model.predict_proba(X_va_sc)[:, 1]
+# ── PyTorch MLP (3-seed, BatchNorm + Dropout, early stopping on val AUC) ─────
+print("Training PyTorch MLP (3-seed)...")
 
+class _PyMLP(nn.Module):
+    def __init__(self, n_in):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_in, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(64, 32),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(32, 1),
+        )
+
+    def forward(self, x):
+        return self.net(x).squeeze(-1)
+
+
+_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+_n_feat = X_arr.shape[1]
+print(f"PyTorch MLP device: {_device}, features: {_n_feat}")
+
+mlp_seeds = [42, 123, 456]
+oof_mlp_list_pt = []
+for _seed in mlp_seeds:
+    torch.manual_seed(_seed)
+    np.random.seed(_seed)
+    oof_seed_mlp = np.zeros(len(X_arr))
+    for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
+        X_tr, X_va = X_arr[tr_idx], X_arr[va_idx]
+        y_tr, y_va = y_encoded[tr_idx], y_encoded[va_idx]
+        _sc = StandardScaler()
+        X_tr_sc = _sc.fit_transform(X_tr).astype(np.float32)
+        X_va_sc = _sc.transform(X_va).astype(np.float32)
+        Xtr_t = torch.from_numpy(X_tr_sc).to(_device)
+        ytr_t = torch.from_numpy(y_tr.astype(np.float32)).to(_device)
+        Xva_t = torch.from_numpy(X_va_sc).to(_device)
+        _mlp = _PyMLP(_n_feat).to(_device)
+        _opt = optim.Adam(_mlp.parameters(), lr=1e-3, weight_decay=1e-3)
+        _crit = nn.BCEWithLogitsLoss()
+        _sched = optim.lr_scheduler.CosineAnnealingLR(_opt, T_max=200)
+        _ds = TensorDataset(Xtr_t, ytr_t)
+        _dl = DataLoader(_ds, batch_size=64, shuffle=True, num_workers=0, drop_last=True)
+        best_auc_pt = -1.0
+        best_state_pt = None
+        no_imp_pt = 0
+        for _ep in range(200):
+            _mlp.train()
+            for _xb, _yb in _dl:
+                _opt.zero_grad()
+                _crit(_mlp(_xb), _yb).backward()
+                _opt.step()
+            _sched.step()
+            _mlp.eval()
+            with torch.no_grad():
+                _vp = torch.sigmoid(_mlp(Xva_t)).cpu().numpy()
+            _vauc = roc_auc_score(y_va, _vp)
+            if _vauc > best_auc_pt:
+                best_auc_pt = _vauc
+                best_state_pt = {k: v.clone() for k, v in _mlp.state_dict().items()}
+                no_imp_pt = 0
+            else:
+                no_imp_pt += 1
+                if no_imp_pt >= 25:
+                    break
+        if best_state_pt is not None:
+            _mlp.load_state_dict(best_state_pt)
+        _mlp.eval()
+        with torch.no_grad():
+            oof_seed_mlp[va_idx] = torch.sigmoid(_mlp(Xva_t)).cpu().numpy()
+    oof_mlp_list_pt.append(oof_seed_mlp)
+
+oof_mlp = np.mean(oof_mlp_list_pt, axis=0)
 auc_mlp = roc_auc_score(y_encoded, oof_mlp)
-print(f"MLP OOF AUC: {auc_mlp:.4f}")
+print(f"MLP (PyTorch 3-seed) OOF AUC: {auc_mlp:.4f}")
 
 # ── DART LightGBM (different boosting strategy for diversity) ─────────────────
-# DART drops trees randomly, reducing correlation with other GBMs
 oof_dart = np.zeros(len(X_arr))
 for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
     X_tr, X_va = X_arr[tr_idx], X_arr[va_idx]
@@ -717,7 +716,7 @@ for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
         boosting_type="dart",
         num_leaves=31,
         learning_rate=0.05,
-        n_estimators=500,  # no early stopping in DART
+        n_estimators=500,
         feature_fraction=0.8,
         bagging_fraction=0.8,
         bagging_freq=5,
@@ -732,9 +731,7 @@ for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
 auc_dart = roc_auc_score(y_encoded, oof_dart)
 print(f"DART-LGB OOF AUC: {auc_dart:.4f}")
 
-# ── GOSS LightGBM (Gradient-based One-Side Sampling) ─────────────────────────
-# GOSS keeps all large-gradient instances + random small-gradient sample,
-# producing different trees than GBDT or DART — adds diversity to the ensemble
+# ── GOSS LightGBM ─────────────────────────────────────────────────────────────
 oof_goss = np.zeros(len(X_arr))
 for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
     X_tr, X_va = X_arr[tr_idx], X_arr[va_idx]
@@ -765,7 +762,6 @@ auc_goss = roc_auc_score(y_encoded, oof_goss)
 print(f"GOSS-LGB OOF AUC: {auc_goss:.4f}")
 
 # ── Logistic Regression with degree-2 polynomial features ────────────────────
-# Captures non-linear interactions between key survival features
 poly_feature_cols = [c for c in ['Pclass', 'Sex_bin', 'Age', 'AgeBin',
                                   'LogFare', 'FarePerPerson', 'FareRank_Pclass',
                                   'FamilySize', 'IsAlone', 'HasCabin',
@@ -789,8 +785,7 @@ for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
 auc_lr_poly = roc_auc_score(y_encoded, oof_lr_poly)
 print(f"LR-Poly OOF AUC: {auc_lr_poly:.4f}")
 
-# ── Sklearn GradientBoostingClassifier (diverse from XGB/LGB family) ─────────
-# sklearn's native GBDT implementation has different regularization; adds diversity
+# ── Sklearn GradientBoostingClassifier ────────────────────────────────────────
 oof_gbm = np.zeros(len(X_arr))
 for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
     X_tr, X_va = X_arr[tr_idx], X_arr[va_idx]
@@ -812,7 +807,7 @@ for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
 auc_gbm = roc_auc_score(y_encoded, oof_gbm)
 print(f"GBM (sklearn) OOF AUC: {auc_gbm:.4f}")
 
-# ── AdaBoost (diverse boosting algorithm — adaptive reweighting vs gradient) ──
+# ── AdaBoost ──────────────────────────────────────────────────────────────────
 oof_ada = np.zeros(len(X_arr))
 for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
     X_tr, X_va = X_arr[tr_idx], X_arr[va_idx]
@@ -829,7 +824,7 @@ for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
 auc_ada = roc_auc_score(y_encoded, oof_ada)
 print(f"AdaBoost OOF AUC: {auc_ada:.4f}")
 
-# ── Logistic Regression with L1 (feature-selecting counterpart to L2 poly-LR) ─
+# ── Logistic Regression with L1 ───────────────────────────────────────────────
 oof_lr_l1 = np.zeros(len(X_arr))
 for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
     X_tr, X_va = X_arr[tr_idx], X_arr[va_idx]
@@ -858,17 +853,17 @@ print(f"Blend-15 OOF AUC: {auc_blend14:.4f}")
 # Weighted blend by individual AUC^4 (emphasize stronger models)
 w = all_aucs_arr ** 4
 w /= w.sum()
-oof_mat = np.column_stack(all_oofs)  # (N, 14)
+oof_mat = np.column_stack(all_oofs)
 oof_blend_wt = oof_mat @ w
 auc_blend_wt = roc_auc_score(y_encoded, oof_blend_wt)
-print(f"Blend-14 (weighted) OOF AUC: {auc_blend_wt:.4f}")
+print(f"Blend-15 (weighted) OOF AUC: {auc_blend_wt:.4f}")
 
-# Rank-average blend (more robust to probability calibration differences)
+# Rank-average blend
 from scipy.stats import rankdata
 oof_ranks_mat = np.column_stack([rankdata(oof) / len(oof) for oof in all_oofs])
 oof_blend_rank = np.mean(oof_ranks_mat, axis=1)
 auc_blend_rank = roc_auc_score(y_encoded, oof_blend_rank)
-print(f"Blend-14 (rank) OOF AUC: {auc_blend_rank:.4f}")
+print(f"Blend-15 (rank) OOF AUC: {auc_blend_rank:.4f}")
 
 # ── Stacking: Logistic Regression meta-learner ────────────────────────────────
 meta_14 = np.column_stack(all_oofs)
@@ -884,7 +879,6 @@ print(f"Stack-LR OOF AUC: {auc_meta_lr:.4f}")
 
 # ── Stacking: LightGBM meta-learner with key original + all TE features ───────
 all_te_cols = [c for c in X_all.columns if c.endswith('_te')]
-# Include new group composition features + TE features
 meta_key_cols = [c for c in ['Pclass', 'Sex_bin', 'AgeBin', 'IsAdultMale',
                                'IsWomanOrChild', 'LogFare', 'HasCabin', 'FamilySize',
                                'FareRank_Pclass', 'IsAlone', 'TicketGroupSize',
@@ -896,11 +890,10 @@ meta_key_cols = [c for c in ['Pclass', 'Sex_bin', 'AgeBin', 'IsAdultMale',
                  if c in X_all.columns]
 meta_orig = X_all[meta_key_cols].values.astype(np.float32)
 
-# Rank-normalized OOF predictions (calibration-invariant signal)
+# Rank-normalized OOF predictions
 meta_ranks = np.column_stack([rankdata(oof) / len(oof) for oof in all_oofs])
 
-# Model uncertainty / disagreement features: std, min, max, range of model predictions
-# These tell the meta-learner about prediction confidence
+# Model uncertainty / disagreement features
 meta_std = oof_mat.std(axis=1, keepdims=True)
 meta_min = oof_mat.min(axis=1, keepdims=True)
 meta_max = oof_mat.max(axis=1, keepdims=True)
@@ -1005,7 +998,6 @@ oof_meta_avg3 = (oof_meta_lgb + oof_meta_xgb + oof_meta_cat2) / 3
 auc_meta_avg3 = roc_auc_score(y_encoded, oof_meta_avg3)
 print(f"Stack-LGB+XGB+CAT OOF AUC: {auc_meta_avg3:.4f}")
 
-# Average all 4 meta-learners (most robust ensemble of stacks)
 oof_meta_avg4 = (oof_meta_lr + oof_meta_lgb + oof_meta_xgb + oof_meta_cat2) / 4
 auc_meta_avg4 = roc_auc_score(y_encoded, oof_meta_avg4)
 print(f"Stack-All4 OOF AUC: {auc_meta_avg4:.4f}")
