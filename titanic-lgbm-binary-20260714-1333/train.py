@@ -1,0 +1,1042 @@
+import os
+DATA_PATH = os.environ.get("DATA_PATH", "/tmp/data")
+
+import sys
+sys.path.insert(0, '/home/flyte/.local/lib/python3.13/site-packages')
+
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import StratifiedKFold
+from sklearn.preprocessing import LabelEncoder, StandardScaler, PolynomialFeatures
+from sklearn.metrics import roc_auc_score
+from sklearn.ensemble import (ExtraTreesClassifier, RandomForestClassifier,
+                               HistGradientBoostingClassifier, GradientBoostingClassifier,
+                               AdaBoostClassifier)
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.svm import SVC
+from sklearn.linear_model import LogisticRegression
+from sklearn.neighbors import KNeighborsClassifier
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+import torch.nn.functional as F
+import lightgbm as lgb
+import xgboost as xgb
+from catboost import CatBoostClassifier
+import optuna
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+df = pd.read_parquet(DATA_PATH)
+
+target_col = "Survived"
+X_raw = df.drop(columns=[target_col])
+y_raw = df[target_col]
+
+le_target = LabelEncoder()
+y_encoded = le_target.fit_transform(y_raw)
+n_cls = len(le_target.classes_)
+class_dist = {int(c): int(cnt) for c, cnt in zip(np.unique(y_encoded), np.bincount(y_encoded))}
+print(f"[DATA] Samples: {len(df)}, Classes: {n_cls}, Distribution: {class_dist}")
+
+
+def engineer_features(df_in):
+    d = df_in.copy()
+
+    if "Name" in d.columns:
+        d["Title"] = d["Name"].str.extract(r" ([A-Za-z]+)\.", expand=False)
+        rare = ["Lady", "Countess", "Capt", "Col", "Don", "Dr",
+                "Major", "Rev", "Sir", "Jonkheer", "Dona"]
+        d["Title"] = d["Title"].replace(rare, "Rare")
+        d["Title"] = d["Title"].replace({"Mlle": "Miss", "Ms": "Miss", "Mme": "Mrs"})
+        d["NameLength"] = d["Name"].str.len()
+        d["LastName"] = d["Name"].str.split(",").str[0].str.strip()
+        d = d.drop(columns=["Name"])
+
+    if "SibSp" in d.columns and "Parch" in d.columns:
+        d["FamilySize"] = d["SibSp"] + d["Parch"] + 1
+        d["IsAlone"] = (d["FamilySize"] == 1).astype(int)
+        d["FamilySizeGroup"] = pd.cut(d["FamilySize"], bins=[0, 1, 4, 20],
+                                      labels=[0, 1, 2]).astype(float)
+
+    if "LastName" in d.columns and "FamilySize" in d.columns:
+        d["FamilyID"] = d["LastName"] + "_" + d["FamilySize"].astype(str)
+        family_counts = d["FamilyID"].value_counts()
+        d["FamilyID"] = d["FamilyID"].map(
+            lambda x: x if family_counts.get(x, 0) >= 2 else "Small"
+        )
+        d = d.drop(columns=["LastName"])
+
+    if "Cabin" in d.columns:
+        d["HasCabin"] = d["Cabin"].notna().astype(int)
+        d["Deck"] = d["Cabin"].str[0].fillna("U")
+        d["CabinNum"] = d["Cabin"].str.extract(r'(\d+)', expand=False).fillna(-1).astype(float)
+        d["CabinCount"] = d["Cabin"].fillna("").apply(
+            lambda x: len(x.split()) if x else 0
+        )
+        d["CabinOdd"] = np.where(d["CabinNum"] > 0, (d["CabinNum"] % 2).astype(int), -1)
+        _deck_order = {'A': 1, 'B': 2, 'C': 3, 'D': 4, 'E': 5, 'F': 6, 'G': 7, 'T': 3}
+        d["DeckNum"] = d["Deck"].map(_deck_order).fillna(0)
+        d = d.drop(columns=["Cabin"])
+
+    if "Ticket" in d.columns:
+        d["TicketGroupSize"] = d["Ticket"].map(d["Ticket"].value_counts())
+        cleaned = d["Ticket"].str.upper().str.replace(r'[\./\s]', '', regex=True)
+        prefix = cleaned.str.extract(r'^([A-Z]+)', expand=False)
+        d["TicketPrefix"] = prefix.fillna("NUM")
+        prefix_counts = d["TicketPrefix"].value_counts()
+        d["TicketPrefix"] = d["TicketPrefix"].map(
+            lambda x: x if prefix_counts.get(x, 0) >= 5 else "RARE"
+        )
+        _tick_num = d["Ticket"].str.extract(r'(\d+)$', expand=False)
+        d["TicketNum"] = pd.to_numeric(_tick_num, errors='coerce').fillna(0)
+        d["TicketNumLog"] = np.log1p(d["TicketNum"])
+        d["TicketID"] = d["Ticket"].astype(str)
+        d = d.drop(columns=["Ticket"])
+
+    for col in ["PassengerId"]:
+        if col in d.columns:
+            d = d.drop(columns=[col])
+
+    if "Age" in d.columns and "Title" in d.columns:
+        d["Age_missing"] = d["Age"].isna().astype(int)
+        title_age_med = d.groupby("Title")["Age"].median()
+        global_age_med = d["Age"].median()
+
+        def fill_age(row):
+            if pd.isna(row["Age"]):
+                return title_age_med.get(row["Title"], global_age_med)
+            return row["Age"]
+
+        d["Age"] = d.apply(fill_age, axis=1)
+        d["AgeBin"] = pd.cut(d["Age"], bins=[0, 12, 18, 35, 60, 200],
+                             labels=[0, 1, 2, 3, 4]).astype(float).fillna(2)
+        d["IsVeryYoung"] = (d["Age"] < 5).astype(int)
+        d["IsSenior"] = (d["Age"] >= 60).astype(int)
+
+    if "Fare" in d.columns:
+        fare_med = d.loc[d["Fare"] > 0, "Fare"].median()
+        d["Fare"] = d["Fare"].fillna(fare_med)
+        d["Fare"] = d["Fare"].clip(lower=0.01)
+        if "FamilySize" in d.columns:
+            d["FarePerPerson"] = d["Fare"] / d["FamilySize"]
+            d["LogFarePerPerson"] = np.log1p(d["FarePerPerson"])
+        if "TicketGroupSize" in d.columns:
+            d["FarePerTicketMate"] = d["Fare"] / d["TicketGroupSize"]
+            d["LogFarePerTicketMate"] = np.log1p(d["FarePerTicketMate"])
+        d["LogFare"] = np.log1p(d["Fare"])
+        if "Pclass" in d.columns:
+            d["FareRank_Pclass"] = d.groupby("Pclass")["Fare"].rank(pct=True)
+        if "FarePerPerson" in d.columns and "Pclass" in d.columns:
+            _class_fpp_med = d.groupby("Pclass")["FarePerPerson"].transform("median")
+            d["FarePP_RelToClass"] = d["FarePerPerson"] / (_class_fpp_med + 0.01)
+
+    if "Embarked" in d.columns:
+        mode_val = d["Embarked"].mode()
+        embarked_mode = mode_val.iloc[0] if len(mode_val) > 0 else "S"
+        d["Embarked"] = d["Embarked"].fillna(embarked_mode)
+
+    if "Pclass" in d.columns and "Sex" in d.columns:
+        d["Pclass_Sex"] = d["Pclass"].astype(str) + "_" + d["Sex"].astype(str)
+
+    if "Sex" in d.columns:
+        d["Sex_bin"] = (d["Sex"] == "male").astype(int)
+        d["IsFemale"] = 1 - d["Sex_bin"]
+
+    if "Age" in d.columns and "Pclass" in d.columns:
+        d["Age_Pclass"] = d["Age"] * d["Pclass"]
+
+    if "Sex_bin" in d.columns and "LogFare" in d.columns:
+        d["Male_LogFare"] = d["Sex_bin"] * d["LogFare"]
+
+    if "Pclass" in d.columns and "LogFarePerPerson" in d.columns:
+        d["Pclass_LogFPP"] = d["Pclass"] * d["LogFarePerPerson"]
+
+    if "Age" in d.columns and "Sex" in d.columns:
+        d["IsChild"] = (d["Age"] < 15).astype(int)
+        d["IsWomanOrChild"] = ((d["Sex"] == "female") | (d["Age"] < 15)).astype(int)
+        d["IsAdultMale"] = ((d["Sex"] == "male") & (d["Age"] >= 18)).astype(int)
+
+    if "Sex" in d.columns and "Parch" in d.columns and "Age" in d.columns:
+        d["IsMother"] = ((d["Sex"] == "female") &
+                         (d["Parch"] > 0) &
+                         (d["Age"] > 18)).astype(int)
+
+    if "Age" in d.columns:
+        d["Age_sq"] = d["Age"] ** 2
+
+    if "LogFare" in d.columns and "IsWomanOrChild" in d.columns:
+        d["Fare_WomanChild"] = d["LogFare"] * d["IsWomanOrChild"]
+
+    if "Pclass" in d.columns and "IsAdultMale" in d.columns:
+        d["Pclass_AdultMale"] = d["Pclass"] * d["IsAdultMale"]
+
+    if "Pclass" in d.columns and "IsAlone" in d.columns:
+        d["Pclass_IsAlone"] = d["Pclass"] * d["IsAlone"]
+
+    if "Age" in d.columns and "Sex_bin" in d.columns:
+        d["Age_Sex"] = d["Age"] * d["Sex_bin"]
+
+    if "Title" in d.columns and "Pclass" in d.columns:
+        d["Title_Pclass"] = d["Title"].astype(str) + "_" + d["Pclass"].astype(str)
+
+    if "TicketGroupSize" in d.columns and "IsAlone" in d.columns:
+        d["TicketSize_IsAlone"] = d["TicketGroupSize"] * d["IsAlone"]
+
+    if "FamilySize" in d.columns and "Pclass" in d.columns:
+        d["FamilySize_Pclass"] = d["FamilySize"] * d["Pclass"]
+
+    if "TicketGroupSize" in d.columns and "FamilySize" in d.columns:
+        d["NonFamilyTicketMates"] = (d["TicketGroupSize"] - d["FamilySize"]).clip(lower=0)
+
+    if "IsChild" in d.columns and "Pclass" in d.columns:
+        d["IsChild_Pclass"] = d["IsChild"] * d["Pclass"]
+
+    if "IsFemale" in d.columns and "Pclass" in d.columns:
+        d["IsFemale_Pclass"] = d["IsFemale"] * d["Pclass"]
+
+    if "IsFemale" in d.columns and "HasCabin" in d.columns:
+        d["IsFemale_HasCabin"] = d["IsFemale"] * d["HasCabin"]
+
+    if all(c in d.columns for c in ["IsAdultMale", "IsAlone", "Pclass"]):
+        d["WorstCase"] = ((d["IsAdultMale"] == 1) & (d["IsAlone"] == 1) &
+                          (d["Pclass"] == 3)).astype(int)
+
+    if all(c in d.columns for c in ["IsFemale", "HasCabin", "Pclass"]):
+        d["BestCase"] = ((d["IsFemale"] == 1) & (d["Pclass"] == 1) &
+                         (d["HasCabin"] == 1)).astype(int)
+
+    if "IsVeryYoung" in d.columns and "Pclass" in d.columns:
+        d["IsVeryYoung_Pclass"] = d["IsVeryYoung"] * d["Pclass"]
+
+    if all(c in d.columns for c in ['TicketID', 'IsFemale', 'IsChild', 'IsWomanOrChild', 'Age']):
+        d['TG_FemRatio'] = d.groupby('TicketID')['IsFemale'].transform('mean')
+        d['TG_ChildRatio'] = d.groupby('TicketID')['IsChild'].transform('mean')
+        d['TG_WCRatio'] = d.groupby('TicketID')['IsWomanOrChild'].transform('mean')
+        d['TG_MeanAge'] = d.groupby('TicketID')['Age'].transform('mean')
+        if 'IsAdultMale' in d.columns:
+            d['TG_AdultMaleRatio'] = d.groupby('TicketID')['IsAdultMale'].transform('mean')
+
+    if all(c in d.columns for c in ['FamilyID', 'IsFemale', 'IsChild', 'IsWomanOrChild']):
+        d['Fam_FemRatio'] = d.groupby('FamilyID')['IsFemale'].transform('mean')
+        d['Fam_ChildRatio'] = d.groupby('FamilyID')['IsChild'].transform('mean')
+        d['Fam_WCRatio'] = d.groupby('FamilyID')['IsWomanOrChild'].transform('mean')
+
+    for col in d.select_dtypes(include=["object", "category"]).columns:
+        d[col] = d[col].fillna("Unknown")
+    for col in d.select_dtypes(include="number").columns:
+        d[col] = d[col].fillna(d[col].median())
+
+    return d
+
+
+X_all_raw = engineer_features(X_raw)
+
+CAT_COLS_FOR_TE = [c for c in ["Title", "Pclass_Sex", "Deck", "TicketPrefix", "FamilyID",
+                                "Embarked", "TicketID", "Title_Pclass", "SibSp", "Parch"]
+                   if c in X_all_raw.columns]
+print(f"Categorical cols for target encoding: {CAT_COLS_FOR_TE}")
+
+n_folds = 10
+skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=42)
+
+
+def add_oof_target_encoding(X_df, y_arr, skf, cat_cols, alpha=5):
+    global_mean = float(y_arr.mean())
+    new_features = {}
+
+    for col in cat_cols:
+        if col not in X_df.columns:
+            continue
+        encoded = np.full(len(X_df), global_mean, dtype=np.float64)
+
+        for tr_idx, va_idx in skf.split(np.zeros(len(X_df)), y_arr):
+            train_vals = X_df[col].astype(str).values[tr_idx]
+            train_y = y_arr[tr_idx]
+
+            cat_stats = {}
+            for cat_val in np.unique(train_vals):
+                mask = train_vals == cat_val
+                n = int(mask.sum())
+                mean = float(train_y[mask].mean())
+                cat_stats[cat_val] = (n * mean + alpha * global_mean) / (n + alpha)
+
+            val_vals = X_df[col].astype(str).values[va_idx]
+            for i, va_i in enumerate(va_idx):
+                encoded[va_i] = cat_stats.get(val_vals[i], global_mean)
+
+        new_features[f"{col}_te"] = encoded
+
+    return pd.DataFrame(new_features, index=X_df.index)
+
+
+te_df = add_oof_target_encoding(X_all_raw, y_encoded, skf, CAT_COLS_FOR_TE, alpha=5)
+X_all = pd.concat([X_all_raw, te_df], axis=1)
+
+for col in X_all.select_dtypes(include=["object", "category"]).columns:
+    le = LabelEncoder()
+    X_all[col] = le.fit_transform(X_all[col].astype(str))
+
+X_arr = X_all.values.astype(np.float32)
+print(f"Features ({X_arr.shape[1]}): {list(X_all.columns)}")
+
+# ── Optuna-tuned LightGBM ─────────────────────────────────────────────────────
+print("Tuning LightGBM with Optuna...")
+
+def lgb_objective(trial):
+    params = dict(
+        objective="binary",
+        metric="auc",
+        boosting_type="gbdt",
+        num_leaves=trial.suggest_int("num_leaves", 20, 127),
+        max_depth=-1,
+        learning_rate=trial.suggest_float("learning_rate", 0.01, 0.08, log=True),
+        n_estimators=3000,
+        feature_fraction=trial.suggest_float("feature_fraction", 0.5, 1.0),
+        bagging_fraction=trial.suggest_float("bagging_fraction", 0.5, 1.0),
+        bagging_freq=5,
+        min_child_samples=trial.suggest_int("min_child_samples", 3, 30),
+        reg_alpha=trial.suggest_float("reg_alpha", 0.01, 2.0, log=True),
+        reg_lambda=trial.suggest_float("reg_lambda", 0.01, 2.0, log=True),
+        verbose=-1,
+        random_state=42,
+    )
+    oof = np.zeros(len(X_arr))
+    for tr_idx, va_idx in skf.split(X_arr, y_encoded):
+        m = lgb.LGBMClassifier(**params)
+        m.fit(X_arr[tr_idx], y_encoded[tr_idx],
+              eval_set=[(X_arr[va_idx], y_encoded[va_idx])],
+              callbacks=[lgb.early_stopping(80, verbose=False), lgb.log_evaluation(-1)])
+        oof[va_idx] = m.predict_proba(X_arr[va_idx])[:, 1]
+    return roc_auc_score(y_encoded, oof)
+
+study_lgb = optuna.create_study(direction="maximize",
+                                 sampler=optuna.samplers.TPESampler(seed=42))
+study_lgb.optimize(lgb_objective, n_trials=75, show_progress_bar=False)
+best_lgb_params = dict(
+    objective="binary",
+    metric="auc",
+    boosting_type="gbdt",
+    verbose=-1,
+    random_state=42,
+    n_estimators=3000,
+    bagging_freq=5,
+    **study_lgb.best_params
+)
+print(f"Best LGB params: {study_lgb.best_params}")
+
+# ── Multi-seed LightGBM ───────────────────────────────────────────────────────
+lgb_seeds = [42, 123, 456, 789, 1024]
+oof_lgb_list = []
+for seed in lgb_seeds:
+    oof_seed = np.zeros(len(X_arr))
+    for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
+        X_tr, X_va = X_arr[tr_idx], X_arr[va_idx]
+        y_tr, y_va = y_encoded[tr_idx], y_encoded[va_idx]
+        model = lgb.LGBMClassifier(**{**best_lgb_params, 'random_state': seed})
+        model.fit(
+            X_tr, y_tr,
+            eval_set=[(X_va, y_va)],
+            callbacks=[lgb.early_stopping(100, verbose=False), lgb.log_evaluation(-1)],
+        )
+        oof_seed[va_idx] = model.predict_proba(X_va)[:, 1]
+    oof_lgb_list.append(oof_seed)
+
+oof_lgb = np.mean(oof_lgb_list, axis=0)
+auc_lgb = roc_auc_score(y_encoded, oof_lgb)
+print(f"LGB (5-seed, Optuna) OOF AUC: {auc_lgb:.4f}")
+
+# ── Optuna-tuned XGBoost ──────────────────────────────────────────────────────
+print("Tuning XGBoost with Optuna...")
+
+def xgb_objective(trial):
+    params = dict(
+        objective="binary:logistic",
+        eval_metric="auc",
+        n_estimators=3000,
+        learning_rate=trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
+        max_depth=trial.suggest_int("max_depth", 3, 8),
+        min_child_weight=trial.suggest_int("min_child_weight", 1, 10),
+        subsample=trial.suggest_float("subsample", 0.5, 1.0),
+        colsample_bytree=trial.suggest_float("colsample_bytree", 0.5, 1.0),
+        colsample_bylevel=trial.suggest_float("colsample_bylevel", 0.5, 1.0),
+        reg_alpha=trial.suggest_float("reg_alpha", 0.001, 2.0, log=True),
+        reg_lambda=trial.suggest_float("reg_lambda", 0.001, 2.0, log=True),
+        verbosity=0,
+        random_state=42,
+        early_stopping_rounds=80,
+    )
+    oof = np.zeros(len(X_arr))
+    for tr_idx, va_idx in skf.split(X_arr, y_encoded):
+        m = xgb.XGBClassifier(**params)
+        m.fit(X_arr[tr_idx], y_encoded[tr_idx],
+              eval_set=[(X_arr[va_idx], y_encoded[va_idx])],
+              verbose=False)
+        oof[va_idx] = m.predict_proba(X_arr[va_idx])[:, 1]
+    return roc_auc_score(y_encoded, oof)
+
+study_xgb = optuna.create_study(direction="maximize",
+                                  sampler=optuna.samplers.TPESampler(seed=42))
+study_xgb.optimize(xgb_objective, n_trials=30, show_progress_bar=False)
+best_xgb_params = dict(
+    objective="binary:logistic",
+    eval_metric="auc",
+    verbosity=0,
+    random_state=42,
+    n_estimators=3000,
+    early_stopping_rounds=80,
+    **study_xgb.best_params
+)
+print(f"Best XGB params: {study_xgb.best_params}")
+
+# ── Multi-seed XGBoost ────────────────────────────────────────────────────────
+xgb_seeds = [42, 123, 456, 789, 1024]
+oof_xgb_list = []
+for seed in xgb_seeds:
+    oof_seed = np.zeros(len(X_arr))
+    for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
+        X_tr, X_va = X_arr[tr_idx], X_arr[va_idx]
+        y_tr, y_va = y_encoded[tr_idx], y_encoded[va_idx]
+        model = xgb.XGBClassifier(**{**best_xgb_params, 'random_state': seed})
+        model.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
+        oof_seed[va_idx] = model.predict_proba(X_va)[:, 1]
+    oof_xgb_list.append(oof_seed)
+
+oof_xgb = np.mean(oof_xgb_list, axis=0)
+auc_xgb = roc_auc_score(y_encoded, oof_xgb)
+print(f"XGB (5-seed, Optuna) OOF AUC: {auc_xgb:.4f}")
+
+# ── Optuna-tuned CatBoost ─────────────────────────────────────────────────────
+print("Tuning CatBoost with Optuna...")
+
+def cat_objective(trial):
+    params = dict(
+        iterations=2000,
+        learning_rate=trial.suggest_float("learning_rate", 0.01, 0.15, log=True),
+        depth=trial.suggest_int("depth", 4, 8),
+        l2_leaf_reg=trial.suggest_float("l2_leaf_reg", 1.0, 10.0, log=True),
+        bagging_temperature=trial.suggest_float("bagging_temperature", 0.0, 1.0),
+        random_strength=trial.suggest_float("random_strength", 0.5, 3.0),
+        min_data_in_leaf=trial.suggest_int("min_data_in_leaf", 1, 15),
+        random_seed=42,
+        verbose=False,
+        train_dir='/tmp/catboost_info',
+        early_stopping_rounds=80,
+        eval_metric='AUC',
+    )
+    oof = np.zeros(len(X_arr))
+    for tr_idx, va_idx in skf.split(X_arr, y_encoded):
+        m = CatBoostClassifier(**params)
+        m.fit(X_arr[tr_idx], y_encoded[tr_idx],
+              eval_set=(X_arr[va_idx], y_encoded[va_idx]))
+        oof[va_idx] = m.predict_proba(X_arr[va_idx])[:, 1]
+    return roc_auc_score(y_encoded, oof)
+
+study_cat = optuna.create_study(direction="maximize",
+                                  sampler=optuna.samplers.TPESampler(seed=42))
+study_cat.optimize(cat_objective, n_trials=25, show_progress_bar=False)
+best_cat_params = dict(
+    verbose=False,
+    train_dir='/tmp/catboost_info',
+    early_stopping_rounds=80,
+    eval_metric='AUC',
+    iterations=2000,
+    **study_cat.best_params
+)
+print(f"Best CatBoost params: {study_cat.best_params}")
+
+# ── Multi-seed CatBoost ───────────────────────────────────────────────────────
+cat_seeds = [42, 123, 456, 789, 1024]
+oof_cat_list = []
+for seed in cat_seeds:
+    oof_seed = np.zeros(len(X_arr))
+    for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
+        X_tr, X_va = X_arr[tr_idx], X_arr[va_idx]
+        y_tr, y_va = y_encoded[tr_idx], y_encoded[va_idx]
+        model = CatBoostClassifier(**{**best_cat_params, 'random_seed': seed})
+        model.fit(X_tr, y_tr, eval_set=(X_va, y_va))
+        oof_seed[va_idx] = model.predict_proba(X_va)[:, 1]
+    oof_cat_list.append(oof_seed)
+
+oof_cat = np.mean(oof_cat_list, axis=0)
+auc_cat = roc_auc_score(y_encoded, oof_cat)
+print(f"CAT (5-seed, Optuna) OOF AUC: {auc_cat:.4f}")
+
+# ── Optuna-tuned ExtraTrees ───────────────────────────────────────────────────
+print("Tuning ExtraTrees with Optuna...")
+
+def et_objective(trial):
+    params = dict(
+        n_estimators=trial.suggest_int("n_estimators", 500, 2000),
+        max_features=trial.suggest_float("max_features", 0.2, 0.9),
+        min_samples_leaf=trial.suggest_int("min_samples_leaf", 1, 10),
+        max_depth=trial.suggest_int("max_depth", 5, 40),
+        random_state=42,
+        n_jobs=-1,
+    )
+    oof = np.zeros(len(X_arr))
+    for tr_idx, va_idx in skf.split(X_arr, y_encoded):
+        m = ExtraTreesClassifier(**params)
+        m.fit(X_arr[tr_idx], y_encoded[tr_idx])
+        oof[va_idx] = m.predict_proba(X_arr[va_idx])[:, 1]
+    return roc_auc_score(y_encoded, oof)
+
+study_et = optuna.create_study(direction="maximize",
+                                sampler=optuna.samplers.TPESampler(seed=42))
+study_et.optimize(et_objective, n_trials=20, show_progress_bar=False)
+best_et_params = dict(random_state=42, n_jobs=-1, **study_et.best_params)
+print(f"Best ET params: {study_et.best_params}")
+
+et_seeds = [42, 123, 456]
+oof_et_list = []
+for seed in et_seeds:
+    oof_seed = np.zeros(len(X_arr))
+    for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
+        model = ExtraTreesClassifier(**{**best_et_params, 'random_state': seed})
+        model.fit(X_arr[tr_idx], y_encoded[tr_idx])
+        oof_seed[va_idx] = model.predict_proba(X_arr[va_idx])[:, 1]
+    oof_et_list.append(oof_seed)
+
+oof_et = np.mean(oof_et_list, axis=0)
+auc_et = roc_auc_score(y_encoded, oof_et)
+print(f"ET (3-seed, Optuna) OOF AUC: {auc_et:.4f}")
+
+# ── Optuna-tuned Random Forest ────────────────────────────────────────────────
+print("Tuning Random Forest with Optuna...")
+
+def rf_objective(trial):
+    params = dict(
+        n_estimators=trial.suggest_int("n_estimators", 500, 2000),
+        max_features=trial.suggest_float("max_features", 0.2, 0.9),
+        min_samples_leaf=trial.suggest_int("min_samples_leaf", 1, 10),
+        max_depth=trial.suggest_int("max_depth", 5, 40),
+        max_samples=trial.suggest_float("max_samples", 0.6, 1.0),
+        random_state=42,
+        n_jobs=-1,
+    )
+    oof = np.zeros(len(X_arr))
+    for tr_idx, va_idx in skf.split(X_arr, y_encoded):
+        m = RandomForestClassifier(**params)
+        m.fit(X_arr[tr_idx], y_encoded[tr_idx])
+        oof[va_idx] = m.predict_proba(X_arr[va_idx])[:, 1]
+    return roc_auc_score(y_encoded, oof)
+
+study_rf = optuna.create_study(direction="maximize",
+                                sampler=optuna.samplers.TPESampler(seed=42))
+study_rf.optimize(rf_objective, n_trials=30, show_progress_bar=False)
+best_rf_params = dict(random_state=42, n_jobs=-1, **study_rf.best_params)
+print(f"Best RF params: {study_rf.best_params}")
+
+rf_seeds = [42, 123, 456]
+oof_rf_list = []
+for seed in rf_seeds:
+    oof_seed = np.zeros(len(X_arr))
+    for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
+        model = RandomForestClassifier(**{**best_rf_params, 'random_state': seed})
+        model.fit(X_arr[tr_idx], y_encoded[tr_idx])
+        oof_seed[va_idx] = model.predict_proba(X_arr[va_idx])[:, 1]
+    oof_rf_list.append(oof_seed)
+
+oof_rf = np.mean(oof_rf_list, axis=0)
+auc_rf = roc_auc_score(y_encoded, oof_rf)
+print(f"RF (3-seed, Optuna) OOF AUC: {auc_rf:.4f}")
+
+# ── SVM with RBF kernel ───────────────────────────────────────────────────────
+oof_svm = np.zeros(len(X_arr))
+for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
+    X_tr, X_va = X_arr[tr_idx], X_arr[va_idx]
+    y_tr, y_va = y_encoded[tr_idx], y_encoded[va_idx]
+    scaler = StandardScaler()
+    X_tr_sc = scaler.fit_transform(X_tr)
+    X_va_sc = scaler.transform(X_va)
+    model = SVC(kernel='rbf', C=10.0, gamma='scale', probability=True, random_state=42)
+    model.fit(X_tr_sc, y_tr)
+    oof_svm[va_idx] = model.predict_proba(X_va_sc)[:, 1]
+
+auc_svm = roc_auc_score(y_encoded, oof_svm)
+print(f"SVM OOF AUC: {auc_svm:.4f}")
+
+# ── Optuna-tuned HistGradientBoostingClassifier ───────────────────────────────
+print("Tuning HistGBM with Optuna...")
+
+def hgb_objective(trial):
+    params = dict(
+        max_iter=1000,
+        learning_rate=trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
+        max_leaf_nodes=trial.suggest_int("max_leaf_nodes", 15, 63),
+        min_samples_leaf=trial.suggest_int("min_samples_leaf", 3, 20),
+        l2_regularization=trial.suggest_float("l2_regularization", 0.0, 1.0),
+        max_bins=255,
+        random_state=42,
+        early_stopping=True,
+        validation_fraction=0.1,
+        n_iter_no_change=30,
+    )
+    oof = np.zeros(len(X_arr))
+    for tr_idx, va_idx in skf.split(X_arr, y_encoded):
+        m = HistGradientBoostingClassifier(**params)
+        m.fit(X_arr[tr_idx], y_encoded[tr_idx])
+        oof[va_idx] = m.predict_proba(X_arr[va_idx])[:, 1]
+    return roc_auc_score(y_encoded, oof)
+
+study_hgb = optuna.create_study(direction="maximize",
+                                  sampler=optuna.samplers.TPESampler(seed=42))
+study_hgb.optimize(hgb_objective, n_trials=15, show_progress_bar=False)
+best_hgb_params = dict(
+    max_bins=255,
+    random_state=42,
+    early_stopping=True,
+    validation_fraction=0.1,
+    n_iter_no_change=30,
+    max_iter=1000,
+    **study_hgb.best_params
+)
+print(f"Best HGB params: {study_hgb.best_params}")
+
+oof_hgb = np.zeros(len(X_arr))
+for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
+    X_tr, X_va = X_arr[tr_idx], X_arr[va_idx]
+    y_tr, y_va = y_encoded[tr_idx], y_encoded[va_idx]
+    model = HistGradientBoostingClassifier(**best_hgb_params)
+    model.fit(X_tr, y_tr)
+    oof_hgb[va_idx] = model.predict_proba(X_va)[:, 1]
+
+auc_hgb = roc_auc_score(y_encoded, oof_hgb)
+print(f"HGB (Optuna) OOF AUC: {auc_hgb:.4f}")
+
+# ── KNN (averaged over multiple k values) ────────────────────────────────────
+oof_knn = np.zeros(len(X_arr))
+for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
+    X_tr, X_va = X_arr[tr_idx], X_arr[va_idx]
+    y_tr, y_va = y_encoded[tr_idx], y_encoded[va_idx]
+    scaler = StandardScaler()
+    X_tr_sc = scaler.fit_transform(X_tr)
+    X_va_sc = scaler.transform(X_va)
+    knn_preds = []
+    for k in [5, 10, 15, 20, 30]:
+        model = KNeighborsClassifier(n_neighbors=k, metric='euclidean', weights='distance', n_jobs=-1)
+        model.fit(X_tr_sc, y_tr)
+        knn_preds.append(model.predict_proba(X_va_sc)[:, 1])
+    oof_knn[va_idx] = np.mean(knn_preds, axis=0)
+
+auc_knn = roc_auc_score(y_encoded, oof_knn)
+print(f"KNN OOF AUC: {auc_knn:.4f}")
+
+# ── PyTorch ResNet MLP (3-seed, skip connections + BatchNorm + Dropout) ──────
+print("Training PyTorch ResNet MLP (3-seed)...")
+
+class _PyMLP(nn.Module):
+    """ResNet-style MLP with skip connections for better gradient flow."""
+    def __init__(self, n_in):
+        super().__init__()
+        H = 128
+
+        # Input projection: n_in → H
+        self.input_proj = nn.Sequential(
+            nn.Linear(n_in, H),
+            nn.BatchNorm1d(H),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+        )
+
+        # ResNet block 1: H → H with skip
+        self.res1 = nn.Sequential(
+            nn.Linear(H, H),
+            nn.BatchNorm1d(H),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(H, H),
+            nn.BatchNorm1d(H),
+        )
+
+        # ResNet block 2: H → H with skip
+        self.res2 = nn.Sequential(
+            nn.Linear(H, H),
+            nn.BatchNorm1d(H),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(H, H),
+            nn.BatchNorm1d(H),
+        )
+
+        # Output head: H → 32 → 1
+        self.output = nn.Sequential(
+            nn.Linear(H, 32),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(32, 1),
+        )
+
+    def forward(self, x):
+        x = self.input_proj(x)
+        x = F.relu(x + self.res1(x))   # skip connection 1
+        x = F.relu(x + self.res2(x))   # skip connection 2
+        return self.output(x).squeeze(-1)
+
+
+_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+_n_feat = X_arr.shape[1]
+print(f"PyTorch MLP device: {_device}, features: {_n_feat}")
+
+mlp_seeds = [42, 123, 456]
+oof_mlp_list_pt = []
+for _seed in mlp_seeds:
+    torch.manual_seed(_seed)
+    np.random.seed(_seed)
+    oof_seed_mlp = np.zeros(len(X_arr))
+    for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
+        X_tr, X_va = X_arr[tr_idx], X_arr[va_idx]
+        y_tr, y_va = y_encoded[tr_idx], y_encoded[va_idx]
+        _sc = StandardScaler()
+        X_tr_sc = _sc.fit_transform(X_tr).astype(np.float32)
+        X_va_sc = _sc.transform(X_va).astype(np.float32)
+        # Label smoothing: reduces overconfidence, improves generalization on small N
+        _smooth_eps = 0.05
+        y_tr_smooth = y_tr.astype(np.float32) * (1.0 - _smooth_eps) + _smooth_eps / 2.0
+        Xtr_t = torch.from_numpy(X_tr_sc).to(_device)
+        ytr_t = torch.from_numpy(y_tr_smooth).to(_device)
+        Xva_t = torch.from_numpy(X_va_sc).to(_device)
+        _mlp = _PyMLP(_n_feat).to(_device)
+        _opt = optim.Adam(_mlp.parameters(), lr=1e-3, weight_decay=1e-3)
+        _crit = nn.BCEWithLogitsLoss()
+        _sched = optim.lr_scheduler.CosineAnnealingLR(_opt, T_max=200)
+        _ds = TensorDataset(Xtr_t, ytr_t)
+        _dl = DataLoader(_ds, batch_size=64, shuffle=True, num_workers=0, drop_last=True)
+        best_auc_pt = -1.0
+        best_state_pt = None
+        no_imp_pt = 0
+        for _ep in range(200):
+            _mlp.train()
+            for _xb, _yb in _dl:
+                _opt.zero_grad()
+                _loss = _crit(_mlp(_xb), _yb)
+                _loss.backward()
+                torch.nn.utils.clip_grad_norm_(_mlp.parameters(), max_norm=1.0)
+                _opt.step()
+            _sched.step()
+            _mlp.eval()
+            with torch.no_grad():
+                _vp = torch.sigmoid(_mlp(Xva_t)).cpu().numpy()
+            _vauc = roc_auc_score(y_va, _vp)  # use original labels for eval
+            if _vauc > best_auc_pt:
+                best_auc_pt = _vauc
+                best_state_pt = {k: v.clone() for k, v in _mlp.state_dict().items()}
+                no_imp_pt = 0
+            else:
+                no_imp_pt += 1
+                if no_imp_pt >= 25:
+                    break
+        if best_state_pt is not None:
+            _mlp.load_state_dict(best_state_pt)
+        _mlp.eval()
+        with torch.no_grad():
+            oof_seed_mlp[va_idx] = torch.sigmoid(_mlp(Xva_t)).cpu().numpy()
+    oof_mlp_list_pt.append(oof_seed_mlp)
+
+oof_mlp = np.mean(oof_mlp_list_pt, axis=0)
+auc_mlp = roc_auc_score(y_encoded, oof_mlp)
+print(f"MLP (PyTorch 3-seed) OOF AUC: {auc_mlp:.4f}")
+
+# ── DART LightGBM (different boosting strategy for diversity) ─────────────────
+oof_dart = np.zeros(len(X_arr))
+for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
+    X_tr, X_va = X_arr[tr_idx], X_arr[va_idx]
+    y_tr, y_va = y_encoded[tr_idx], y_encoded[va_idx]
+    model = lgb.LGBMClassifier(
+        objective="binary",
+        metric="auc",
+        boosting_type="dart",
+        num_leaves=31,
+        learning_rate=0.05,
+        n_estimators=500,
+        feature_fraction=0.8,
+        bagging_fraction=0.8,
+        bagging_freq=5,
+        drop_rate=0.1,
+        skip_drop=0.5,
+        verbose=-1,
+        random_state=42,
+    )
+    model.fit(X_tr, y_tr)
+    oof_dart[va_idx] = model.predict_proba(X_va)[:, 1]
+
+auc_dart = roc_auc_score(y_encoded, oof_dart)
+print(f"DART-LGB OOF AUC: {auc_dart:.4f}")
+
+# ── GOSS LightGBM ─────────────────────────────────────────────────────────────
+oof_goss = np.zeros(len(X_arr))
+for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
+    X_tr, X_va = X_arr[tr_idx], X_arr[va_idx]
+    y_tr, y_va = y_encoded[tr_idx], y_encoded[va_idx]
+    model = lgb.LGBMClassifier(
+        objective="binary",
+        metric="auc",
+        boosting_type="gbdt",
+        data_sample_strategy="goss",
+        num_leaves=31,
+        learning_rate=0.03,
+        n_estimators=2000,
+        top_rate=0.2,
+        other_rate=0.1,
+        feature_fraction=0.8,
+        reg_alpha=0.1,
+        reg_lambda=0.5,
+        min_child_samples=5,
+        verbose=-1,
+        random_state=42,
+    )
+    model.fit(X_tr, y_tr,
+              eval_set=[(X_va, y_va)],
+              callbacks=[lgb.early_stopping(100, verbose=False), lgb.log_evaluation(-1)])
+    oof_goss[va_idx] = model.predict_proba(X_va)[:, 1]
+
+auc_goss = roc_auc_score(y_encoded, oof_goss)
+print(f"GOSS-LGB OOF AUC: {auc_goss:.4f}")
+
+# ── Logistic Regression with degree-2 polynomial features ────────────────────
+poly_feature_cols = [c for c in ['Pclass', 'Sex_bin', 'Age', 'AgeBin',
+                                  'LogFare', 'FarePerPerson', 'FareRank_Pclass',
+                                  'FamilySize', 'IsAlone', 'HasCabin',
+                                  'IsAdultMale', 'IsWomanOrChild', 'TicketGroupSize',
+                                  'IsFemale']
+                     if c in X_all.columns]
+X_poly_base = X_all[poly_feature_cols].values.astype(np.float32)
+
+oof_lr_poly = np.zeros(len(X_arr))
+for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
+    scaler = StandardScaler()
+    X_tr_sc = scaler.fit_transform(X_poly_base[tr_idx])
+    X_va_sc = scaler.transform(X_poly_base[va_idx])
+    poly = PolynomialFeatures(degree=2, include_bias=False)
+    X_tr_poly = poly.fit_transform(X_tr_sc)
+    X_va_poly = poly.transform(X_va_sc)
+    model = LogisticRegression(C=0.05, max_iter=3000, random_state=42, solver='saga')
+    model.fit(X_tr_poly, y_encoded[tr_idx])
+    oof_lr_poly[va_idx] = model.predict_proba(X_va_poly)[:, 1]
+
+auc_lr_poly = roc_auc_score(y_encoded, oof_lr_poly)
+print(f"LR-Poly OOF AUC: {auc_lr_poly:.4f}")
+
+# ── Sklearn GradientBoostingClassifier ────────────────────────────────────────
+oof_gbm = np.zeros(len(X_arr))
+for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
+    X_tr, X_va = X_arr[tr_idx], X_arr[va_idx]
+    y_tr, y_va = y_encoded[tr_idx], y_encoded[va_idx]
+    model = GradientBoostingClassifier(
+        n_estimators=600,
+        learning_rate=0.05,
+        max_depth=4,
+        subsample=0.8,
+        max_features='sqrt',
+        min_samples_leaf=3,
+        random_state=42,
+        n_iter_no_change=30,
+        validation_fraction=0.1,
+    )
+    model.fit(X_tr, y_tr)
+    oof_gbm[va_idx] = model.predict_proba(X_va)[:, 1]
+
+auc_gbm = roc_auc_score(y_encoded, oof_gbm)
+print(f"GBM (sklearn) OOF AUC: {auc_gbm:.4f}")
+
+# ── AdaBoost ──────────────────────────────────────────────────────────────────
+oof_ada = np.zeros(len(X_arr))
+for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
+    X_tr, X_va = X_arr[tr_idx], X_arr[va_idx]
+    y_tr, y_va = y_encoded[tr_idx], y_encoded[va_idx]
+    model = AdaBoostClassifier(
+        estimator=DecisionTreeClassifier(max_depth=3),
+        n_estimators=300,
+        learning_rate=0.5,
+        random_state=42,
+    )
+    model.fit(X_tr, y_tr)
+    oof_ada[va_idx] = model.predict_proba(X_va)[:, 1]
+
+auc_ada = roc_auc_score(y_encoded, oof_ada)
+print(f"AdaBoost OOF AUC: {auc_ada:.4f}")
+
+# ── Logistic Regression with L1 ───────────────────────────────────────────────
+oof_lr_l1 = np.zeros(len(X_arr))
+for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
+    X_tr, X_va = X_arr[tr_idx], X_arr[va_idx]
+    y_tr, y_va = y_encoded[tr_idx], y_encoded[va_idx]
+    scaler = StandardScaler()
+    X_tr_sc = scaler.fit_transform(X_tr)
+    X_va_sc = scaler.transform(X_va)
+    model = LogisticRegression(C=0.1, penalty='l1', solver='saga',
+                                max_iter=3000, random_state=42)
+    model.fit(X_tr_sc, y_tr)
+    oof_lr_l1[va_idx] = model.predict_proba(X_va_sc)[:, 1]
+
+auc_lr_l1 = roc_auc_score(y_encoded, oof_lr_l1)
+print(f"LR-L1 OOF AUC: {auc_lr_l1:.4f}")
+
+# ── Equal-weight blend of all 15 models ───────────────────────────────────────
+all_oofs = [oof_lgb, oof_xgb, oof_cat, oof_et, oof_rf, oof_svm, oof_hgb,
+            oof_knn, oof_mlp, oof_dart, oof_goss, oof_lr_poly, oof_gbm, oof_ada, oof_lr_l1]
+all_aucs_arr = np.array([auc_lgb, auc_xgb, auc_cat, auc_et, auc_rf, auc_svm, auc_hgb,
+                          auc_knn, auc_mlp, auc_dart, auc_goss, auc_lr_poly, auc_gbm, auc_ada, auc_lr_l1])
+
+oof_blend14 = np.mean(all_oofs, axis=0)
+auc_blend14 = roc_auc_score(y_encoded, oof_blend14)
+print(f"Blend-15 OOF AUC: {auc_blend14:.4f}")
+
+# Weighted blend by individual AUC^4 (emphasize stronger models)
+w = all_aucs_arr ** 4
+w /= w.sum()
+oof_mat = np.column_stack(all_oofs)
+oof_blend_wt = oof_mat @ w
+auc_blend_wt = roc_auc_score(y_encoded, oof_blend_wt)
+print(f"Blend-15 (weighted) OOF AUC: {auc_blend_wt:.4f}")
+
+# Rank-average blend
+from scipy.stats import rankdata
+oof_ranks_mat = np.column_stack([rankdata(oof) / len(oof) for oof in all_oofs])
+oof_blend_rank = np.mean(oof_ranks_mat, axis=1)
+auc_blend_rank = roc_auc_score(y_encoded, oof_blend_rank)
+print(f"Blend-15 (rank) OOF AUC: {auc_blend_rank:.4f}")
+
+# ── Stacking: Logistic Regression meta-learner ────────────────────────────────
+meta_14 = np.column_stack(all_oofs)
+
+oof_meta_lr = np.zeros(len(X_arr))
+for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
+    meta_model = LogisticRegression(C=1.0, random_state=42, max_iter=1000)
+    meta_model.fit(meta_14[tr_idx], y_encoded[tr_idx])
+    oof_meta_lr[va_idx] = meta_model.predict_proba(meta_14[va_idx])[:, 1]
+
+auc_meta_lr = roc_auc_score(y_encoded, oof_meta_lr)
+print(f"Stack-LR OOF AUC: {auc_meta_lr:.4f}")
+
+# ── Stacking: LightGBM meta-learner with key original + all TE features ───────
+all_te_cols = [c for c in X_all.columns if c.endswith('_te')]
+meta_key_cols = [c for c in ['Pclass', 'Sex_bin', 'AgeBin', 'IsAdultMale',
+                               'IsWomanOrChild', 'LogFare', 'HasCabin', 'FamilySize',
+                               'FareRank_Pclass', 'IsAlone', 'TicketGroupSize',
+                               'IsFemale', 'IsFemale_Pclass', 'IsChild_Pclass',
+                               'FarePerTicketMate', 'IsFemale_HasCabin',
+                               'WorstCase', 'BestCase', 'IsVeryYoung', 'DeckNum',
+                               'TG_FemRatio', 'TG_WCRatio', 'TG_ChildRatio', 'TG_MeanAge',
+                               'Fam_FemRatio', 'Fam_WCRatio', 'Fam_ChildRatio'] + all_te_cols
+                 if c in X_all.columns]
+meta_orig = X_all[meta_key_cols].values.astype(np.float32)
+
+# Rank-normalized OOF predictions
+meta_ranks = np.column_stack([rankdata(oof) / len(oof) for oof in all_oofs])
+
+# Model uncertainty / disagreement features
+meta_std = oof_mat.std(axis=1, keepdims=True)
+meta_min = oof_mat.min(axis=1, keepdims=True)
+meta_max = oof_mat.max(axis=1, keepdims=True)
+meta_range = meta_max - meta_min
+meta_uncertainty = np.column_stack([meta_std, meta_min, meta_max, meta_range])
+
+meta_all_ext = np.column_stack([meta_14, meta_ranks, meta_orig, meta_uncertainty])
+
+# ── Optuna-tune the LGB meta-learner ─────────────────────────────────────────
+print("Tuning meta-LGB with Optuna...")
+
+def meta_lgb_objective(trial):
+    meta_params = dict(
+        objective="binary",
+        metric="auc",
+        boosting_type="gbdt",
+        num_leaves=trial.suggest_int("num_leaves", 4, 20),
+        max_depth=trial.suggest_int("max_depth", 2, 5),
+        learning_rate=trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
+        n_estimators=500,
+        feature_fraction=trial.suggest_float("feature_fraction", 0.3, 1.0),
+        bagging_fraction=trial.suggest_float("bagging_fraction", 0.4, 1.0),
+        bagging_freq=5,
+        min_child_samples=trial.suggest_int("min_child_samples", 5, 30),
+        reg_alpha=trial.suggest_float("reg_alpha", 0.01, 10.0, log=True),
+        reg_lambda=trial.suggest_float("reg_lambda", 0.01, 10.0, log=True),
+        verbose=-1,
+        random_state=42,
+    )
+    oof = np.zeros(len(X_arr))
+    for tr_idx, va_idx in skf.split(X_arr, y_encoded):
+        m = lgb.LGBMClassifier(**meta_params)
+        m.fit(meta_all_ext[tr_idx], y_encoded[tr_idx])
+        oof[va_idx] = m.predict_proba(meta_all_ext[va_idx])[:, 1]
+    return roc_auc_score(y_encoded, oof)
+
+study_meta_lgb = optuna.create_study(direction="maximize",
+                                      sampler=optuna.samplers.TPESampler(seed=42))
+study_meta_lgb.optimize(meta_lgb_objective, n_trials=20, show_progress_bar=False)
+best_meta_lgb_params = dict(
+    objective="binary",
+    metric="auc",
+    boosting_type="gbdt",
+    verbose=-1,
+    random_state=42,
+    n_estimators=500,
+    bagging_freq=5,
+    **study_meta_lgb.best_params
+)
+print(f"Best meta-LGB params: {study_meta_lgb.best_params}")
+
+oof_meta_lgb = np.zeros(len(X_arr))
+for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
+    meta_model = lgb.LGBMClassifier(**best_meta_lgb_params)
+    meta_model.fit(meta_all_ext[tr_idx], y_encoded[tr_idx])
+    oof_meta_lgb[va_idx] = meta_model.predict_proba(meta_all_ext[va_idx])[:, 1]
+
+auc_meta_lgb = roc_auc_score(y_encoded, oof_meta_lgb)
+print(f"Stack-LGB OOF AUC: {auc_meta_lgb:.4f}")
+
+# ── Stacking: XGBoost meta-learner ────────────────────────────────────────────
+oof_meta_xgb = np.zeros(len(X_arr))
+for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
+    meta_model = xgb.XGBClassifier(
+        objective="binary:logistic",
+        n_estimators=300,
+        max_depth=2,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        reg_alpha=1.0,
+        reg_lambda=2.0,
+        verbosity=0,
+        random_state=42,
+    )
+    meta_model.fit(meta_all_ext[tr_idx], y_encoded[tr_idx])
+    oof_meta_xgb[va_idx] = meta_model.predict_proba(meta_all_ext[va_idx])[:, 1]
+
+auc_meta_xgb = roc_auc_score(y_encoded, oof_meta_xgb)
+print(f"Stack-XGB OOF AUC: {auc_meta_xgb:.4f}")
+
+# ── Stacking: CatBoost meta-learner ───────────────────────────────────────────
+oof_meta_cat2 = np.zeros(len(X_arr))
+for fold, (tr_idx, va_idx) in enumerate(skf.split(X_arr, y_encoded)):
+    meta_model = CatBoostClassifier(
+        iterations=300,
+        depth=2,
+        learning_rate=0.05,
+        l2_leaf_reg=5.0,
+        random_seed=42,
+        verbose=False,
+        train_dir='/tmp/catboost_info',
+    )
+    meta_model.fit(meta_all_ext[tr_idx], y_encoded[tr_idx])
+    oof_meta_cat2[va_idx] = meta_model.predict_proba(meta_all_ext[va_idx])[:, 1]
+
+auc_meta_cat2 = roc_auc_score(y_encoded, oof_meta_cat2)
+print(f"Stack-CAT OOF AUC: {auc_meta_cat2:.4f}")
+
+# ── Meta-ensemble: average LGB, XGB, CAT meta predictions ────────────────────
+oof_meta_avg3 = (oof_meta_lgb + oof_meta_xgb + oof_meta_cat2) / 3
+auc_meta_avg3 = roc_auc_score(y_encoded, oof_meta_avg3)
+print(f"Stack-LGB+XGB+CAT OOF AUC: {auc_meta_avg3:.4f}")
+
+oof_meta_avg4 = (oof_meta_lr + oof_meta_lgb + oof_meta_xgb + oof_meta_cat2) / 4
+auc_meta_avg4 = roc_auc_score(y_encoded, oof_meta_avg4)
+print(f"Stack-All4 OOF AUC: {auc_meta_avg4:.4f}")
+
+# Report the best across all ensembling strategies
+best_val_roc_auc = max(auc_blend14, auc_blend_wt, auc_blend_rank,
+                        auc_meta_lr, auc_meta_lgb, auc_meta_xgb, auc_meta_cat2,
+                        auc_meta_avg3, auc_meta_avg4)
+print(f"BEST_VAL_ROC_AUC: {best_val_roc_auc:.6f}")
