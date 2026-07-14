@@ -1,1 +1,2 @@
 experiment_id,description,model_name,metric_name,metric_value,improved,duration_s,commit,notes
+0,"baseline: LightGBM with 5-fold stratified CV + feature engineering (Title extraction, FamilySize, HasCabin/Deck, missingness indicators) chosen because N=891 < 10k tabular data with mixed numeric/categorical features strongly favors gradient boosting over deep learning",,roc_auc,0.838538,true,3.1,f9cfc74,
