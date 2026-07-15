@@ -8,7 +8,8 @@ sys.path.insert(0, '/home/flyte/.local/lib/python3.13/site-packages')
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import StratifiedKFold
-from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.neural_network import MLPClassifier
 from sklearn.metrics import roc_auc_score
 import lightgbm as lgb
 import xgboost as xgb
@@ -31,6 +32,10 @@ CABIN_NAN_PLACEHOLDER = "B96 B98"
 def engineer_features(df):
     df = df.copy()
 
+    # 0. Extract Surname before Name is dropped (family group size without target leakage)
+    df['Surname'] = df['Name'].str.split(',').str[0].str.strip()
+    df['SurnameSize'] = df.groupby('Surname')['Surname'].transform('count')
+
     # 1. Title from Name — very predictive on Titanic
     df['Title'] = df['Name'].str.extract(r' ([A-Za-z]+)\.', expand=False)
     title_map = {'Mlle': 'Miss', 'Ms': 'Miss', 'Mme': 'Mrs'}
@@ -50,10 +55,16 @@ def engineer_features(df):
         lambda r: age_medians.get((r['Title'], r['Pclass']), global_age_median), axis=1
     )
 
+    # 3.5. Age percentile rank within sex group (relative age — stronger signal than raw age)
+    df['AgePctileInSex'] = df.groupby('Sex')['Age'].rank(pct=True)
+
     # 4. Fare: impute missing by Pclass median before computing per-person fare
     df['Fare_missing'] = df['Fare'].isna().astype(int)
     pclass_fare_median = df.groupby('Pclass')['Fare'].median()
     df['Fare'] = df['Fare'].fillna(df['Pclass'].map(pclass_fare_median))
+
+    # 4.5. Fare percentile rank within Pclass (relative wealth within class)
+    df['FarePctileInPclass'] = df.groupby('Pclass')['Fare'].rank(pct=True)
 
     # 5. Family features
     df['FamilySize'] = df['SibSp'] + df['Parch'] + 1
@@ -75,6 +86,9 @@ def engineer_features(df):
         lambda row: len(row['Cabin'].split()) if row['Cabin'] != CABIN_NAN_PLACEHOLDER else 0,
         axis=1
     )
+    # DeckOrd: ordinal proximity to lifeboats (A deck = 7 = closest, G = 1, X = 0 = no cabin)
+    deck_ord = {'A': 7, 'B': 6, 'C': 5, 'D': 4, 'E': 3, 'F': 2, 'G': 1, 'X': 0}
+    df['DeckOrd'] = df['Deck'].map(deck_ord).fillna(0).astype(int)
 
     # 8. Age features (age is now fully imputed)
     df['IsChild'] = (df['Age'] < 12).astype(int)
@@ -108,7 +122,7 @@ def engineer_features(df):
     df['Embarked_Pclass'] = df['Embarked'] + '_' + df['Pclass'].astype(str)
 
     # 13. Drop raw text columns
-    df = df.drop(columns=['PassengerId', 'Name', 'Ticket', 'Cabin'])
+    df = df.drop(columns=['PassengerId', 'Name', 'Ticket', 'Cabin', 'Surname'])
 
     return df
 
@@ -319,13 +333,61 @@ cat_best.update({
 print(f"CatBoost best AUC={cat_study.best_value:.6f} ({len(cat_study.trials)} trials)")
 
 
-# ===================== Final 5-Fold CV: LGB + XGB + CatBoost + ExtraTrees Ensemble =====================
+# ===================== Optuna for MLP =====================
+# MLP provides genuinely different inductive bias (smooth boundaries vs piecewise trees)
+
+def mlp_objective(trial):
+    h_layers = trial.suggest_categorical('h_layers', [
+        (32,), (64,), (128,), (32, 16), (64, 32), (128, 64),
+        (128, 64, 32), (256, 128), (256, 128, 64)
+    ])
+    alpha = trial.suggest_float('alpha', 1e-5, 0.3, log=True)
+    lr_init = trial.suggest_float('lr_init', 5e-5, 1e-2, log=True)
+    batch_size = trial.suggest_categorical('batch_size', [32, 64, 128])
+
+    oof_preds = np.zeros(len(y))
+    for tr_idx, va_idx in skf.split(X_eng, y):
+        X_tr_m, X_va_m, _ = preprocess_encoded(X_eng.iloc[tr_idx], X_eng.iloc[va_idx])
+        scaler = StandardScaler()
+        X_tr_s = scaler.fit_transform(X_tr_m)
+        X_va_s = scaler.transform(X_va_m)
+        y_tr = y[tr_idx]
+        model = MLPClassifier(
+            hidden_layer_sizes=h_layers,
+            alpha=alpha,
+            learning_rate_init=lr_init,
+            activation='relu',
+            solver='adam',
+            batch_size=batch_size,
+            max_iter=2000,
+            early_stopping=True,
+            validation_fraction=0.1,
+            n_iter_no_change=30,
+            random_state=42,
+        )
+        model.fit(X_tr_s, y_tr)
+        oof_preds[va_idx] = model.predict_proba(X_va_s)[:, 1]
+    return roc_auc_score(y, oof_preds)
+
+
+print("Running MLP Optuna (50 trials)...")
+mlp_study = optuna.create_study(
+    direction="maximize",
+    sampler=optuna.samplers.TPESampler(seed=42),
+)
+mlp_study.optimize(mlp_objective, n_trials=50, timeout=90, show_progress_bar=False)
+mlp_best_params = mlp_study.best_params
+print(f"MLP best AUC={mlp_study.best_value:.6f} ({len(mlp_study.trials)} trials)")
+
+
+# ===================== Final 5-Fold CV: All 6 Models =====================
 
 oof_lgb = np.zeros(len(y))
 oof_xgb = np.zeros(len(y))
 oof_cat = np.zeros(len(y))
 oof_et = np.zeros(len(y))
 oof_rf = np.zeros(len(y))
+oof_mlp = np.zeros(len(y))
 fold_aucs = []
 
 for fold, (tr_idx, va_idx) in enumerate(skf.split(X_eng, y)):
@@ -380,42 +442,80 @@ for fold, (tr_idx, va_idx) in enumerate(skf.split(X_eng, y)):
     rf_model.fit(X_tr_r, y_tr)
     oof_rf[va_idx] = rf_model.predict_proba(X_va_r)[:, 1]
 
-    fold_ens = (oof_lgb[va_idx] + oof_xgb[va_idx] + oof_cat[va_idx] + oof_et[va_idx] + oof_rf[va_idx]) / 5
+    # --- MLP (neural network — smooth boundaries, different inductive bias from trees) ---
+    X_tr_m, X_va_m, _ = preprocess_encoded(X_eng.iloc[tr_idx], X_eng.iloc[va_idx])
+    scaler = StandardScaler()
+    X_tr_ms = scaler.fit_transform(X_tr_m)
+    X_va_ms = scaler.transform(X_va_m)
+    mlp_model = MLPClassifier(
+        hidden_layer_sizes=mlp_best_params['h_layers'],
+        alpha=mlp_best_params['alpha'],
+        learning_rate_init=mlp_best_params['lr_init'],
+        activation='relu',
+        solver='adam',
+        batch_size=mlp_best_params['batch_size'],
+        max_iter=2000,
+        early_stopping=True,
+        validation_fraction=0.1,
+        n_iter_no_change=30,
+        random_state=42,
+    )
+    mlp_model.fit(X_tr_ms, y_tr)
+    oof_mlp[va_idx] = mlp_model.predict_proba(X_va_ms)[:, 1]
+
+    # Fold-level ensemble stats
+    fold_ens = (oof_lgb[va_idx] + oof_xgb[va_idx] + oof_cat[va_idx] +
+                oof_et[va_idx] + oof_rf[va_idx] + oof_mlp[va_idx]) / 6
     fold_auc = roc_auc_score(y_va, fold_ens)
     fold_aucs.append(fold_auc)
     lgb_f = roc_auc_score(y_va, oof_lgb[va_idx])
     xgb_f = roc_auc_score(y_va, oof_xgb[va_idx])
     cat_f = roc_auc_score(y_va, oof_cat[va_idx])
-    et_f = roc_auc_score(y_va, oof_et[va_idx])
-    rf_f = roc_auc_score(y_va, oof_rf[va_idx])
-    print(f"Fold {fold+1}: LGB={lgb_f:.4f} XGB={xgb_f:.4f} CAT={cat_f:.4f} ET={et_f:.4f} RF={rf_f:.4f} ENS={fold_auc:.4f}")
+    et_f  = roc_auc_score(y_va, oof_et[va_idx])
+    rf_f  = roc_auc_score(y_va, oof_rf[va_idx])
+    mlp_f = roc_auc_score(y_va, oof_mlp[va_idx])
+    print(f"Fold {fold+1}: LGB={lgb_f:.4f} XGB={xgb_f:.4f} CAT={cat_f:.4f} "
+          f"ET={et_f:.4f} RF={rf_f:.4f} MLP={mlp_f:.4f} ENS={fold_auc:.4f}")
 
 lgb_auc = roc_auc_score(y, oof_lgb)
 xgb_auc = roc_auc_score(y, oof_xgb)
 cat_auc = roc_auc_score(y, oof_cat)
-et_auc = roc_auc_score(y, oof_et)
-rf_auc = roc_auc_score(y, oof_rf)
-print(f"Individual OOF: LGB={lgb_auc:.6f} XGB={xgb_auc:.6f} CAT={cat_auc:.6f} ET={et_auc:.6f} RF={rf_auc:.6f}")
+et_auc  = roc_auc_score(y, oof_et)
+rf_auc  = roc_auc_score(y, oof_rf)
+mlp_auc = roc_auc_score(y, oof_mlp)
+print(f"Individual OOF: LGB={lgb_auc:.6f} XGB={xgb_auc:.6f} CAT={cat_auc:.6f} "
+      f"ET={et_auc:.6f} RF={rf_auc:.6f} MLP={mlp_auc:.6f}")
 
-# Equal-weight ensemble
-oof_equal = (oof_lgb + oof_xgb + oof_cat + oof_et + oof_rf) / 5
-equal_auc = roc_auc_score(y, oof_equal)
+# Equal-weight ensemble (all 6 models)
+oof_equal6 = (oof_lgb + oof_xgb + oof_cat + oof_et + oof_rf + oof_mlp) / 6
+equal6_auc = roc_auc_score(y, oof_equal6)
 
-# AUC-proportional weighted ensemble (models with higher OOF AUC get more weight)
-aucs = np.array([lgb_auc, xgb_auc, cat_auc, et_auc, rf_auc])
-weights = aucs / aucs.sum()
-oof_weighted = (weights[0]*oof_lgb + weights[1]*oof_xgb + weights[2]*oof_cat +
-                weights[3]*oof_et + weights[4]*oof_rf)
-weighted_auc = roc_auc_score(y, oof_weighted)
+# Equal-weight (5 tree models only — fallback if MLP hurts)
+oof_equal5 = (oof_lgb + oof_xgb + oof_cat + oof_et + oof_rf) / 5
+equal5_auc = roc_auc_score(y, oof_equal5)
 
-# GBM-only blend (exclude tree bagging models if they hurt)
+# AUC-proportional weighted ensemble across all 6 models
+aucs6 = np.array([lgb_auc, xgb_auc, cat_auc, et_auc, rf_auc, mlp_auc])
+weights6 = aucs6 / aucs6.sum()
+oof_weighted6 = (weights6[0]*oof_lgb + weights6[1]*oof_xgb + weights6[2]*oof_cat +
+                 weights6[3]*oof_et  + weights6[4]*oof_rf  + weights6[5]*oof_mlp)
+weighted6_auc = roc_auc_score(y, oof_weighted6)
+
+# GBM-only blend (LGB + XGB + CAT) — used as baseline comparison
 oof_gbm3 = (oof_lgb + oof_xgb + oof_cat) / 3
 gbm3_auc = roc_auc_score(y, oof_gbm3)
 
-oof_auc = max(equal_auc, weighted_auc, gbm3_auc)
-best_blend = "equal" if equal_auc >= weighted_auc and equal_auc >= gbm3_auc else (
-    "weighted" if weighted_auc >= gbm3_auc else "gbm3")
-print(f"Equal-weight AUC={equal_auc:.6f} | Weighted AUC={weighted_auc:.6f} | GBM3 AUC={gbm3_auc:.6f}")
+all_blends = {
+    "equal6": equal6_auc,
+    "equal5": equal5_auc,
+    "weighted6": weighted6_auc,
+    "gbm3": gbm3_auc,
+}
+oof_auc = max(all_blends.values())
+best_blend = max(all_blends, key=all_blends.get)
+
+print(f"Equal-6 AUC={equal6_auc:.6f} | Equal-5 AUC={equal5_auc:.6f} | "
+      f"Weighted-6 AUC={weighted6_auc:.6f} | GBM3 AUC={gbm3_auc:.6f}")
 print(f"Best blend: {best_blend} | Mean fold: {np.mean(fold_aucs):.6f} ± {np.std(fold_aucs):.6f}")
 
 best_val_roc_auc = oof_auc
