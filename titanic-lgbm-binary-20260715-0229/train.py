@@ -142,6 +142,11 @@ def engineer_features(df):
         (df['Sex'] == 'male') & (df['Age'] >= 18) & (df['Pclass'] == 3)
     ).astype(int)
 
+    # 9.9. FemaleHighClass: female in 1st or 2nd class — highest survival group (~95%)
+    df['FemaleHighClass'] = (
+        (df['Sex'] == 'female') & (df['Pclass'].isin([1, 2]))
+    ).astype(int)
+
     # 10. Ticket features
     df['TicketPrefix'] = (
         df['Ticket'].str.extract(r'^([A-Za-z0-9./]+)\s', expand=False).fillna('NUMERIC')
@@ -668,6 +673,93 @@ gbm4_auc = roc_auc_score(y, oof_gbm4)
 oof_gbm3 = (oof_lgb + oof_xgb + oof_cat) / 3
 gbm3_auc = roc_auc_score(y, oof_gbm3)
 
+# ===================== Additional Blending Strategies =====================
+
+# Rank-average blend (robust to scale differences between models)
+from scipy.stats import rankdata
+
+
+def rank_norm(x):
+    return rankdata(x) / len(x)
+
+
+oof_rank8 = (rank_norm(oof_lgb) + rank_norm(oof_xgb) + rank_norm(oof_cat) +
+             rank_norm(oof_et) + rank_norm(oof_rf) + rank_norm(oof_mlp) +
+             rank_norm(oof_hgb) + rank_norm(oof_knn)) / 8
+rank8_auc = roc_auc_score(y, oof_rank8)
+
+# Rank-average (top 5 models only — exclude ET, RF, KNN if they hurt)
+oof_rank5 = (rank_norm(oof_lgb) + rank_norm(oof_xgb) + rank_norm(oof_cat) +
+             rank_norm(oof_mlp) + rank_norm(oof_hgb)) / 5
+rank5_auc = roc_auc_score(y, oof_rank5)
+
+print(f"Rank-8 AUC={rank8_auc:.6f} | Rank-5 AUC={rank5_auc:.6f}")
+
+# Optuna-optimized blend weights (direct optimization over full OOF)
+_oof_list = [oof_lgb, oof_xgb, oof_cat, oof_et, oof_rf, oof_mlp, oof_hgb, oof_knn]
+
+
+def blend_objective(trial):
+    weights = np.array([trial.suggest_float(f'w{i}', 0.0, 1.0) for i in range(8)])
+    s = weights.sum()
+    if s < 1e-10:
+        return 0.5
+    weights = weights / s
+    blend = sum(w * o for w, o in zip(weights, _oof_list))
+    return roc_auc_score(y, blend)
+
+
+print("Running blend weight optimization (500 trials)...")
+blend_study = optuna.create_study(
+    direction='maximize',
+    sampler=optuna.samplers.TPESampler(seed=42),
+)
+blend_study.optimize(blend_objective, n_trials=500, timeout=25, show_progress_bar=False)
+opt_w = np.array([blend_study.best_params.get(f'w{i}', 1.0 / 8) for i in range(8)])
+opt_w /= opt_w.sum()
+oof_optblend = sum(w * o for w, o in zip(opt_w, _oof_list))
+optblend_auc = roc_auc_score(y, oof_optblend)
+print(f"Optuna blend AUC={optblend_auc:.6f} | weights: {np.round(opt_w, 3)}")
+
+# LR meta-learner stacking on OOF predictions (cross-validated, different seed)
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import cross_val_predict
+
+meta_features = np.column_stack([oof_lgb, oof_xgb, oof_cat, oof_et, oof_rf, oof_mlp, oof_hgb, oof_knn])
+# Also build rank-transformed meta-features for a second meta-learner
+meta_features_rank = np.column_stack([rank_norm(o) for o in _oof_list])
+
+meta_skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=99)
+
+# LR with L2 regularization (C=0.1 prevents overfitting on 891 samples)
+lr_meta = LogisticRegression(C=0.1, max_iter=2000, random_state=42, solver='lbfgs')
+oof_lr_meta = cross_val_predict(lr_meta, meta_features, y, cv=meta_skf, method='predict_proba')[:, 1]
+lr_meta_auc = roc_auc_score(y, oof_lr_meta)
+
+# LR on rank-transformed meta-features (handles scale differences)
+lr_meta_rank = LogisticRegression(C=0.1, max_iter=2000, random_state=42, solver='lbfgs')
+oof_lr_meta_rank = cross_val_predict(lr_meta_rank, meta_features_rank, y, cv=meta_skf, method='predict_proba')[:, 1]
+lr_meta_rank_auc = roc_auc_score(y, oof_lr_meta_rank)
+
+print(f"LR meta-learner AUC={lr_meta_auc:.6f} | LR-rank meta AUC={lr_meta_rank_auc:.6f}")
+
+# LightGBM meta-learner (can capture non-linear interactions between models)
+meta_lgb_params = {
+    'objective': 'binary', 'metric': 'auc', 'verbosity': -1,
+    'num_leaves': 7, 'learning_rate': 0.03, 'n_estimators': 200,
+    'min_child_samples': 10, 'reg_alpha': 0.5, 'reg_lambda': 1.0,
+    'feature_fraction': 0.8, 'bagging_fraction': 0.8, 'bagging_freq': 5,
+    'random_state': 42, 'n_jobs': -1,
+}
+import lightgbm as lgb_meta_import
+oof_lgb_meta = np.zeros(len(y))
+for tr_idx, va_idx in meta_skf.split(meta_features, y):
+    m = lgb_meta_import.LGBMClassifier(**meta_lgb_params)
+    m.fit(meta_features[tr_idx], y[tr_idx])
+    oof_lgb_meta[va_idx] = m.predict_proba(meta_features[va_idx])[:, 1]
+lgb_meta_auc = roc_auc_score(y, oof_lgb_meta)
+print(f"LGB meta-learner AUC={lgb_meta_auc:.6f}")
+
 all_blends = {
     "equal8": equal8_auc,
     "equal7": equal7_auc,
@@ -677,6 +769,12 @@ all_blends = {
     "weighted7": weighted7_auc,
     "gbm4": gbm4_auc,
     "gbm3": gbm3_auc,
+    "rank8": rank8_auc,
+    "rank5": rank5_auc,
+    "optblend": optblend_auc,
+    "lr_meta": lr_meta_auc,
+    "lr_meta_rank": lr_meta_rank_auc,
+    "lgb_meta": lgb_meta_auc,
 }
 oof_auc = max(all_blends.values())
 best_blend = max(all_blends, key=all_blends.get)
