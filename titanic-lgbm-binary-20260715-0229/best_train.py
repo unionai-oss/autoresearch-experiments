@@ -13,6 +13,7 @@ from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.neural_network import MLPClassifier
 from sklearn.ensemble import HistGradientBoostingClassifier, ExtraTreesClassifier, RandomForestClassifier
 from sklearn.neighbors import KNeighborsClassifier
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.metrics import roc_auc_score
 import lightgbm as lgb
 import xgboost as xgb
@@ -570,10 +571,11 @@ rf_best_params = rf_study.best_params
 print(f"RandomForest best AUC={rf_study.best_value:.6f} ({len(rf_study.trials)} trials)")
 
 
-# ===================== Final 5-Fold CV: All 8 Models =====================
-# LGB uses 3-seed averaging to reduce model variance in OOF predictions
+# ===================== Final 5-Fold CV: All 9 Models =====================
+# LGB uses 3-seed averaging; XGB uses 2-seed averaging for variance reduction
 
 LGB_SEEDS = [42, 123, 456]
+XGB_SEEDS = [42, 123]
 
 oof_lgb = np.zeros(len(y))
 oof_xgb = np.zeros(len(y))
@@ -583,6 +585,7 @@ oof_rf = np.zeros(len(y))
 oof_mlp = np.zeros(len(y))
 oof_hgb = np.zeros(len(y))
 oof_knn = np.zeros(len(y))
+oof_lda = np.zeros(len(y))
 fold_aucs = []
 
 for fold, (tr_idx, va_idx) in enumerate(skf.split(X_eng, y)):
@@ -604,11 +607,16 @@ for fold, (tr_idx, va_idx) in enumerate(skf.split(X_eng, y)):
         lgb_fold_pred += lgb_model.predict(X_va_l) / len(LGB_SEEDS)
     oof_lgb[va_idx] = lgb_fold_pred
 
-    # --- XGBoost ---
+    # --- XGBoost (2-seed averaging for variance reduction) ---
     X_tr_x, X_va_x, _ = preprocess_encoded(X_eng.iloc[tr_idx], X_eng.iloc[va_idx])
-    xgb_model = xgb.XGBClassifier(**xgb_best)
-    xgb_model.fit(X_tr_x, y_tr, eval_set=[(X_va_x, y_va)], verbose=False)
-    oof_xgb[va_idx] = xgb_model.predict_proba(X_va_x)[:, 1]
+    xgb_fold_pred = np.zeros(len(va_idx))
+    for _xseed in XGB_SEEDS:
+        _xp = xgb_best.copy()
+        _xp['seed'] = _xseed
+        xgb_model = xgb.XGBClassifier(**_xp)
+        xgb_model.fit(X_tr_x, y_tr, eval_set=[(X_va_x, y_va)], verbose=False)
+        xgb_fold_pred += xgb_model.predict_proba(X_va_x)[:, 1] / len(XGB_SEEDS)
+    oof_xgb[va_idx] = xgb_fold_pred
 
     # --- CatBoost (Optuna-tuned, handles categoricals natively) ---
     X_tr_c, X_va_c, cat_cols_c = preprocess_catboost(X_eng.iloc[tr_idx], X_eng.iloc[va_idx])
@@ -664,10 +672,16 @@ for fold, (tr_idx, va_idx) in enumerate(skf.split(X_eng, y)):
     knn_model.fit(X_tr_ks, y_tr)
     oof_knn[va_idx] = knn_model.predict_proba(X_va_ks)[:, 1]
 
-    # Fold-level ensemble stats (8 models)
+    # --- LDA (Linear Discriminant Analysis — Gaussian assumption, very different from trees) ---
+    X_tr_ld, X_va_ld, _ = preprocess_encoded(X_eng.iloc[tr_idx], X_eng.iloc[va_idx])
+    lda_model = LinearDiscriminantAnalysis()
+    lda_model.fit(X_tr_ld, y_tr)
+    oof_lda[va_idx] = lda_model.predict_proba(X_va_ld)[:, 1]
+
+    # Fold-level ensemble stats (9 models)
     fold_ens = (oof_lgb[va_idx] + oof_xgb[va_idx] + oof_cat[va_idx] +
                 oof_et[va_idx] + oof_rf[va_idx] + oof_mlp[va_idx] +
-                oof_hgb[va_idx] + oof_knn[va_idx]) / 8
+                oof_hgb[va_idx] + oof_knn[va_idx] + oof_lda[va_idx]) / 9
     fold_auc = roc_auc_score(y_va, fold_ens)
     fold_aucs.append(fold_auc)
     lgb_f = roc_auc_score(y_va, oof_lgb[va_idx])
@@ -678,9 +692,10 @@ for fold, (tr_idx, va_idx) in enumerate(skf.split(X_eng, y)):
     mlp_f = roc_auc_score(y_va, oof_mlp[va_idx])
     hgb_f = roc_auc_score(y_va, oof_hgb[va_idx])
     knn_f = roc_auc_score(y_va, oof_knn[va_idx])
+    lda_f = roc_auc_score(y_va, oof_lda[va_idx])
     print(f"Fold {fold+1}: LGB={lgb_f:.4f} XGB={xgb_f:.4f} CAT={cat_f:.4f} "
           f"ET={et_f:.4f} RF={rf_f:.4f} MLP={mlp_f:.4f} HGB={hgb_f:.4f} "
-          f"KNN={knn_f:.4f} ENS={fold_auc:.4f}")
+          f"KNN={knn_f:.4f} LDA={lda_f:.4f} ENS={fold_auc:.4f}")
 
 lgb_auc = roc_auc_score(y, oof_lgb)
 xgb_auc = roc_auc_score(y, oof_xgb)
@@ -690,18 +705,24 @@ rf_auc  = roc_auc_score(y, oof_rf)
 mlp_auc = roc_auc_score(y, oof_mlp)
 hgb_auc = roc_auc_score(y, oof_hgb)
 knn_auc = roc_auc_score(y, oof_knn)
+lda_auc = roc_auc_score(y, oof_lda)
 print(f"Individual OOF: LGB={lgb_auc:.6f} XGB={xgb_auc:.6f} CAT={cat_auc:.6f} "
-      f"ET={et_auc:.6f} RF={rf_auc:.6f} MLP={mlp_auc:.6f} HGB={hgb_auc:.6f} KNN={knn_auc:.6f}")
+      f"ET={et_auc:.6f} RF={rf_auc:.6f} MLP={mlp_auc:.6f} HGB={hgb_auc:.6f} "
+      f"KNN={knn_auc:.6f} LDA={lda_auc:.6f}")
 
-# Equal-weight ensemble (all 8 models)
+# Equal-weight ensemble (all 9 models)
+oof_equal9 = (oof_lgb + oof_xgb + oof_cat + oof_et + oof_rf + oof_mlp + oof_hgb + oof_knn + oof_lda) / 9
+equal9_auc = roc_auc_score(y, oof_equal9)
+
+# Equal-weight ensemble (8 models, exclude LDA — fallback if LDA hurts)
 oof_equal8 = (oof_lgb + oof_xgb + oof_cat + oof_et + oof_rf + oof_mlp + oof_hgb + oof_knn) / 8
 equal8_auc = roc_auc_score(y, oof_equal8)
 
-# Equal-weight ensemble (7 models, exclude KNN — fallback if KNN hurts)
+# Equal-weight ensemble (7 models, exclude KNN & LDA)
 oof_equal7 = (oof_lgb + oof_xgb + oof_cat + oof_et + oof_rf + oof_mlp + oof_hgb) / 7
 equal7_auc = roc_auc_score(y, oof_equal7)
 
-# Equal-weight (6 models, exclude HGBC & KNN)
+# Equal-weight (6 models, exclude HGBC, KNN, LDA)
 oof_equal6 = (oof_lgb + oof_xgb + oof_cat + oof_et + oof_rf + oof_mlp) / 6
 equal6_auc = roc_auc_score(y, oof_equal6)
 
@@ -709,7 +730,15 @@ equal6_auc = roc_auc_score(y, oof_equal6)
 oof_equal5 = (oof_lgb + oof_xgb + oof_cat + oof_et + oof_rf) / 5
 equal5_auc = roc_auc_score(y, oof_equal5)
 
-# AUC-proportional weighted ensemble across all 8 models
+# AUC-proportional weighted ensemble across all 9 models
+aucs9 = np.array([lgb_auc, xgb_auc, cat_auc, et_auc, rf_auc, mlp_auc, hgb_auc, knn_auc, lda_auc])
+weights9 = aucs9 / aucs9.sum()
+oof_weighted9 = (weights9[0]*oof_lgb + weights9[1]*oof_xgb + weights9[2]*oof_cat +
+                 weights9[3]*oof_et  + weights9[4]*oof_rf  + weights9[5]*oof_mlp +
+                 weights9[6]*oof_hgb + weights9[7]*oof_knn + weights9[8]*oof_lda)
+weighted9_auc = roc_auc_score(y, oof_weighted9)
+
+# AUC-weighted (8 models, no LDA)
 aucs8 = np.array([lgb_auc, xgb_auc, cat_auc, et_auc, rf_auc, mlp_auc, hgb_auc, knn_auc])
 weights8 = aucs8 / aucs8.sum()
 oof_weighted8 = (weights8[0]*oof_lgb + weights8[1]*oof_xgb + weights8[2]*oof_cat +
@@ -717,7 +746,7 @@ oof_weighted8 = (weights8[0]*oof_lgb + weights8[1]*oof_xgb + weights8[2]*oof_cat
                  weights8[6]*oof_hgb + weights8[7]*oof_knn)
 weighted8_auc = roc_auc_score(y, oof_weighted8)
 
-# AUC-weighted (7 models, no KNN)
+# AUC-weighted (7 models, no KNN & LDA)
 aucs7 = np.array([lgb_auc, xgb_auc, cat_auc, et_auc, rf_auc, mlp_auc, hgb_auc])
 weights7 = aucs7 / aucs7.sum()
 oof_weighted7 = (weights7[0]*oof_lgb + weights7[1]*oof_xgb + weights7[2]*oof_cat +
@@ -743,24 +772,30 @@ def rank_norm(x):
     return rankdata(x) / len(x)
 
 
+oof_rank9 = (rank_norm(oof_lgb) + rank_norm(oof_xgb) + rank_norm(oof_cat) +
+             rank_norm(oof_et) + rank_norm(oof_rf) + rank_norm(oof_mlp) +
+             rank_norm(oof_hgb) + rank_norm(oof_knn) + rank_norm(oof_lda)) / 9
+rank9_auc = roc_auc_score(y, oof_rank9)
+
 oof_rank8 = (rank_norm(oof_lgb) + rank_norm(oof_xgb) + rank_norm(oof_cat) +
              rank_norm(oof_et) + rank_norm(oof_rf) + rank_norm(oof_mlp) +
              rank_norm(oof_hgb) + rank_norm(oof_knn)) / 8
 rank8_auc = roc_auc_score(y, oof_rank8)
 
-# Rank-average (top 5 models only — exclude ET, RF, KNN if they hurt)
+# Rank-average (top 5 models only — exclude ET, RF, KNN, LDA if they hurt)
 oof_rank5 = (rank_norm(oof_lgb) + rank_norm(oof_xgb) + rank_norm(oof_cat) +
              rank_norm(oof_mlp) + rank_norm(oof_hgb)) / 5
 rank5_auc = roc_auc_score(y, oof_rank5)
 
-print(f"Rank-8 AUC={rank8_auc:.6f} | Rank-5 AUC={rank5_auc:.6f}")
+print(f"Rank-9 AUC={rank9_auc:.6f} | Rank-8 AUC={rank8_auc:.6f} | Rank-5 AUC={rank5_auc:.6f}")
 
-# Optuna-optimized blend weights (direct optimization over full OOF)
-_oof_list = [oof_lgb, oof_xgb, oof_cat, oof_et, oof_rf, oof_mlp, oof_hgb, oof_knn]
+# Optuna-optimized blend weights using CMA-ES (superior to TPE for continuous optimization)
+_oof_list = [oof_lgb, oof_xgb, oof_cat, oof_et, oof_rf, oof_mlp, oof_hgb, oof_knn, oof_lda]
+_n_models = len(_oof_list)
 
 
 def blend_objective(trial):
-    weights = np.array([trial.suggest_float(f'w{i}', 0.0, 1.0) for i in range(8)])
+    weights = np.array([trial.suggest_float(f'w{i}', 0.0, 1.0) for i in range(_n_models)])
     s = weights.sum()
     if s < 1e-10:
         return 0.5
@@ -769,23 +804,23 @@ def blend_objective(trial):
     return roc_auc_score(y, blend)
 
 
-print("Running blend weight optimization (500 trials)...")
+print("Running blend weight optimization with CMA-ES (1000 trials)...")
 blend_study = optuna.create_study(
     direction='maximize',
-    sampler=optuna.samplers.TPESampler(seed=42),
+    sampler=optuna.samplers.CmaEsSampler(seed=42),
 )
-blend_study.optimize(blend_objective, n_trials=500, timeout=25, show_progress_bar=False)
-opt_w = np.array([blend_study.best_params.get(f'w{i}', 1.0 / 8) for i in range(8)])
+blend_study.optimize(blend_objective, n_trials=1000, timeout=45, show_progress_bar=False)
+opt_w = np.array([blend_study.best_params.get(f'w{i}', 1.0 / _n_models) for i in range(_n_models)])
 opt_w /= opt_w.sum()
 oof_optblend = sum(w * o for w, o in zip(opt_w, _oof_list))
 optblend_auc = roc_auc_score(y, oof_optblend)
-print(f"Optuna blend AUC={optblend_auc:.6f} | weights: {np.round(opt_w, 3)}")
+print(f"CMA-ES blend AUC={optblend_auc:.6f} | weights: {np.round(opt_w, 3)}")
 
 # LR meta-learner stacking on OOF predictions (cross-validated, different seed)
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import cross_val_predict
 
-meta_features = np.column_stack([oof_lgb, oof_xgb, oof_cat, oof_et, oof_rf, oof_mlp, oof_hgb, oof_knn])
+meta_features = np.column_stack([oof_lgb, oof_xgb, oof_cat, oof_et, oof_rf, oof_mlp, oof_hgb, oof_knn, oof_lda])
 # Also build rank-transformed meta-features for a second meta-learner
 meta_features_rank = np.column_stack([rank_norm(o) for o in _oof_list])
 
@@ -821,14 +856,17 @@ lgb_meta_auc = roc_auc_score(y, oof_lgb_meta)
 print(f"LGB meta-learner AUC={lgb_meta_auc:.6f}")
 
 all_blends = {
+    "equal9": equal9_auc,
     "equal8": equal8_auc,
     "equal7": equal7_auc,
     "equal6": equal6_auc,
     "equal5": equal5_auc,
+    "weighted9": weighted9_auc,
     "weighted8": weighted8_auc,
     "weighted7": weighted7_auc,
     "gbm4": gbm4_auc,
     "gbm3": gbm3_auc,
+    "rank9": rank9_auc,
     "rank8": rank8_auc,
     "rank5": rank5_auc,
     "optblend": optblend_auc,
@@ -839,8 +877,8 @@ all_blends = {
 oof_auc = max(all_blends.values())
 best_blend = max(all_blends, key=all_blends.get)
 
-print(f"Equal-8 AUC={equal8_auc:.6f} | Equal-7 AUC={equal7_auc:.6f} | Equal-6 AUC={equal6_auc:.6f}")
-print(f"Weighted-8 AUC={weighted8_auc:.6f} | Weighted-7 AUC={weighted7_auc:.6f}")
+print(f"Equal-9 AUC={equal9_auc:.6f} | Equal-8 AUC={equal8_auc:.6f} | Equal-7 AUC={equal7_auc:.6f}")
+print(f"Weighted-9 AUC={weighted9_auc:.6f} | Weighted-8 AUC={weighted8_auc:.6f}")
 print(f"GBM4 AUC={gbm4_auc:.6f} | GBM3 AUC={gbm3_auc:.6f}")
 print(f"Best blend: {best_blend} | Mean fold: {np.mean(fold_aucs):.6f} +/- {np.std(fold_aucs):.6f}")
 
