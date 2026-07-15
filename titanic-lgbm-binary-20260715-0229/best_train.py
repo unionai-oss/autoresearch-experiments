@@ -11,7 +11,7 @@ import numpy as np
 from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.neural_network import MLPClassifier
-from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.ensemble import HistGradientBoostingClassifier, ExtraTreesClassifier, RandomForestClassifier
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.metrics import roc_auc_score
 import lightgbm as lgb
@@ -99,7 +99,6 @@ def engineer_features(df):
     df['DeckOrd'] = df['Deck'].map(deck_ord).fillna(0).astype(int)
 
     # 7.5. Cabin side: even=port, odd=starboard (lifeboats had asymmetric deployment)
-    # Extract first cabin number; -1 if no cabin data
     _placeholder = CABIN_NAN_PLACEHOLDER
 
     def _get_cabin_num(c):
@@ -131,7 +130,7 @@ def engineer_features(df):
     # 9.6. Pclass + IsAlone (lone first-class vs lone third-class differ significantly)
     df['Pclass_IsAlone'] = df['Pclass'].astype(str) + '_' + df['IsAlone'].astype(str)
 
-    # 9.7. IsMother: female, adult (≥18), traveling with child (Parch > 0), Mrs title
+    # 9.7. IsMother: female, adult (>=18), traveling with child (Parch > 0), Mrs title
     df['IsMother'] = (
         (df['Sex'] == 'female') & (df['Age'] >= 18) &
         (df['Parch'] > 0) & (df['Title'] == 'Mrs')
@@ -171,6 +170,15 @@ def engineer_features(df):
     # 12. Embarked interaction
     df['Embarked'] = df['Embarked'].fillna('S')
     df['Embarked_Pclass'] = df['Embarked'] + '_' + df['Pclass'].astype(str)
+
+    # 13. Title x IsAlone interaction (e.g., lone Mr vs Mr with family have different survival)
+    df['Title_IsAlone'] = df['Title'] + '_' + df['IsAlone'].astype(str)
+
+    # 14. Female x HasCabin (female passengers with known cabin had higher survival rates)
+    df['Female_x_Cabin'] = ((df['Sex'] == 'female') & (df['HasRealCabin'] == 1)).astype(int)
+
+    # 15. Child x Pclass (children in different classes had different survival rates)
+    df['Child_x_Pclass'] = df['IsChild'].astype(str) + '_' + df['Pclass'].astype(str)
 
     # 13. Drop raw text columns
     df = df.drop(columns=['PassengerId', 'Name', 'Ticket', 'Cabin', 'Surname'])
@@ -338,9 +346,6 @@ print(f"XGBoost best AUC={xgb_study.best_value:.6f} ({len(xgb_study.trials)} tri
 
 # ===================== Optuna for CatBoost =====================
 
-from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier
-
-
 def cat_objective(trial):
     params = dict(
         iterations=1500,
@@ -432,8 +437,6 @@ print(f"MLP best AUC={mlp_study.best_value:.6f} ({len(mlp_study.trials)} trials)
 
 
 # ===================== Optuna for HistGradientBoosting =====================
-# HGBC: sklearn's native fast GBM; different from LGB/XGB (histogram-based,
-# native missing-value handling, different regularization path) — adds model diversity
 
 def hgb_objective(trial):
     params = dict(
@@ -504,7 +507,73 @@ knn_best_params = knn_study.best_params
 print(f"KNN best AUC={knn_study.best_value:.6f} ({len(knn_study.trials)} trials)")
 
 
+# ===================== Optuna for ExtraTrees =====================
+# ET currently uses fixed params — tuning it removes the last untuned component
+
+def et_objective(trial):
+    params = dict(
+        n_estimators=trial.suggest_int('n_estimators', 200, 1000),
+        max_features=trial.suggest_categorical('max_features', ['sqrt', 'log2', 0.5, 0.7]),
+        min_samples_leaf=trial.suggest_int('min_samples_leaf', 1, 15),
+        min_samples_split=trial.suggest_int('min_samples_split', 2, 15),
+        max_depth=trial.suggest_categorical('max_depth', [None, 10, 15, 20, 25]),
+        random_state=42,
+        n_jobs=-1,
+    )
+    oof_preds = np.zeros(len(y))
+    for tr_idx, va_idx in skf.split(X_eng, y):
+        X_tr_e, X_va_e, _ = preprocess_encoded(X_eng.iloc[tr_idx], X_eng.iloc[va_idx])
+        model = ExtraTreesClassifier(**params)
+        model.fit(X_tr_e, y[tr_idx])
+        oof_preds[va_idx] = model.predict_proba(X_va_e)[:, 1]
+    return roc_auc_score(y, oof_preds)
+
+
+print("Running ExtraTrees Optuna (40 trials)...")
+et_study = optuna.create_study(
+    direction="maximize",
+    sampler=optuna.samplers.TPESampler(seed=42),
+)
+et_study.optimize(et_objective, n_trials=40, timeout=70, show_progress_bar=False)
+et_best_params = et_study.best_params
+print(f"ExtraTrees best AUC={et_study.best_value:.6f} ({len(et_study.trials)} trials)")
+
+
+# ===================== Optuna for RandomForest =====================
+
+def rf_objective(trial):
+    params = dict(
+        n_estimators=trial.suggest_int('n_estimators', 200, 1000),
+        max_features=trial.suggest_categorical('max_features', ['sqrt', 'log2', 0.5, 0.7]),
+        min_samples_leaf=trial.suggest_int('min_samples_leaf', 1, 10),
+        min_samples_split=trial.suggest_int('min_samples_split', 2, 10),
+        max_depth=trial.suggest_categorical('max_depth', [None, 10, 15, 20, 25]),
+        random_state=42,
+        n_jobs=-1,
+    )
+    oof_preds = np.zeros(len(y))
+    for tr_idx, va_idx in skf.split(X_eng, y):
+        X_tr_r, X_va_r, _ = preprocess_encoded(X_eng.iloc[tr_idx], X_eng.iloc[va_idx])
+        model = RandomForestClassifier(**params)
+        model.fit(X_tr_r, y[tr_idx])
+        oof_preds[va_idx] = model.predict_proba(X_va_r)[:, 1]
+    return roc_auc_score(y, oof_preds)
+
+
+print("Running RandomForest Optuna (40 trials)...")
+rf_study = optuna.create_study(
+    direction="maximize",
+    sampler=optuna.samplers.TPESampler(seed=42),
+)
+rf_study.optimize(rf_objective, n_trials=40, timeout=70, show_progress_bar=False)
+rf_best_params = rf_study.best_params
+print(f"RandomForest best AUC={rf_study.best_value:.6f} ({len(rf_study.trials)} trials)")
+
+
 # ===================== Final 5-Fold CV: All 8 Models =====================
+# LGB uses 3-seed averaging to reduce model variance in OOF predictions
+
+LGB_SEEDS = [42, 123, 456]
 
 oof_lgb = np.zeros(len(y))
 oof_xgb = np.zeros(len(y))
@@ -519,16 +588,21 @@ fold_aucs = []
 for fold, (tr_idx, va_idx) in enumerate(skf.split(X_eng, y)):
     y_tr, y_va = y[tr_idx], y[va_idx]
 
-    # --- LightGBM ---
+    # --- LightGBM (multi-seed averaging for variance reduction) ---
     X_tr_l, X_va_l, cat_cols_l = preprocess_encoded(X_eng.iloc[tr_idx], X_eng.iloc[va_idx])
-    ds_tr = lgb.Dataset(X_tr_l, label=y_tr, categorical_feature=cat_cols_l)
-    ds_va = lgb.Dataset(X_va_l, label=y_va, reference=ds_tr)
-    lgb_model = lgb.train(
-        lgb_best, ds_tr, num_boost_round=3000,
-        valid_sets=[ds_va],
-        callbacks=[lgb.early_stopping(100, verbose=False), lgb.log_evaluation(0)],
-    )
-    oof_lgb[va_idx] = lgb_model.predict(X_va_l)
+    lgb_fold_pred = np.zeros(len(va_idx))
+    for seed in LGB_SEEDS:
+        params_seed = lgb_best.copy()
+        params_seed['random_state'] = seed
+        ds_tr = lgb.Dataset(X_tr_l, label=y_tr, categorical_feature=cat_cols_l)
+        ds_va = lgb.Dataset(X_va_l, label=y_va, reference=ds_tr)
+        lgb_model = lgb.train(
+            params_seed, ds_tr, num_boost_round=3000,
+            valid_sets=[ds_va],
+            callbacks=[lgb.early_stopping(100, verbose=False), lgb.log_evaluation(0)],
+        )
+        lgb_fold_pred += lgb_model.predict(X_va_l) / len(LGB_SEEDS)
+    oof_lgb[va_idx] = lgb_fold_pred
 
     # --- XGBoost ---
     X_tr_x, X_va_x, _ = preprocess_encoded(X_eng.iloc[tr_idx], X_eng.iloc[va_idx])
@@ -542,29 +616,15 @@ for fold, (tr_idx, va_idx) in enumerate(skf.split(X_eng, y)):
     cat_model.fit(X_tr_c, y_tr, cat_features=cat_cols_c, eval_set=(X_va_c, y_va))
     oof_cat[va_idx] = cat_model.predict_proba(X_va_c)[:, 1]
 
-    # --- ExtraTrees (high variance, strong diversity vs GBMs) ---
+    # --- ExtraTrees (Optuna-tuned) ---
     X_tr_e, X_va_e, _ = preprocess_encoded(X_eng.iloc[tr_idx], X_eng.iloc[va_idx])
-    et_model = ExtraTreesClassifier(
-        n_estimators=800,
-        max_depth=None,
-        min_samples_leaf=1,
-        max_features='sqrt',
-        random_state=42,
-        n_jobs=-1,
-    )
+    et_model = ExtraTreesClassifier(**et_best_params, random_state=42, n_jobs=-1)
     et_model.fit(X_tr_e, y_tr)
     oof_et[va_idx] = et_model.predict_proba(X_va_e)[:, 1]
 
-    # --- RandomForest (bagging complement to boosting) ---
+    # --- RandomForest (Optuna-tuned) ---
     X_tr_r, X_va_r, _ = preprocess_encoded(X_eng.iloc[tr_idx], X_eng.iloc[va_idx])
-    rf_model = RandomForestClassifier(
-        n_estimators=800,
-        max_depth=None,
-        min_samples_leaf=2,
-        max_features='sqrt',
-        random_state=42,
-        n_jobs=-1,
-    )
+    rf_model = RandomForestClassifier(**rf_best_params, random_state=42, n_jobs=-1)
     rf_model.fit(X_tr_r, y_tr)
     oof_rf[va_idx] = rf_model.predict_proba(X_va_r)[:, 1]
 
@@ -782,7 +842,7 @@ best_blend = max(all_blends, key=all_blends.get)
 print(f"Equal-8 AUC={equal8_auc:.6f} | Equal-7 AUC={equal7_auc:.6f} | Equal-6 AUC={equal6_auc:.6f}")
 print(f"Weighted-8 AUC={weighted8_auc:.6f} | Weighted-7 AUC={weighted7_auc:.6f}")
 print(f"GBM4 AUC={gbm4_auc:.6f} | GBM3 AUC={gbm3_auc:.6f}")
-print(f"Best blend: {best_blend} | Mean fold: {np.mean(fold_aucs):.6f} ± {np.std(fold_aucs):.6f}")
+print(f"Best blend: {best_blend} | Mean fold: {np.mean(fold_aucs):.6f} +/- {np.std(fold_aucs):.6f}")
 
 best_val_roc_auc = oof_auc
 print(f"BEST_VAL_ROC_AUC: {best_val_roc_auc:.6f}")
