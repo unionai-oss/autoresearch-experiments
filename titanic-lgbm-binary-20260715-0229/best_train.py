@@ -10,6 +10,7 @@ import numpy as np
 from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.neural_network import MLPClassifier
+from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.metrics import roc_auc_score
 import lightgbm as lgb
 import xgboost as xgb
@@ -92,6 +93,7 @@ def engineer_features(df):
 
     # 8. Age features (age is now fully imputed)
     df['IsChild'] = (df['Age'] < 12).astype(int)
+    df['IsInfant'] = (df['Age'] < 5).astype(int)  # infants had ~75% survival rate
     df['IsYouth'] = ((df['Age'] >= 12) & (df['Age'] < 18)).astype(int)
     df['IsSenior'] = (df['Age'] > 60).astype(int)
     df['AgeSq'] = df['Age'] ** 2
@@ -101,11 +103,35 @@ def engineer_features(df):
     df['WomenChild'] = ((df['Sex'] == 'female') | (df['Age'] < 15)).astype(int)
     df['WomenChildPclass'] = df['WomenChild'].astype(str) + '_' + df['Pclass'].astype(str)
 
+    # 9.5. Three-way interaction: AgeGroup × Sex × Pclass
+    age_cat = pd.cut(df['Age'], bins=[0, 5, 12, 18, 35, 60, 100],
+                     labels=['infant', 'child', 'teen', 'young', 'adult', 'senior'])
+    df['AgeSexPclass'] = age_cat.astype(str) + '_' + df['Sex'] + '_' + df['Pclass'].astype(str)
+
+    # 9.6. Pclass + IsAlone (lone first-class vs lone third-class differ significantly)
+    df['Pclass_IsAlone'] = df['Pclass'].astype(str) + '_' + df['IsAlone'].astype(str)
+
+    # 9.7. IsMother: female, adult (≥18), traveling with child (Parch > 0), Mrs title
+    df['IsMother'] = (
+        (df['Sex'] == 'female') & (df['Age'] >= 18) &
+        (df['Parch'] > 0) & (df['Title'] == 'Mrs')
+    ).astype(int)
+
+    # 9.8. MaleAdult3rd: male, adult, 3rd class — captures lowest-survival group
+    df['MaleAdult3rd'] = (
+        (df['Sex'] == 'male') & (df['Age'] >= 18) & (df['Pclass'] == 3)
+    ).astype(int)
+
     # 10. Ticket features
     df['TicketPrefix'] = (
         df['Ticket'].str.extract(r'^([A-Za-z0-9./]+)\s', expand=False).fillna('NUMERIC')
     )
     df['TicketFreq'] = df.groupby('Ticket')['Ticket'].transform('count')
+    # Numeric part of ticket (lower numbers → forward decks, closer to boats)
+    df['TicketNumeric'] = pd.to_numeric(
+        df['Ticket'].str.extract(r'(\d+)$', expand=False), errors='coerce'
+    ).fillna(-1)
+    df['LogTicketNumeric'] = np.log1p(df['TicketNumeric'].clip(lower=0))
 
     # 11. Key interactions
     df['Pclass_Sex'] = df['Pclass'].astype(str) + '_' + df['Sex']
@@ -380,7 +406,51 @@ mlp_best_params = mlp_study.best_params
 print(f"MLP best AUC={mlp_study.best_value:.6f} ({len(mlp_study.trials)} trials)")
 
 
-# ===================== Final 5-Fold CV: All 6 Models =====================
+# ===================== Optuna for HistGradientBoosting =====================
+# HGBC: sklearn's native fast GBM; different from LGB/XGB (histogram-based,
+# native missing-value handling, different regularization path) — adds model diversity
+
+def hgb_objective(trial):
+    params = dict(
+        learning_rate=trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
+        max_iter=1000,
+        max_leaf_nodes=trial.suggest_int('max_leaf_nodes', 15, 63),
+        max_depth=trial.suggest_int('max_depth', 3, 10),
+        min_samples_leaf=trial.suggest_int('min_samples_leaf', 5, 60),
+        l2_regularization=trial.suggest_float('l2_regularization', 1e-6, 10.0, log=True),
+        max_bins=trial.suggest_int('max_bins', 64, 255),
+        random_state=42,
+        early_stopping=True,
+        n_iter_no_change=30,
+        validation_fraction=0.1,
+    )
+    oof_preds = np.zeros(len(y))
+    for tr_idx, va_idx in skf.split(X_eng, y):
+        X_tr_h, X_va_h, _ = preprocess_encoded(X_eng.iloc[tr_idx], X_eng.iloc[va_idx])
+        model = HistGradientBoostingClassifier(**params)
+        model.fit(X_tr_h, y[tr_idx])
+        oof_preds[va_idx] = model.predict_proba(X_va_h)[:, 1]
+    return roc_auc_score(y, oof_preds)
+
+
+print("Running HistGradientBoosting Optuna (40 trials)...")
+hgb_study = optuna.create_study(
+    direction="maximize",
+    sampler=optuna.samplers.TPESampler(seed=42),
+)
+hgb_study.optimize(hgb_objective, n_trials=40, timeout=80, show_progress_bar=False)
+hgb_best_params = hgb_study.best_params
+hgb_best_params.update({
+    "max_iter": 1000,
+    "random_state": 42,
+    "early_stopping": True,
+    "n_iter_no_change": 30,
+    "validation_fraction": 0.1,
+})
+print(f"HGBC best AUC={hgb_study.best_value:.6f} ({len(hgb_study.trials)} trials)")
+
+
+# ===================== Final 5-Fold CV: All 7 Models =====================
 
 oof_lgb = np.zeros(len(y))
 oof_xgb = np.zeros(len(y))
@@ -388,6 +458,7 @@ oof_cat = np.zeros(len(y))
 oof_et = np.zeros(len(y))
 oof_rf = np.zeros(len(y))
 oof_mlp = np.zeros(len(y))
+oof_hgb = np.zeros(len(y))
 fold_aucs = []
 
 for fold, (tr_idx, va_idx) in enumerate(skf.split(X_eng, y)):
@@ -463,9 +534,15 @@ for fold, (tr_idx, va_idx) in enumerate(skf.split(X_eng, y)):
     mlp_model.fit(X_tr_ms, y_tr)
     oof_mlp[va_idx] = mlp_model.predict_proba(X_va_ms)[:, 1]
 
+    # --- HistGradientBoosting (sklearn native GBM — different regularization from LGB/XGB) ---
+    X_tr_h, X_va_h, _ = preprocess_encoded(X_eng.iloc[tr_idx], X_eng.iloc[va_idx])
+    hgb_model = HistGradientBoostingClassifier(**hgb_best_params)
+    hgb_model.fit(X_tr_h, y_tr)
+    oof_hgb[va_idx] = hgb_model.predict_proba(X_va_h)[:, 1]
+
     # Fold-level ensemble stats
     fold_ens = (oof_lgb[va_idx] + oof_xgb[va_idx] + oof_cat[va_idx] +
-                oof_et[va_idx] + oof_rf[va_idx] + oof_mlp[va_idx]) / 6
+                oof_et[va_idx] + oof_rf[va_idx] + oof_mlp[va_idx] + oof_hgb[va_idx]) / 7
     fold_auc = roc_auc_score(y_va, fold_ens)
     fold_aucs.append(fold_auc)
     lgb_f = roc_auc_score(y_va, oof_lgb[va_idx])
@@ -474,8 +551,9 @@ for fold, (tr_idx, va_idx) in enumerate(skf.split(X_eng, y)):
     et_f  = roc_auc_score(y_va, oof_et[va_idx])
     rf_f  = roc_auc_score(y_va, oof_rf[va_idx])
     mlp_f = roc_auc_score(y_va, oof_mlp[va_idx])
+    hgb_f = roc_auc_score(y_va, oof_hgb[va_idx])
     print(f"Fold {fold+1}: LGB={lgb_f:.4f} XGB={xgb_f:.4f} CAT={cat_f:.4f} "
-          f"ET={et_f:.4f} RF={rf_f:.4f} MLP={mlp_f:.4f} ENS={fold_auc:.4f}")
+          f"ET={et_f:.4f} RF={rf_f:.4f} MLP={mlp_f:.4f} HGB={hgb_f:.4f} ENS={fold_auc:.4f}")
 
 lgb_auc = roc_auc_score(y, oof_lgb)
 xgb_auc = roc_auc_score(y, oof_xgb)
@@ -483,39 +561,51 @@ cat_auc = roc_auc_score(y, oof_cat)
 et_auc  = roc_auc_score(y, oof_et)
 rf_auc  = roc_auc_score(y, oof_rf)
 mlp_auc = roc_auc_score(y, oof_mlp)
+hgb_auc = roc_auc_score(y, oof_hgb)
 print(f"Individual OOF: LGB={lgb_auc:.6f} XGB={xgb_auc:.6f} CAT={cat_auc:.6f} "
-      f"ET={et_auc:.6f} RF={rf_auc:.6f} MLP={mlp_auc:.6f}")
+      f"ET={et_auc:.6f} RF={rf_auc:.6f} MLP={mlp_auc:.6f} HGB={hgb_auc:.6f}")
 
-# Equal-weight ensemble (all 6 models)
+# Equal-weight ensemble (all 7 models)
+oof_equal7 = (oof_lgb + oof_xgb + oof_cat + oof_et + oof_rf + oof_mlp + oof_hgb) / 7
+equal7_auc = roc_auc_score(y, oof_equal7)
+
+# Equal-weight (6 models, exclude HGBC — fallback if HGBC hurts)
 oof_equal6 = (oof_lgb + oof_xgb + oof_cat + oof_et + oof_rf + oof_mlp) / 6
 equal6_auc = roc_auc_score(y, oof_equal6)
 
-# Equal-weight (5 tree models only — fallback if MLP hurts)
+# Equal-weight (5 tree models only — fallback if neural nets hurt)
 oof_equal5 = (oof_lgb + oof_xgb + oof_cat + oof_et + oof_rf) / 5
 equal5_auc = roc_auc_score(y, oof_equal5)
 
-# AUC-proportional weighted ensemble across all 6 models
-aucs6 = np.array([lgb_auc, xgb_auc, cat_auc, et_auc, rf_auc, mlp_auc])
-weights6 = aucs6 / aucs6.sum()
-oof_weighted6 = (weights6[0]*oof_lgb + weights6[1]*oof_xgb + weights6[2]*oof_cat +
-                 weights6[3]*oof_et  + weights6[4]*oof_rf  + weights6[5]*oof_mlp)
-weighted6_auc = roc_auc_score(y, oof_weighted6)
+# AUC-proportional weighted ensemble across all 7 models
+aucs7 = np.array([lgb_auc, xgb_auc, cat_auc, et_auc, rf_auc, mlp_auc, hgb_auc])
+weights7 = aucs7 / aucs7.sum()
+oof_weighted7 = (weights7[0]*oof_lgb + weights7[1]*oof_xgb + weights7[2]*oof_cat +
+                 weights7[3]*oof_et  + weights7[4]*oof_rf  + weights7[5]*oof_mlp +
+                 weights7[6]*oof_hgb)
+weighted7_auc = roc_auc_score(y, oof_weighted7)
+
+# GBM-only blend (LGB + XGB + CAT + HGB) — four complementary GBMs
+oof_gbm4 = (oof_lgb + oof_xgb + oof_cat + oof_hgb) / 4
+gbm4_auc = roc_auc_score(y, oof_gbm4)
 
 # GBM-only blend (LGB + XGB + CAT) — used as baseline comparison
 oof_gbm3 = (oof_lgb + oof_xgb + oof_cat) / 3
 gbm3_auc = roc_auc_score(y, oof_gbm3)
 
 all_blends = {
+    "equal7": equal7_auc,
     "equal6": equal6_auc,
     "equal5": equal5_auc,
-    "weighted6": weighted6_auc,
+    "weighted7": weighted7_auc,
+    "gbm4": gbm4_auc,
     "gbm3": gbm3_auc,
 }
 oof_auc = max(all_blends.values())
 best_blend = max(all_blends, key=all_blends.get)
 
-print(f"Equal-6 AUC={equal6_auc:.6f} | Equal-5 AUC={equal5_auc:.6f} | "
-      f"Weighted-6 AUC={weighted6_auc:.6f} | GBM3 AUC={gbm3_auc:.6f}")
+print(f"Equal-7 AUC={equal7_auc:.6f} | Equal-6 AUC={equal6_auc:.6f} | Equal-5 AUC={equal5_auc:.6f}")
+print(f"Weighted-7 AUC={weighted7_auc:.6f} | GBM4 AUC={gbm4_auc:.6f} | GBM3 AUC={gbm3_auc:.6f}")
 print(f"Best blend: {best_blend} | Mean fold: {np.mean(fold_aucs):.6f} ± {np.std(fold_aucs):.6f}")
 
 best_val_roc_auc = oof_auc
