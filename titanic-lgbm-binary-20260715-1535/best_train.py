@@ -7,8 +7,9 @@ sys.path.insert(0, '/home/flyte/.local/lib/python3.13/site-packages')
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import StratifiedKFold
-from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.metrics import roc_auc_score
+from sklearn.neural_network import MLPClassifier
 from scipy.stats import rankdata
 import lightgbm as lgb
 import xgboost as xgb
@@ -35,6 +36,20 @@ def engineer_features(X_raw):
 
     # Drop identifier
     X = X.drop(columns=['PassengerId'], errors='ignore')
+
+    # ===== Ticket group composition features (computed BEFORE dropping Ticket/Sex/Age) =====
+    # These use only feature info (no survival target)
+    if 'Ticket' in X.columns and 'Sex' in X.columns:
+        ticket_n = X.groupby('Ticket')['Ticket'].transform('count')
+        ticket_n_women = (X['Sex'] == 'female').groupby(X['Ticket']).transform('sum')
+        X['TicketGroupAllWomen'] = (ticket_n_women == ticket_n).astype(int)
+        X['TicketGroupWomenFrac'] = (ticket_n_women / ticket_n.clip(lower=1)).fillna(0.0)
+
+    if 'Ticket' in X.columns and 'Age' in X.columns:
+        # Only count confirmed children (known age < 12, no imputation needed for this flag)
+        is_confirmed_child = (X['Age'] < 12).fillna(False)
+        ticket_has_child = is_confirmed_child.groupby(X['Ticket']).transform('max')
+        X['TicketGroupHasChild'] = ticket_has_child.astype(int)
 
     # ===== Name -> Title + Surname size =====
     if 'Name' in X.columns:
@@ -66,13 +81,16 @@ def engineer_features(X_raw):
         else:
             X['Age'] = X['Age'].fillna(X['Age'].median())
 
-    # ===== Cabin -> Deck + missingness + count =====
+    # ===== Cabin -> Deck + missingness + count + ordinal =====
     if 'Cabin' in X.columns:
         X['Cabin_missing'] = X['Cabin'].isna().astype(int)
         X['Deck'] = X['Cabin'].str[0].fillna('U')
         X['Cabin_count'] = X['Cabin'].apply(
             lambda c: len(str(c).split()) if pd.notna(c) else 0
         )
+        # Ordinal deck: A=7 (top, closest to lifeboats), G=1 (bottom), U=0 (unknown)
+        deck_order = {'A': 7, 'B': 6, 'C': 5, 'D': 4, 'E': 3, 'F': 2, 'G': 1, 'U': 0}
+        X['Deck_num'] = X['Deck'].map(deck_order).fillna(0).astype(int)
         X = X.drop(columns=['Cabin'])
 
     # ===== Fare: fill missing, per-person fare, log transform =====
@@ -101,11 +119,13 @@ def engineer_features(X_raw):
         X['IsChild'] = (X['Age'] < 12).astype(int)
         X['IsSenior'] = (X['Age'] > 60).astype(int)
         X['AgeBin'] = pd.cut(X['Age'], bins=[0, 12, 18, 35, 60, 100], labels=False).fillna(0).astype(int)
+        X['Age_sq'] = X['Age'] ** 2
 
     # ===== Sex-based interactions (core Titanic survival signal) =====
     if 'Sex' in X.columns and 'Pclass' in X.columns:
         sex_is_female = (X['Sex'] == 'female').astype(int)
         X['IsWoman'] = sex_is_female
+        X['SexPclass'] = sex_is_female * 4 - X['Pclass']  # numeric interaction
         X['Woman_Pclass'] = sex_is_female * 4 - X['Pclass']
         X['WomanInHighClass'] = ((sex_is_female == 1) & (X['Pclass'] <= 2)).astype(int)
         X['ManInLowClass'] = ((sex_is_female == 0) & (X['Pclass'] >= 3)).astype(int)
@@ -138,6 +158,14 @@ def engineer_features(X_raw):
     # Surname_size × IsWoman (large named families, women survived more)
     if 'Surname_size' in X.columns and 'IsWoman' in X.columns:
         X['Surname_size_x_IsWoman'] = X['Surname_size'] * X['IsWoman']
+
+    # Deck_num × Pclass
+    if 'Deck_num' in X.columns and 'Pclass' in X.columns:
+        X['Deck_x_Pclass'] = X['Deck_num'] * X['Pclass']
+
+    # TicketGroupWomenFrac × Pclass (women-majority group in lower class = higher survival)
+    if 'TicketGroupWomenFrac' in X.columns and 'Pclass' in X.columns:
+        X['TicketWomenFrac_x_Pclass'] = X['TicketGroupWomenFrac'] * (4 - X['Pclass'])
 
     # ===== Fill any remaining numeric NaN =====
     num_cols = X.select_dtypes(include=[np.number]).columns
@@ -206,6 +234,32 @@ def run_cat_oof(params, X_df, cat_cols, y, skf):
         m = CatBoostClassifier(**params)
         m.fit(train_pool, eval_set=eval_pool)
         oof[vl_idx] = m.predict_proba(eval_pool)[:, 1]
+    return oof
+
+
+def run_mlp_oof(X, y, skf):
+    """MLPClassifier OOF — genuinely different model family from GBMs."""
+    oof = np.zeros(len(X))
+    for tr_idx, vl_idx in skf.split(X, y):
+        scaler = StandardScaler()
+        X_tr = scaler.fit_transform(X[tr_idx])
+        X_vl = scaler.transform(X[vl_idx])
+        m = MLPClassifier(
+            hidden_layer_sizes=(128, 64, 32),
+            activation='relu',
+            solver='adam',
+            alpha=0.01,        # L2 regularization
+            batch_size=32,
+            learning_rate_init=0.001,
+            max_iter=500,
+            early_stopping=True,
+            validation_fraction=0.15,
+            n_iter_no_change=25,
+            random_state=42,
+            tol=1e-5,
+        )
+        m.fit(X_tr, y[tr_idx])
+        oof[vl_idx] = m.predict_proba(X_vl)[:, 1]
     return oof
 
 
@@ -323,16 +377,32 @@ oof_cat = run_cat_oof(best_cat_params, X_all, cat_col_names, y_np, skf)
 cat_auc = roc_auc_score(y_np, oof_cat)
 print(f"Final CAT OOF AUC: {cat_auc:.6f}")
 
+# MLP — genuinely different model family (neural net, gradient descent)
+print("Running MLPClassifier OOF...")
+oof_mlp = run_mlp_oof(X_np, y_np, skf)
+mlp_auc = roc_auc_score(y_np, oof_mlp)
+print(f"Final MLP OOF AUC: {mlp_auc:.6f}")
+
 # =============================================================
 # Rank-based ensemble (normalises score distributions)
+# 4-model blend: LGB + XGB + CatBoost + MLP
 # =============================================================
 oof_lgb_r = rankdata(oof_lgb) / len(oof_lgb)
 oof_xgb_r = rankdata(oof_xgb) / len(oof_xgb)
 oof_cat_r = rankdata(oof_cat) / len(oof_cat)
+oof_mlp_r = rankdata(oof_mlp) / len(oof_mlp)
 
-oof_ensemble = (oof_lgb_r + oof_xgb_r + oof_cat_r) / 3.0
+# Equal-weight blend across 4 models
+oof_ensemble = (oof_lgb_r + oof_xgb_r + oof_cat_r + oof_mlp_r) / 4.0
 ensemble_auc = roc_auc_score(y_np, oof_ensemble)
 
-print(f"\nIndividual OOF AUCs: LGB={lgb_auc:.6f}, XGB={xgb_auc:.6f}, CAT={cat_auc:.6f}")
-print(f"Ensemble OOF AUC (rank-avg LGB+XGB+CAT): {ensemble_auc:.6f}")
-print(f"BEST_VAL_ROC_AUC: {ensemble_auc:.6f}")
+# Also try 3-model GBM-only to see if MLP helps
+oof_gbm_only = (oof_lgb_r + oof_xgb_r + oof_cat_r) / 3.0
+gbm_auc = roc_auc_score(y_np, oof_gbm_only)
+
+print(f"\nIndividual OOF AUCs: LGB={lgb_auc:.6f}, XGB={xgb_auc:.6f}, CAT={cat_auc:.6f}, MLP={mlp_auc:.6f}")
+print(f"GBM-only ensemble AUC: {gbm_auc:.6f}")
+print(f"4-model ensemble AUC (LGB+XGB+CAT+MLP): {ensemble_auc:.6f}")
+
+best_auc = max(ensemble_auc, gbm_auc)
+print(f"BEST_VAL_ROC_AUC: {best_auc:.6f}")
