@@ -1,6 +1,7 @@
 import os
 DATA_PATH = os.environ.get("DATA_PATH", "/tmp/data")
 
+import random
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
@@ -16,6 +17,7 @@ from torch.amp import autocast, GradScaler
 
 torch.manual_seed(42)
 np.random.seed(42)
+random.seed(42)
 
 df = pd.read_parquet(DATA_PATH)
 
@@ -51,7 +53,20 @@ RC_TABLE = str.maketrans('ATGCatgcNn', 'TACGtacgNn')
 def reverse_complement(seq):
     return seq.translate(RC_TABLE)[::-1]
 
-# Increase MAX_LEN to 800 to capture more of sequences (up to 1000 chars)
+def random_mutate(seq, mut_rate=0.02):
+    """Apply random base substitutions (SNP-like augmentation) to increase diversity."""
+    bases = 'ATGC'
+    seq = seq.upper()
+    result = []
+    for ch in seq:
+        if ch in bases and random.random() < mut_rate:
+            # Pick any base (including same — biologically realistic)
+            result.append(random.choice(bases))
+        else:
+            result.append(ch)
+    return ''.join(result)
+
+# MAX_LEN = 800 captures most of sequences (up to 1000 chars)
 MAX_LEN = 800
 
 
@@ -78,8 +93,19 @@ class DNADataset(Dataset):
 
     def __getitem__(self, idx):
         seq = self.seqs[idx]
-        if self.augment and np.random.random() < 0.5:
-            seq = reverse_complement(seq)
+        if self.augment:
+            # Reverse complement (50% prob) — captures RC-invariant biology
+            if random.random() < 0.5:
+                seq = reverse_complement(seq)
+            # Random window selection for sequences longer than max_len
+            # Exposes model to different parts of long sequences
+            if len(seq) > self.max_len:
+                start = random.randint(0, len(seq) - self.max_len)
+                seq = seq[start:start + self.max_len]
+            # Random mutation (SNP-like, 30% prob, 2% rate)
+            # Dramatically increases effective diversity for minority class 2 (1143 samples)
+            if random.random() < 0.3:
+                seq = random_mutate(seq, mut_rate=0.02)
         return torch.from_numpy(self._encode(seq)), self.y[idx]
 
 
@@ -230,11 +256,11 @@ print(f"[MODEL] Parameters: {n_params:,}")
 
 use_cuda = device.type == "cuda"
 
-# Standard cross-entropy (no class weights) since WeightedRandomSampler already balances classes
-# Avoids double-correcting for imbalance
-criterion = nn.CrossEntropyLoss()
+# CrossEntropyLoss with label smoothing — prevents overconfidence on minority class,
+# improves calibration. WeightedRandomSampler handles class imbalance (no double correction).
+criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
 
-N_EPOCHS  = 50
+N_EPOCHS  = 60
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=N_EPOCHS, eta_min=1e-5)
 
@@ -245,7 +271,7 @@ else:
 
 best_f1    = 0.0
 best_state = None
-patience   = 12
+patience   = 15
 no_improve = 0
 
 for epoch in range(1, N_EPOCHS + 1):
