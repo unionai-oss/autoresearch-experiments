@@ -11,13 +11,12 @@ from collections import Counter
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import autocast, GradScaler
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torch.amp import autocast, GradScaler
 
 torch.manual_seed(42)
 np.random.seed(42)
 
-# ── Data loading ──────────────────────────────────────────────────────────────
 df = pd.read_parquet(DATA_PATH)
 
 target_col = "label"
@@ -47,149 +46,206 @@ train_dist = Counter(train_labels)
 print(f"[DATA] Total: {len(sequences)}, Train: {len(train_seqs)}, Val: {len(val_seqs)}, Classes: {num_classes}")
 print(f"[DATA] Class distribution: {class_dist}")
 
-# ── One-hot encoding (ATGC → 4 channels) ─────────────────────────────────────
-MAX_LEN = 1024
+RC_TABLE = str.maketrans('ATGCatgcNn', 'TACGtacgNn')
 
-def encode_sequences(seqs, max_len=MAX_LEN):
-    N = len(seqs)
-    X = np.zeros((N, 4, max_len), dtype=np.float32)
-    for i, seq in enumerate(seqs):
-        s = seq[:max_len].upper()
+def reverse_complement(seq):
+    return seq.translate(RC_TABLE)[::-1]
+
+# Increase MAX_LEN to 800 to capture more of sequences (up to 1000 chars)
+MAX_LEN = 800
+
+
+class DNADataset(Dataset):
+    def __init__(self, seqs, y, max_len=MAX_LEN, augment=False):
+        self.seqs = seqs
+        self.y = torch.tensor(y, dtype=torch.long)
+        self.max_len = max_len
+        self.augment = augment
+
+    def _encode(self, seq):
+        x = np.zeros((4, self.max_len), dtype=np.float32)
+        s = seq[:self.max_len].upper()
         b = np.frombuffer(s.encode(), dtype=np.uint8)
         L = len(b)
-        X[i, 0, :L] = (b == 65)  # A
-        X[i, 1, :L] = (b == 84)  # T
-        X[i, 2, :L] = (b == 71)  # G
-        X[i, 3, :L] = (b == 67)  # C
-    return X
-
-print("[FEAT] Encoding sequences...")
-X_train = encode_sequences(train_seqs)
-X_val   = encode_sequences(val_seqs)
-print(f"[FEAT] X_train={X_train.shape}, X_val={X_val.shape}")
-
-# ── Dataset ───────────────────────────────────────────────────────────────────
-class DNADataset(Dataset):
-    def __init__(self, X, y):
-        self.X = torch.from_numpy(X)
-        self.y = torch.tensor(y, dtype=torch.long)
+        x[0, :L] = (b == 65)   # A
+        x[1, :L] = (b == 84)   # T
+        x[2, :L] = (b == 71)   # G
+        x[3, :L] = (b == 67)   # C
+        return x
 
     def __len__(self):
         return len(self.y)
 
     def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
+        seq = self.seqs[idx]
+        if self.augment and np.random.random() < 0.5:
+            seq = reverse_complement(seq)
+        return torch.from_numpy(self._encode(seq)), self.y[idx]
 
-BATCH_SIZE = 256
-train_ds = DNADataset(X_train, train_labels)
-val_ds   = DNADataset(X_val, val_labels)
-train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  num_workers=0)
-val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
-# ── Model: 1D CNN ─────────────────────────────────────────────────────────────
-class ResBlock1d(nn.Module):
-    """Residual block for 1D sequences."""
-    def __init__(self, channels, kernel_size=7):
+# Reduced batch size to handle longer sequences (800 vs 512)
+BATCH_SIZE = 128
+
+counts = np.array([train_dist[c] for c in range(num_classes)], dtype=np.float64)
+
+# WeightedRandomSampler ensures balanced class frequency per batch
+# Using ONLY this for imbalance handling (not combined with focal loss)
+class_weights_sampler = 1.0 / counts
+sample_weights = np.array([class_weights_sampler[l] for l in train_labels], dtype=np.float32)
+
+train_ds = DNADataset(train_seqs, train_labels, augment=True)
+val_ds   = DNADataset(val_seqs,   val_labels,   augment=False)
+
+sampler = WeightedRandomSampler(
+    weights=torch.from_numpy(sample_weights),
+    num_samples=len(train_labels),
+    replacement=True,
+)
+# num_workers=0 required — worker processes hang in containers
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, sampler=sampler, num_workers=0, pin_memory=True)
+val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False,   num_workers=0, pin_memory=True)
+
+
+class SEBlock(nn.Module):
+    def __init__(self, channels, reduction=16):
         super().__init__()
-        pad = kernel_size // 2
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, max(channels // reduction, 4), bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(max(channels // reduction, 4), channels, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        b, c, _ = x.shape
+        w = self.pool(x).view(b, c)
+        w = self.fc(w).view(b, c, 1)
+        return x * w
+
+
+class ResBlock(nn.Module):
+    def __init__(self, channels, kernel_size=7, dilation=1, dropout=0.1):
+        super().__init__()
+        pad = (kernel_size - 1) * dilation // 2
         self.net = nn.Sequential(
-            nn.Conv1d(channels, channels, kernel_size, padding=pad, bias=False),
+            nn.Conv1d(channels, channels, kernel_size, padding=pad, dilation=dilation, bias=False),
             nn.BatchNorm1d(channels),
             nn.GELU(),
-            nn.Conv1d(channels, channels, kernel_size, padding=pad, bias=False),
+            nn.Dropout(dropout),
+            nn.Conv1d(channels, channels, kernel_size, padding=pad, dilation=dilation, bias=False),
             nn.BatchNorm1d(channels),
         )
+        self.se = SEBlock(channels)
         self.act = nn.GELU()
 
     def forward(self, x):
-        return self.act(self.net(x) + x)
+        return self.act(self.se(self.net(x)) + x)
 
 
-class DNACNNClassifier(nn.Module):
-    def __init__(self, num_classes=3, dropout=0.4):
+class DNACNNv3(nn.Module):
+    """Multi-scale dilated CNN with SE attention and attention pooling."""
+    def __init__(self, num_classes=3, dropout=0.3):
         super().__init__()
-        # Stem: (4, 1024) → (128, 512)
-        self.stem = nn.Sequential(
-            nn.Conv1d(4, 128, kernel_size=15, padding=7, bias=False),
+
+        # Multi-scale stem: 3 kernel sizes to capture short/medium/long motifs
+        self.stem_branches = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv1d(4, 32, k, padding=k // 2, bias=False),
+                nn.BatchNorm1d(32),
+                nn.GELU(),
+            )
+            for k in [3, 7, 15]
+        ])
+        # Project from 96 -> 128
+        self.stem_proj = nn.Sequential(
+            nn.Conv1d(96, 128, 1, bias=False),
             nn.BatchNorm1d(128),
             nn.GELU(),
-            nn.MaxPool1d(2),
         )
-        # Stage 1: (128, 512) → (128, 256)
+        self.stem_pool = nn.MaxPool1d(2)  # 800 -> 400
+
         self.stage1 = nn.Sequential(
-            ResBlock1d(128, kernel_size=7),
-            nn.MaxPool1d(2),
+            ResBlock(128, kernel_size=7, dilation=1, dropout=0.1),
+            ResBlock(128, kernel_size=7, dilation=2, dropout=0.1),
+            ResBlock(128, kernel_size=7, dilation=4, dropout=0.1),
         )
-        # Stage 2: (128, 256) → (256, 128)
+        self.down1 = nn.Sequential(
+            nn.Conv1d(128, 192, 1, bias=False),
+            nn.BatchNorm1d(192),
+            nn.MaxPool1d(2),  # 400 -> 200
+        )
+
         self.stage2 = nn.Sequential(
-            nn.Conv1d(128, 256, kernel_size=1, bias=False),
-            nn.BatchNorm1d(256),
-            ResBlock1d(256, kernel_size=5),
-            nn.MaxPool1d(2),
+            ResBlock(192, kernel_size=5, dilation=1, dropout=0.1),
+            ResBlock(192, kernel_size=5, dilation=2, dropout=0.1),
         )
-        # Stage 3: (256, 128) → (512, 64)
+        self.down2 = nn.Sequential(
+            nn.Conv1d(192, 256, 1, bias=False),
+            nn.BatchNorm1d(256),
+            nn.MaxPool1d(2),  # 200 -> 100
+        )
+
         self.stage3 = nn.Sequential(
-            nn.Conv1d(256, 512, kernel_size=1, bias=False),
-            nn.BatchNorm1d(512),
-            ResBlock1d(512, kernel_size=3),
-            nn.MaxPool1d(2),
+            ResBlock(256, kernel_size=3, dilation=1, dropout=0.1),
+            ResBlock(256, kernel_size=3, dilation=2, dropout=0.1),
         )
-        self.pool = nn.AdaptiveAvgPool1d(1)
+
+        # Attention pooling aggregates position-specific information
+        self.attn_pool = nn.Conv1d(256, 1, 1)
+
         self.head = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(512, 256, bias=False),
-            nn.BatchNorm1d(256),
+            nn.LayerNorm(256),
+            nn.Linear(256, 128),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(256, num_classes),
+            nn.Linear(128, num_classes),
         )
 
     def forward(self, x):
-        x = self.stem(x)
+        # Multi-scale stem
+        x = torch.cat([b(x) for b in self.stem_branches], dim=1)
+        x = self.stem_proj(x)
+        x = self.stem_pool(x)
+
         x = self.stage1(x)
+        x = self.down1(x)
         x = self.stage2(x)
+        x = self.down2(x)
         x = self.stage3(x)
-        x = self.pool(x)
+
+        # Attention pooling
+        w = torch.softmax(self.attn_pool(x), dim=-1)
+        x = (x * w).sum(dim=-1)
+
         return self.head(x)
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"[MODEL] Device: {device}")
 
-model = DNACNNClassifier(num_classes=num_classes).to(device)
+model = DNACNNv3(num_classes=num_classes).to(device)
 n_params = sum(p.numel() for p in model.parameters())
 print(f"[MODEL] Parameters: {n_params:,}")
 
-# ── Focal Loss (alpha = 1/count, normalized) ──────────────────────────────────
-class FocalLoss(nn.Module):
-    def __init__(self, alpha, gamma=2.0):
-        super().__init__()
-        self.register_buffer('alpha', alpha)
-        self.gamma = gamma
+use_cuda = device.type == "cuda"
 
-    def forward(self, logits, targets):
-        ce = F.cross_entropy(logits, targets, reduction='none')
-        pt = torch.exp(-ce)
-        alpha_t = self.alpha[targets]
-        return (alpha_t * (1 - pt) ** self.gamma * ce).mean()
+# Standard cross-entropy (no class weights) since WeightedRandomSampler already balances classes
+# Avoids double-correcting for imbalance
+criterion = nn.CrossEntropyLoss()
 
-
-counts = np.array([train_dist[c] for c in range(num_classes)], dtype=np.float32)
-alpha_raw  = 1.0 / counts
-alpha_norm = torch.tensor(alpha_raw / alpha_raw.sum(), dtype=torch.float32)
-print(f"[MODEL] Focal alpha: {alpha_norm.tolist()}")
-criterion = FocalLoss(alpha=alpha_norm, gamma=2.0).to(device)
-
-# ── Optimizer & Scheduler ─────────────────────────────────────────────────────
-N_EPOCHS  = 40
+N_EPOCHS  = 50
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=N_EPOCHS, eta_min=1e-5)
-scaler    = GradScaler()
 
-# ── Training loop ─────────────────────────────────────────────────────────────
+if use_cuda:
+    scaler = GradScaler('cuda')
+else:
+    scaler = None
+
 best_f1    = 0.0
 best_state = None
-patience   = 10
+patience   = 12
 no_improve = 0
 
 for epoch in range(1, N_EPOCHS + 1):
@@ -198,24 +254,33 @@ for epoch in range(1, N_EPOCHS + 1):
     for X_b, y_b in train_loader:
         X_b, y_b = X_b.to(device), y_b.to(device)
         optimizer.zero_grad(set_to_none=True)
-        with autocast():
+        if use_cuda:
+            with autocast('cuda'):
+                logits = model(X_b)
+                loss   = criterion(logits, y_b)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
             logits = model(X_b)
             loss   = criterion(logits, y_b)
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        scaler.step(optimizer)
-        scaler.update()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
         epoch_loss += loss.item()
 
     scheduler.step()
 
-    # ── Validation ───────────────────────────────────────────────────────────
     model.eval()
     preds = []
     with torch.no_grad():
         for X_b, _ in val_loader:
-            with autocast():
+            if use_cuda:
+                with autocast('cuda'):
+                    logits = model(X_b.to(device))
+            else:
                 logits = model(X_b.to(device))
             preds.extend(logits.argmax(1).cpu().numpy())
 
@@ -237,18 +302,40 @@ for epoch in range(1, N_EPOCHS + 1):
             print(f"[EARLY STOP] No improvement for {patience} epochs, stopping at epoch {epoch}")
             break
 
-# ── Final evaluation ──────────────────────────────────────────────────────────
+# TTA: Test-time augmentation with reverse complement
 model.load_state_dict(best_state)
 model.eval()
-preds = []
+
+# Pre-compute reverse complement sequences for TTA
+val_rc_seqs = [reverse_complement(s) for s in val_seqs]
+val_ds_rc = DNADataset(val_rc_seqs, val_labels, augment=False)
+val_loader_rc = DataLoader(val_ds_rc, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+
+preds_fwd = []
+preds_rc  = []
 with torch.no_grad():
     for X_b, _ in val_loader:
-        with autocast():
+        if use_cuda:
+            with autocast('cuda'):
+                logits = model(X_b.to(device))
+        else:
             logits = model(X_b.to(device))
-        preds.extend(logits.argmax(1).cpu().numpy())
+        preds_fwd.append(torch.softmax(logits, dim=-1).cpu())
 
-macro_f1  = f1_score(val_labels, preds, average='macro')
-per_class = f1_score(val_labels, preds, average=None)
-print(f"[EVAL] Per-class F1: {per_class}")
+    for X_b, _ in val_loader_rc:
+        if use_cuda:
+            with autocast('cuda'):
+                logits = model(X_b.to(device))
+        else:
+            logits = model(X_b.to(device))
+        preds_rc.append(torch.softmax(logits, dim=-1).cpu())
+
+preds_fwd = torch.cat(preds_fwd, dim=0)
+preds_rc  = torch.cat(preds_rc,  dim=0)
+preds_tta = ((preds_fwd + preds_rc) / 2).argmax(1).numpy()
+
+macro_f1  = f1_score(val_labels, preds_tta, average='macro')
+per_class = f1_score(val_labels, preds_tta, average=None)
+print(f"[EVAL] Per-class F1 (TTA): {per_class}")
 print(f"[EVAL] Best epoch val macro_f1: {best_f1:.6f}")
 print(f"BEST_VAL_MACRO_F1: {macro_f1:.6f}")
