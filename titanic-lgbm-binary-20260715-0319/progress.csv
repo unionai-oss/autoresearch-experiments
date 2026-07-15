@@ -1,3 +1,4 @@
 experiment_id,description,model_name,metric_name,metric_value,improved,duration_s,commit,notes
 0,baseline: LightGBM with 5-fold stratified CV + missingness indicators — optimal for N=891 tabular data where GBMs dominate at this scale,,roc_auc,0.816996,true,3.0,a25498c,
 1,sdk_error_1,,roc_auc,,false,2.6,,NotImplementedError: <class 'pandas.arrays.ArrowStringArray'> does not support reshape as backed by a 1D pyarrow.ChunkedArray.
+2,"Fix ArrowStringArray reshape crash, add TicketGroupSize/WomanOrChild features, add HistGradientBoosting as 3rd ensemble model, lower LR to 0.01 for better convergence",,roc_auc,0.833992,true,6.7,d6f5835,
