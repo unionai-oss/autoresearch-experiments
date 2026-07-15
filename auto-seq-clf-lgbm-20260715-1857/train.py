@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torch.amp import autocast, GradScaler
 
+# Global seed for reproducible data splitting
 torch.manual_seed(42)
 np.random.seed(42)
 random.seed(42)
@@ -60,14 +61,13 @@ def random_mutate(seq, mut_rate=0.02):
     result = []
     for ch in seq:
         if ch in bases and random.random() < mut_rate:
-            # Pick any base (including same — biologically realistic)
             result.append(random.choice(bases))
         else:
             result.append(ch)
     return ''.join(result)
 
-# MAX_LEN = 800 captures most of sequences (up to 1000 chars)
 MAX_LEN = 800
+BATCH_SIZE = 128
 
 
 class DNADataset(Dataset):
@@ -94,42 +94,17 @@ class DNADataset(Dataset):
     def __getitem__(self, idx):
         seq = self.seqs[idx]
         if self.augment:
-            # Reverse complement (50% prob) — captures RC-invariant biology
+            # Reverse complement (50% prob)
             if random.random() < 0.5:
                 seq = reverse_complement(seq)
             # Random window selection for sequences longer than max_len
-            # Exposes model to different parts of long sequences
             if len(seq) > self.max_len:
                 start = random.randint(0, len(seq) - self.max_len)
                 seq = seq[start:start + self.max_len]
             # Random mutation (SNP-like, 30% prob, 2% rate)
-            # Dramatically increases effective diversity for minority class 2 (1143 samples)
             if random.random() < 0.3:
                 seq = random_mutate(seq, mut_rate=0.02)
         return torch.from_numpy(self._encode(seq)), self.y[idx]
-
-
-# Reduced batch size to handle longer sequences (800 vs 512)
-BATCH_SIZE = 128
-
-counts = np.array([train_dist[c] for c in range(num_classes)], dtype=np.float64)
-
-# WeightedRandomSampler ensures balanced class frequency per batch
-# Using ONLY this for imbalance handling (not combined with focal loss)
-class_weights_sampler = 1.0 / counts
-sample_weights = np.array([class_weights_sampler[l] for l in train_labels], dtype=np.float32)
-
-train_ds = DNADataset(train_seqs, train_labels, augment=True)
-val_ds   = DNADataset(val_seqs,   val_labels,   augment=False)
-
-sampler = WeightedRandomSampler(
-    weights=torch.from_numpy(sample_weights),
-    num_samples=len(train_labels),
-    replacement=True,
-)
-# num_workers=0 required — worker processes hang in containers
-train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, sampler=sampler, num_workers=0, pin_memory=True)
-val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False,   num_workers=0, pin_memory=True)
 
 
 class SEBlock(nn.Module):
@@ -249,119 +224,156 @@ class DNACNNv3(nn.Module):
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"[MODEL] Device: {device}")
-
-model = DNACNNv3(num_classes=num_classes).to(device)
-n_params = sum(p.numel() for p in model.parameters())
-print(f"[MODEL] Parameters: {n_params:,}")
-
 use_cuda = device.type == "cuda"
 
-# CrossEntropyLoss with label smoothing — prevents overconfidence on minority class,
-# improves calibration. WeightedRandomSampler handles class imbalance (no double correction).
-criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
+# Pre-compute WRS weights (fixed across models — only randomness is in sampling order)
+counts = np.array([train_dist[c] for c in range(num_classes)], dtype=np.float64)
+class_weights_sampler = 1.0 / counts
+sample_weights = np.array([class_weights_sampler[l] for l in train_labels], dtype=np.float32)
 
-N_EPOCHS  = 60
-optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=N_EPOCHS, eta_min=1e-5)
+# Pre-compute validation datasets + loaders (shared across ensemble members)
+val_rc_seqs = [reverse_complement(s) for s in val_seqs]
+val_ds     = DNADataset(val_seqs,    val_labels, augment=False)
+val_ds_rc  = DNADataset(val_rc_seqs, val_labels, augment=False)
+val_loader    = DataLoader(val_ds,    batch_size=BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=True)
+val_loader_rc = DataLoader(val_ds_rc, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
-if use_cuda:
-    scaler = GradScaler('cuda')
-else:
-    scaler = None
+N_EPOCHS = 60
+PATIENCE = 15
+# Train 2 independent models with different seeds — averaging reduces variance
+# from 21x class imbalance (high per-run variance for class 2 predictions)
+ENSEMBLE_SEEDS = [42, 7]
 
-best_f1    = 0.0
-best_state = None
-patience   = 15
-no_improve = 0
 
-for epoch in range(1, N_EPOCHS + 1):
-    model.train()
-    epoch_loss = 0.0
-    for X_b, y_b in train_loader:
-        X_b, y_b = X_b.to(device), y_b.to(device)
-        optimizer.zero_grad(set_to_none=True)
-        if use_cuda:
-            with autocast('cuda'):
+def train_one_model(seed):
+    """Train a single CNN model with the given seed. Returns best state dict."""
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+
+    # Fresh dataset + sampler per model (augmentation randomness controlled by seed)
+    train_ds_local = DNADataset(train_seqs, train_labels, augment=True)
+    sampler_local = WeightedRandomSampler(
+        weights=torch.from_numpy(sample_weights),
+        num_samples=len(train_labels),
+        replacement=True,
+    )
+    train_loader_local = DataLoader(
+        train_ds_local, batch_size=BATCH_SIZE,
+        sampler=sampler_local, num_workers=0, pin_memory=True
+    )
+
+    model = DNACNNv3(num_classes=num_classes).to(device)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"  [seed={seed}] Parameters: {n_params:,}")
+
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=N_EPOCHS, eta_min=1e-5)
+
+    if use_cuda:
+        scaler = GradScaler('cuda')
+    else:
+        scaler = None
+
+    best_f1 = 0.0
+    best_state = None
+    no_improve = 0
+
+    for epoch in range(1, N_EPOCHS + 1):
+        model.train()
+        epoch_loss = 0.0
+        for X_b, y_b in train_loader_local:
+            X_b, y_b = X_b.to(device), y_b.to(device)
+            optimizer.zero_grad(set_to_none=True)
+            if use_cuda:
+                with autocast('cuda'):
+                    logits = model(X_b)
+                    loss   = criterion(logits, y_b)
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
                 logits = model(X_b)
                 loss   = criterion(logits, y_b)
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(optimizer)
-            scaler.update()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+            epoch_loss += loss.item()
+
+        scheduler.step()
+
+        model.eval()
+        preds = []
+        with torch.no_grad():
+            for X_b, _ in val_loader:
+                if use_cuda:
+                    with autocast('cuda'):
+                        logits = model(X_b.to(device))
+                else:
+                    logits = model(X_b.to(device))
+                preds.extend(logits.argmax(1).cpu().numpy())
+
+        val_f1   = f1_score(val_labels, preds, average='macro')
+        avg_loss = epoch_loss / len(train_loader_local)
+        lr_now   = scheduler.get_last_lr()[0]
+
+        print(f"  [seed={seed} EPOCH {epoch:02d}/{N_EPOCHS}] loss={avg_loss:.4f} val_f1={val_f1:.4f} lr={lr_now:.2e}")
+
+        if val_f1 > best_f1:
+            best_f1    = val_f1
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            no_improve = 0
         else:
-            logits = model(X_b)
-            loss   = criterion(logits, y_b)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-        epoch_loss += loss.item()
+            no_improve += 1
+            if no_improve >= PATIENCE:
+                print(f"  [EARLY STOP seed={seed}] No improvement for {PATIENCE} epochs at epoch {epoch}")
+                break
 
-    scheduler.step()
+    print(f"  [seed={seed}] Best val_f1: {best_f1:.4f}")
+    return best_state
 
+
+def get_softmax_probs(model, loader):
+    """Get softmax probability matrix from model on a DataLoader."""
     model.eval()
-    preds = []
+    all_probs = []
     with torch.no_grad():
-        for X_b, _ in val_loader:
+        for X_b, _ in loader:
             if use_cuda:
                 with autocast('cuda'):
                     logits = model(X_b.to(device))
             else:
                 logits = model(X_b.to(device))
-            preds.extend(logits.argmax(1).cpu().numpy())
+            all_probs.append(torch.softmax(logits, dim=-1).cpu())
+    return torch.cat(all_probs, dim=0)
 
-    val_f1    = f1_score(val_labels, preds, average='macro')
-    per_class = f1_score(val_labels, preds, average=None)
-    avg_loss  = epoch_loss / len(train_loader)
-    lr_now    = scheduler.get_last_lr()[0]
 
-    print(f"[EPOCH {epoch:02d}/{N_EPOCHS}] loss={avg_loss:.4f} val_f1={val_f1:.4f} "
-          f"per_class={[f'{v:.3f}' for v in per_class]} lr={lr_now:.2e}")
+# ── Ensemble training ──────────────────────────────────────────────────────────
+best_states = []
+for seed in ENSEMBLE_SEEDS:
+    print(f"\n[ENSEMBLE] Training model with seed={seed}")
+    state = train_one_model(seed)
+    best_states.append(state)
 
-    if val_f1 > best_f1:
-        best_f1    = val_f1
-        best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-        no_improve = 0
-    else:
-        no_improve += 1
-        if no_improve >= patience:
-            print(f"[EARLY STOP] No improvement for {patience} epochs, stopping at epoch {epoch}")
-            break
+# ── Inference: ensemble (2 models) × TTA (fwd + RC) = 4 predictions averaged ─
+inference_model = DNACNNv3(num_classes=num_classes).to(device)
+all_probs = []
 
-# TTA: Test-time augmentation with reverse complement
-model.load_state_dict(best_state)
-model.eval()
+for i, state in enumerate(best_states):
+    inference_model.load_state_dict(state)
+    probs_fwd = get_softmax_probs(inference_model, val_loader)
+    probs_rc  = get_softmax_probs(inference_model, val_loader_rc)
+    model_probs = (probs_fwd + probs_rc) / 2
+    all_probs.append(model_probs)
+    print(f"[INFERENCE] Model {i+1}/{len(best_states)} done")
 
-# Pre-compute reverse complement sequences for TTA
-val_rc_seqs = [reverse_complement(s) for s in val_seqs]
-val_ds_rc = DNADataset(val_rc_seqs, val_labels, augment=False)
-val_loader_rc = DataLoader(val_ds_rc, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+ensemble_probs = sum(all_probs) / len(all_probs)
+preds = ensemble_probs.argmax(1).numpy()
 
-preds_fwd = []
-preds_rc  = []
-with torch.no_grad():
-    for X_b, _ in val_loader:
-        if use_cuda:
-            with autocast('cuda'):
-                logits = model(X_b.to(device))
-        else:
-            logits = model(X_b.to(device))
-        preds_fwd.append(torch.softmax(logits, dim=-1).cpu())
-
-    for X_b, _ in val_loader_rc:
-        if use_cuda:
-            with autocast('cuda'):
-                logits = model(X_b.to(device))
-        else:
-            logits = model(X_b.to(device))
-        preds_rc.append(torch.softmax(logits, dim=-1).cpu())
-
-preds_fwd = torch.cat(preds_fwd, dim=0)
-preds_rc  = torch.cat(preds_rc,  dim=0)
-preds_tta = ((preds_fwd + preds_rc) / 2).argmax(1).numpy()
-
-macro_f1  = f1_score(val_labels, preds_tta, average='macro')
-per_class = f1_score(val_labels, preds_tta, average=None)
-print(f"[EVAL] Per-class F1 (TTA): {per_class}")
-print(f"[EVAL] Best epoch val macro_f1: {best_f1:.6f}")
+macro_f1  = f1_score(val_labels, preds, average='macro')
+per_class = f1_score(val_labels, preds, average=None)
+print(f"[EVAL] Per-class F1 (ensemble+TTA): {per_class}")
 print(f"BEST_VAL_MACRO_F1: {macro_f1:.6f}")
