@@ -271,11 +271,61 @@ xgb_best.update({
 print(f"XGBoost best AUC={xgb_study.best_value:.6f} ({len(xgb_study.trials)} trials)")
 
 
-# ===================== Final 5-Fold CV: LGB + XGB + CatBoost Ensemble =====================
+# ===================== Optuna for CatBoost =====================
+
+from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier
+
+
+def cat_objective(trial):
+    params = dict(
+        iterations=1500,
+        learning_rate=trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+        depth=trial.suggest_int("depth", 4, 10),
+        l2_leaf_reg=trial.suggest_float("l2_leaf_reg", 0.5, 30.0, log=True),
+        bagging_temperature=trial.suggest_float("bagging_temperature", 0.0, 2.0),
+        random_strength=trial.suggest_float("random_strength", 0.0, 10.0),
+        border_count=trial.suggest_int("border_count", 32, 255),
+        min_data_in_leaf=trial.suggest_int("min_data_in_leaf", 1, 20),
+        random_seed=42,
+        eval_metric='AUC',
+        early_stopping_rounds=50,
+        verbose=False,
+        train_dir='/tmp/catboost_info',
+    )
+    oof_preds = np.zeros(len(y))
+    for tr_idx, va_idx in skf.split(X_eng, y):
+        X_tr_c, X_va_c, cat_cols_c = preprocess_catboost(X_eng.iloc[tr_idx], X_eng.iloc[va_idx])
+        model = CatBoostClassifier(**params)
+        model.fit(X_tr_c, y[tr_idx], cat_features=cat_cols_c, eval_set=(X_va_c, y[va_idx]))
+        oof_preds[va_idx] = model.predict_proba(X_va_c)[:, 1]
+    return roc_auc_score(y, oof_preds)
+
+
+print("Running CatBoost Optuna (80 trials)...")
+cat_study = optuna.create_study(
+    direction="maximize",
+    sampler=optuna.samplers.TPESampler(seed=42),
+)
+cat_study.optimize(cat_objective, n_trials=80, timeout=220, show_progress_bar=False)
+cat_best = cat_study.best_params
+cat_best.update({
+    "iterations": 2000,
+    "random_seed": 42,
+    "eval_metric": "AUC",
+    "early_stopping_rounds": 100,
+    "verbose": False,
+    "train_dir": "/tmp/catboost_info",
+})
+print(f"CatBoost best AUC={cat_study.best_value:.6f} ({len(cat_study.trials)} trials)")
+
+
+# ===================== Final 5-Fold CV: LGB + XGB + CatBoost + ExtraTrees Ensemble =====================
 
 oof_lgb = np.zeros(len(y))
 oof_xgb = np.zeros(len(y))
 oof_cat = np.zeros(len(y))
+oof_et = np.zeros(len(y))
+oof_rf = np.zeros(len(y))
 fold_aucs = []
 
 for fold, (tr_idx, va_idx) in enumerate(skf.split(X_eng, y)):
@@ -298,38 +348,75 @@ for fold, (tr_idx, va_idx) in enumerate(skf.split(X_eng, y)):
     xgb_model.fit(X_tr_x, y_tr, eval_set=[(X_va_x, y_va)], verbose=False)
     oof_xgb[va_idx] = xgb_model.predict_proba(X_va_x)[:, 1]
 
-    # --- CatBoost (handles categoricals natively) ---
+    # --- CatBoost (Optuna-tuned, handles categoricals natively) ---
     X_tr_c, X_va_c, cat_cols_c = preprocess_catboost(X_eng.iloc[tr_idx], X_eng.iloc[va_idx])
-    cat_model = CatBoostClassifier(
-        iterations=2000,
-        learning_rate=0.05,
-        depth=6,
-        l2_leaf_reg=3.0,
-        random_seed=42,
-        eval_metric='AUC',
-        early_stopping_rounds=100,
-        verbose=False,
-        train_dir='/tmp/catboost_info',
-    )
+    cat_model = CatBoostClassifier(**cat_best)
     cat_model.fit(X_tr_c, y_tr, cat_features=cat_cols_c, eval_set=(X_va_c, y_va))
     oof_cat[va_idx] = cat_model.predict_proba(X_va_c)[:, 1]
 
-    fold_ens = (oof_lgb[va_idx] + oof_xgb[va_idx] + oof_cat[va_idx]) / 3
+    # --- ExtraTrees (high variance, strong diversity vs GBMs) ---
+    X_tr_e, X_va_e, _ = preprocess_encoded(X_eng.iloc[tr_idx], X_eng.iloc[va_idx])
+    et_model = ExtraTreesClassifier(
+        n_estimators=800,
+        max_depth=None,
+        min_samples_leaf=1,
+        max_features='sqrt',
+        random_state=42,
+        n_jobs=-1,
+    )
+    et_model.fit(X_tr_e, y_tr)
+    oof_et[va_idx] = et_model.predict_proba(X_va_e)[:, 1]
+
+    # --- RandomForest (bagging complement to boosting) ---
+    X_tr_r, X_va_r, _ = preprocess_encoded(X_eng.iloc[tr_idx], X_eng.iloc[va_idx])
+    rf_model = RandomForestClassifier(
+        n_estimators=800,
+        max_depth=None,
+        min_samples_leaf=2,
+        max_features='sqrt',
+        random_state=42,
+        n_jobs=-1,
+    )
+    rf_model.fit(X_tr_r, y_tr)
+    oof_rf[va_idx] = rf_model.predict_proba(X_va_r)[:, 1]
+
+    fold_ens = (oof_lgb[va_idx] + oof_xgb[va_idx] + oof_cat[va_idx] + oof_et[va_idx] + oof_rf[va_idx]) / 5
     fold_auc = roc_auc_score(y_va, fold_ens)
     fold_aucs.append(fold_auc)
     lgb_f = roc_auc_score(y_va, oof_lgb[va_idx])
     xgb_f = roc_auc_score(y_va, oof_xgb[va_idx])
     cat_f = roc_auc_score(y_va, oof_cat[va_idx])
-    print(f"Fold {fold+1}: LGB={lgb_f:.4f} XGB={xgb_f:.4f} CAT={cat_f:.4f} ENS={fold_auc:.4f}")
+    et_f = roc_auc_score(y_va, oof_et[va_idx])
+    rf_f = roc_auc_score(y_va, oof_rf[va_idx])
+    print(f"Fold {fold+1}: LGB={lgb_f:.4f} XGB={xgb_f:.4f} CAT={cat_f:.4f} ET={et_f:.4f} RF={rf_f:.4f} ENS={fold_auc:.4f}")
 
-oof_ensemble = (oof_lgb + oof_xgb + oof_cat) / 3
 lgb_auc = roc_auc_score(y, oof_lgb)
 xgb_auc = roc_auc_score(y, oof_xgb)
 cat_auc = roc_auc_score(y, oof_cat)
-oof_auc = roc_auc_score(y, oof_ensemble)
+et_auc = roc_auc_score(y, oof_et)
+rf_auc = roc_auc_score(y, oof_rf)
+print(f"Individual OOF: LGB={lgb_auc:.6f} XGB={xgb_auc:.6f} CAT={cat_auc:.6f} ET={et_auc:.6f} RF={rf_auc:.6f}")
 
-print(f"Individual OOF: LGB={lgb_auc:.6f} XGB={xgb_auc:.6f} CAT={cat_auc:.6f}")
-print(f"Ensemble OOF AUC: {oof_auc:.6f} | Mean fold: {np.mean(fold_aucs):.6f} ± {np.std(fold_aucs):.6f}")
+# Equal-weight ensemble
+oof_equal = (oof_lgb + oof_xgb + oof_cat + oof_et + oof_rf) / 5
+equal_auc = roc_auc_score(y, oof_equal)
+
+# AUC-proportional weighted ensemble (models with higher OOF AUC get more weight)
+aucs = np.array([lgb_auc, xgb_auc, cat_auc, et_auc, rf_auc])
+weights = aucs / aucs.sum()
+oof_weighted = (weights[0]*oof_lgb + weights[1]*oof_xgb + weights[2]*oof_cat +
+                weights[3]*oof_et + weights[4]*oof_rf)
+weighted_auc = roc_auc_score(y, oof_weighted)
+
+# GBM-only blend (exclude tree bagging models if they hurt)
+oof_gbm3 = (oof_lgb + oof_xgb + oof_cat) / 3
+gbm3_auc = roc_auc_score(y, oof_gbm3)
+
+oof_auc = max(equal_auc, weighted_auc, gbm3_auc)
+best_blend = "equal" if equal_auc >= weighted_auc and equal_auc >= gbm3_auc else (
+    "weighted" if weighted_auc >= gbm3_auc else "gbm3")
+print(f"Equal-weight AUC={equal_auc:.6f} | Weighted AUC={weighted_auc:.6f} | GBM3 AUC={gbm3_auc:.6f}")
+print(f"Best blend: {best_blend} | Mean fold: {np.mean(fold_aucs):.6f} ± {np.std(fold_aucs):.6f}")
 
 best_val_roc_auc = oof_auc
 print(f"BEST_VAL_ROC_AUC: {best_val_roc_auc:.6f}")
