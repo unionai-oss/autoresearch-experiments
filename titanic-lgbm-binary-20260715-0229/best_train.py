@@ -2,6 +2,7 @@ import os
 DATA_PATH = os.environ.get("DATA_PATH", "/tmp/data")
 
 import sys
+import re
 # optuna/xgboost/catboost are in user site-packages
 sys.path.insert(0, '/home/flyte/.local/lib/python3.13/site-packages')
 
@@ -11,6 +12,7 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.neural_network import MLPClassifier
 from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.neighbors import KNeighborsClassifier
 from sklearn.metrics import roc_auc_score
 import lightgbm as lgb
 import xgboost as xgb
@@ -67,6 +69,11 @@ def engineer_features(df):
     # 4.5. Fare percentile rank within Pclass (relative wealth within class)
     df['FarePctileInPclass'] = df.groupby('Pclass')['Fare'].rank(pct=True)
 
+    # 4.6. Fare z-score within Pclass (deviation from class mean — different signal from percentile)
+    fare_mean_by_pclass = df.groupby('Pclass')['Fare'].transform('mean')
+    fare_std_by_pclass = df.groupby('Pclass')['Fare'].transform('std').replace(0, 1.0)
+    df['FareZScoreInPclass'] = (df['Fare'] - fare_mean_by_pclass) / fare_std_by_pclass
+
     # 5. Family features
     df['FamilySize'] = df['SibSp'] + df['Parch'] + 1
     df['IsAlone'] = (df['FamilySize'] == 1).astype(int)
@@ -90,6 +97,19 @@ def engineer_features(df):
     # DeckOrd: ordinal proximity to lifeboats (A deck = 7 = closest, G = 1, X = 0 = no cabin)
     deck_ord = {'A': 7, 'B': 6, 'C': 5, 'D': 4, 'E': 3, 'F': 2, 'G': 1, 'X': 0}
     df['DeckOrd'] = df['Deck'].map(deck_ord).fillna(0).astype(int)
+
+    # 7.5. Cabin side: even=port, odd=starboard (lifeboats had asymmetric deployment)
+    # Extract first cabin number; -1 if no cabin data
+    _placeholder = CABIN_NAN_PLACEHOLDER
+
+    def _get_cabin_num(c):
+        if c == _placeholder:
+            return -1
+        m = re.search(r'[A-Za-z](\d+)', c)
+        return int(m.group(1)) if m else -1
+
+    df['CabinNumber'] = df['Cabin'].apply(_get_cabin_num)
+    df['CabinSide'] = df['CabinNumber'].apply(lambda x: x % 2 if x >= 0 else -1)
 
     # 8. Age features (age is now fully imputed)
     df['IsChild'] = (df['Age'] < 12).astype(int)
@@ -450,7 +470,36 @@ hgb_best_params.update({
 print(f"HGBC best AUC={hgb_study.best_value:.6f} ({len(hgb_study.trials)} trials)")
 
 
-# ===================== Final 5-Fold CV: All 7 Models =====================
+# ===================== Optuna for KNN =====================
+# KNN: instance-based, non-parametric — fundamentally different inductive bias from tree ensembles
+
+def knn_objective(trial):
+    k = trial.suggest_int('n_neighbors', 3, 25)
+    weights = trial.suggest_categorical('weights', ['uniform', 'distance'])
+
+    oof_preds = np.zeros(len(y))
+    for tr_idx, va_idx in skf.split(X_eng, y):
+        X_tr_k, X_va_k, _ = preprocess_encoded(X_eng.iloc[tr_idx], X_eng.iloc[va_idx])
+        scaler_k = StandardScaler()
+        X_tr_ks = scaler_k.fit_transform(X_tr_k)
+        X_va_ks = scaler_k.transform(X_va_k)
+        model = KNeighborsClassifier(n_neighbors=k, weights=weights, n_jobs=-1)
+        model.fit(X_tr_ks, y[tr_idx])
+        oof_preds[va_idx] = model.predict_proba(X_va_ks)[:, 1]
+    return roc_auc_score(y, oof_preds)
+
+
+print("Running KNN Optuna (30 trials)...")
+knn_study = optuna.create_study(
+    direction="maximize",
+    sampler=optuna.samplers.TPESampler(seed=42),
+)
+knn_study.optimize(knn_objective, n_trials=30, timeout=60, show_progress_bar=False)
+knn_best_params = knn_study.best_params
+print(f"KNN best AUC={knn_study.best_value:.6f} ({len(knn_study.trials)} trials)")
+
+
+# ===================== Final 5-Fold CV: All 8 Models =====================
 
 oof_lgb = np.zeros(len(y))
 oof_xgb = np.zeros(len(y))
@@ -459,6 +508,7 @@ oof_et = np.zeros(len(y))
 oof_rf = np.zeros(len(y))
 oof_mlp = np.zeros(len(y))
 oof_hgb = np.zeros(len(y))
+oof_knn = np.zeros(len(y))
 fold_aucs = []
 
 for fold, (tr_idx, va_idx) in enumerate(skf.split(X_eng, y)):
@@ -540,9 +590,19 @@ for fold, (tr_idx, va_idx) in enumerate(skf.split(X_eng, y)):
     hgb_model.fit(X_tr_h, y_tr)
     oof_hgb[va_idx] = hgb_model.predict_proba(X_va_h)[:, 1]
 
-    # Fold-level ensemble stats
+    # --- KNN (instance-based — no assumptions about data distribution) ---
+    X_tr_k, X_va_k, _ = preprocess_encoded(X_eng.iloc[tr_idx], X_eng.iloc[va_idx])
+    scaler_knn = StandardScaler()
+    X_tr_ks = scaler_knn.fit_transform(X_tr_k)
+    X_va_ks = scaler_knn.transform(X_va_k)
+    knn_model = KNeighborsClassifier(**knn_best_params, n_jobs=-1)
+    knn_model.fit(X_tr_ks, y_tr)
+    oof_knn[va_idx] = knn_model.predict_proba(X_va_ks)[:, 1]
+
+    # Fold-level ensemble stats (8 models)
     fold_ens = (oof_lgb[va_idx] + oof_xgb[va_idx] + oof_cat[va_idx] +
-                oof_et[va_idx] + oof_rf[va_idx] + oof_mlp[va_idx] + oof_hgb[va_idx]) / 7
+                oof_et[va_idx] + oof_rf[va_idx] + oof_mlp[va_idx] +
+                oof_hgb[va_idx] + oof_knn[va_idx]) / 8
     fold_auc = roc_auc_score(y_va, fold_ens)
     fold_aucs.append(fold_auc)
     lgb_f = roc_auc_score(y_va, oof_lgb[va_idx])
@@ -552,8 +612,10 @@ for fold, (tr_idx, va_idx) in enumerate(skf.split(X_eng, y)):
     rf_f  = roc_auc_score(y_va, oof_rf[va_idx])
     mlp_f = roc_auc_score(y_va, oof_mlp[va_idx])
     hgb_f = roc_auc_score(y_va, oof_hgb[va_idx])
+    knn_f = roc_auc_score(y_va, oof_knn[va_idx])
     print(f"Fold {fold+1}: LGB={lgb_f:.4f} XGB={xgb_f:.4f} CAT={cat_f:.4f} "
-          f"ET={et_f:.4f} RF={rf_f:.4f} MLP={mlp_f:.4f} HGB={hgb_f:.4f} ENS={fold_auc:.4f}")
+          f"ET={et_f:.4f} RF={rf_f:.4f} MLP={mlp_f:.4f} HGB={hgb_f:.4f} "
+          f"KNN={knn_f:.4f} ENS={fold_auc:.4f}")
 
 lgb_auc = roc_auc_score(y, oof_lgb)
 xgb_auc = roc_auc_score(y, oof_xgb)
@@ -562,22 +624,35 @@ et_auc  = roc_auc_score(y, oof_et)
 rf_auc  = roc_auc_score(y, oof_rf)
 mlp_auc = roc_auc_score(y, oof_mlp)
 hgb_auc = roc_auc_score(y, oof_hgb)
+knn_auc = roc_auc_score(y, oof_knn)
 print(f"Individual OOF: LGB={lgb_auc:.6f} XGB={xgb_auc:.6f} CAT={cat_auc:.6f} "
-      f"ET={et_auc:.6f} RF={rf_auc:.6f} MLP={mlp_auc:.6f} HGB={hgb_auc:.6f}")
+      f"ET={et_auc:.6f} RF={rf_auc:.6f} MLP={mlp_auc:.6f} HGB={hgb_auc:.6f} KNN={knn_auc:.6f}")
 
-# Equal-weight ensemble (all 7 models)
+# Equal-weight ensemble (all 8 models)
+oof_equal8 = (oof_lgb + oof_xgb + oof_cat + oof_et + oof_rf + oof_mlp + oof_hgb + oof_knn) / 8
+equal8_auc = roc_auc_score(y, oof_equal8)
+
+# Equal-weight ensemble (7 models, exclude KNN — fallback if KNN hurts)
 oof_equal7 = (oof_lgb + oof_xgb + oof_cat + oof_et + oof_rf + oof_mlp + oof_hgb) / 7
 equal7_auc = roc_auc_score(y, oof_equal7)
 
-# Equal-weight (6 models, exclude HGBC — fallback if HGBC hurts)
+# Equal-weight (6 models, exclude HGBC & KNN)
 oof_equal6 = (oof_lgb + oof_xgb + oof_cat + oof_et + oof_rf + oof_mlp) / 6
 equal6_auc = roc_auc_score(y, oof_equal6)
 
-# Equal-weight (5 tree models only — fallback if neural nets hurt)
+# Equal-weight (5 tree models only)
 oof_equal5 = (oof_lgb + oof_xgb + oof_cat + oof_et + oof_rf) / 5
 equal5_auc = roc_auc_score(y, oof_equal5)
 
-# AUC-proportional weighted ensemble across all 7 models
+# AUC-proportional weighted ensemble across all 8 models
+aucs8 = np.array([lgb_auc, xgb_auc, cat_auc, et_auc, rf_auc, mlp_auc, hgb_auc, knn_auc])
+weights8 = aucs8 / aucs8.sum()
+oof_weighted8 = (weights8[0]*oof_lgb + weights8[1]*oof_xgb + weights8[2]*oof_cat +
+                 weights8[3]*oof_et  + weights8[4]*oof_rf  + weights8[5]*oof_mlp +
+                 weights8[6]*oof_hgb + weights8[7]*oof_knn)
+weighted8_auc = roc_auc_score(y, oof_weighted8)
+
+# AUC-weighted (7 models, no KNN)
 aucs7 = np.array([lgb_auc, xgb_auc, cat_auc, et_auc, rf_auc, mlp_auc, hgb_auc])
 weights7 = aucs7 / aucs7.sum()
 oof_weighted7 = (weights7[0]*oof_lgb + weights7[1]*oof_xgb + weights7[2]*oof_cat +
@@ -594,9 +669,11 @@ oof_gbm3 = (oof_lgb + oof_xgb + oof_cat) / 3
 gbm3_auc = roc_auc_score(y, oof_gbm3)
 
 all_blends = {
+    "equal8": equal8_auc,
     "equal7": equal7_auc,
     "equal6": equal6_auc,
     "equal5": equal5_auc,
+    "weighted8": weighted8_auc,
     "weighted7": weighted7_auc,
     "gbm4": gbm4_auc,
     "gbm3": gbm3_auc,
@@ -604,8 +681,9 @@ all_blends = {
 oof_auc = max(all_blends.values())
 best_blend = max(all_blends, key=all_blends.get)
 
-print(f"Equal-7 AUC={equal7_auc:.6f} | Equal-6 AUC={equal6_auc:.6f} | Equal-5 AUC={equal5_auc:.6f}")
-print(f"Weighted-7 AUC={weighted7_auc:.6f} | GBM4 AUC={gbm4_auc:.6f} | GBM3 AUC={gbm3_auc:.6f}")
+print(f"Equal-8 AUC={equal8_auc:.6f} | Equal-7 AUC={equal7_auc:.6f} | Equal-6 AUC={equal6_auc:.6f}")
+print(f"Weighted-8 AUC={weighted8_auc:.6f} | Weighted-7 AUC={weighted7_auc:.6f}")
+print(f"GBM4 AUC={gbm4_auc:.6f} | GBM3 AUC={gbm3_auc:.6f}")
 print(f"Best blend: {best_blend} | Mean fold: {np.mean(fold_aucs):.6f} ± {np.std(fold_aucs):.6f}")
 
 best_val_roc_auc = oof_auc
