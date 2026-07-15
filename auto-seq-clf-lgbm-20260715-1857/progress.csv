@@ -1,1 +1,2 @@
 experiment_id,description,model_name,metric_name,metric_value,improved,duration_s,commit,notes
+0,"baseline: k-mer TF-IDF (3–6-mers) + LightGBM with balanced class weights — step 2 of the sequence ladder for variable-length DNA sequences (300–1000 chars, N=50k)",,macro_f1,0.506043,true,735.1,9b0cf76,
