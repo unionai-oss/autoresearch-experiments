@@ -2,7 +2,7 @@ import os
 DATA_PATH = os.environ.get("DATA_PATH", "/tmp/data")
 
 import sys
-# optuna is installed in user site-packages, not the venv — add it to path
+# optuna/xgboost/catboost are in user site-packages
 sys.path.insert(0, '/home/flyte/.local/lib/python3.13/site-packages')
 
 import pandas as pd
@@ -11,6 +11,8 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import roc_auc_score
 import lightgbm as lgb
+import xgboost as xgb
+from catboost import CatBoostClassifier
 import optuna
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -23,7 +25,7 @@ X_raw = df.drop(columns=[target_col])
 print(f"Dataset: {df.shape}, classes: {np.bincount(y)}")
 
 # ===================== Feature Engineering =====================
-CABIN_NAN_PLACEHOLDER = "B96 B98"  # The cleaned dataset uses this for missing Cabin
+CABIN_NAN_PLACEHOLDER = "B96 B98"
 
 
 def engineer_features(df):
@@ -101,7 +103,11 @@ def engineer_features(df):
     df['FamilySize_x_Pclass'] = df['FamilySize'] * df['Pclass']
     df['FareBin_x_Sex'] = df['FareBin'].astype(str) + '_' + df['Sex']
 
-    # 12. Drop raw text columns
+    # 12. Embarked interaction
+    df['Embarked'] = df['Embarked'].fillna('S')
+    df['Embarked_Pclass'] = df['Embarked'] + '_' + df['Pclass'].astype(str)
+
+    # 13. Drop raw text columns
     df = df.drop(columns=['PassengerId', 'Name', 'Ticket', 'Cabin'])
 
     return df
@@ -109,44 +115,61 @@ def engineer_features(df):
 
 X_eng = engineer_features(X_raw)
 print(f"Features after engineering: {X_eng.shape[1]}")
-print(f"Feature list: {list(X_eng.columns)}")
 
-# ===================== Preprocessing (per-fold, no leakage) =====================
+# ===================== Preprocessing =====================
 
-def preprocess(X_tr, X_va):
-    """Fit on X_tr, apply to X_va — no label leakage."""
+def preprocess_encoded(X_tr, X_va):
+    """Fit on X_tr, apply to X_va — label encode categoricals."""
     X_tr = X_tr.copy()
     X_va = X_va.copy()
 
     cat_cols = X_tr.select_dtypes(include=["object", "category"]).columns.tolist()
     num_cols = X_tr.select_dtypes(include="number").columns.tolist()
 
-    # Numeric: fill any residual NaN with fold-train median
     for col in num_cols:
         med = X_tr[col].median()
         X_tr[col] = X_tr[col].fillna(med)
         X_va[col] = X_va[col].fillna(med)
 
-    # Categorical: label-encode (fit on train, apply to val)
     for col in cat_cols:
         X_tr[col] = X_tr[col].fillna("MISSING").astype(str)
         X_va[col] = X_va[col].fillna("MISSING").astype(str)
-        le_col = LabelEncoder()
-        le_col.fit(X_tr[col])
-        known = set(le_col.classes_)
-        X_va[col] = X_va[col].apply(lambda x: x if x in known else le_col.classes_[0])
-        X_tr[col] = le_col.transform(X_tr[col])
-        X_va[col] = le_col.transform(X_va[col])
+        le = LabelEncoder()
+        le.fit(X_tr[col])
+        known = set(le.classes_)
+        X_va[col] = X_va[col].apply(lambda x: x if x in known else le.classes_[0])
+        X_tr[col] = le.transform(X_tr[col])
+        X_va[col] = le.transform(X_va[col])
 
     return X_tr, X_va, cat_cols
 
 
-# ===================== Optuna Hyperparameter Search =====================
+def preprocess_catboost(X_tr, X_va):
+    """For CatBoost: keep categoricals as strings (CatBoost handles natively)."""
+    X_tr = X_tr.copy()
+    X_va = X_va.copy()
+
+    cat_cols = X_tr.select_dtypes(include=["object", "category"]).columns.tolist()
+    num_cols = X_tr.select_dtypes(include="number").columns.tolist()
+
+    for col in num_cols:
+        med = X_tr[col].median()
+        X_tr[col] = X_tr[col].fillna(med)
+        X_va[col] = X_va[col].fillna(med)
+
+    for col in cat_cols:
+        X_tr[col] = X_tr[col].fillna("MISSING").astype(str)
+        X_va[col] = X_va[col].fillna("MISSING").astype(str)
+
+    return X_tr, X_va, cat_cols
+
+
+# ===================== Optuna for LightGBM =====================
 
 skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 
 
-def objective(trial):
+def lgb_objective(trial):
     params = {
         "objective": "binary",
         "metric": "auc",
@@ -168,16 +191,12 @@ def objective(trial):
 
     oof_preds = np.zeros(len(y))
     for tr_idx, va_idx in skf.split(X_eng, y):
-        X_tr_f, X_va_f, cat_cols = preprocess(X_eng.iloc[tr_idx], X_eng.iloc[va_idx])
+        X_tr_f, X_va_f, cat_cols = preprocess_encoded(X_eng.iloc[tr_idx], X_eng.iloc[va_idx])
         y_tr, y_va = y[tr_idx], y[va_idx]
-
         ds_tr = lgb.Dataset(X_tr_f, label=y_tr, categorical_feature=cat_cols)
         ds_va = lgb.Dataset(X_va_f, label=y_va, reference=ds_tr)
-
         model = lgb.train(
-            params,
-            ds_tr,
-            num_boost_round=2000,
+            params, ds_tr, num_boost_round=2000,
             valid_sets=[ds_va],
             callbacks=[
                 lgb.early_stopping(stopping_rounds=50, verbose=False),
@@ -189,55 +208,128 @@ def objective(trial):
     return roc_auc_score(y, oof_preds)
 
 
-study = optuna.create_study(
+print("Running LightGBM Optuna (200 trials)...")
+lgb_study = optuna.create_study(
     direction="maximize",
     sampler=optuna.samplers.TPESampler(seed=42),
     pruner=optuna.pruners.MedianPruner(n_startup_trials=20, n_warmup_steps=5),
 )
+lgb_study.optimize(lgb_objective, n_trials=200, timeout=330, show_progress_bar=False)
+lgb_best = lgb_study.best_params
+lgb_best.update({"objective": "binary", "metric": "auc", "verbosity": -1, "n_jobs": -1, "random_state": 42})
+print(f"LightGBM best AUC={lgb_study.best_value:.6f} ({len(lgb_study.trials)} trials)")
 
-# Time budget: ~8 min for Optuna, then final CV
-study.optimize(objective, n_trials=300, timeout=480, show_progress_bar=False)
 
-print(f"Optuna: best AUC={study.best_value:.6f} after {len(study.trials)} trials")
-best_params = study.best_params
-best_params.update({
-    "objective": "binary",
-    "metric": "auc",
-    "verbosity": -1,
-    "n_jobs": -1,
-    "random_state": 42,
+# ===================== Optuna for XGBoost =====================
+
+def xgb_objective(trial):
+    params = dict(
+        objective="binary:logistic",
+        eval_metric="auc",
+        verbosity=0,
+        nthread=4,
+        seed=42,
+        learning_rate=trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+        max_depth=trial.suggest_int("max_depth", 3, 10),
+        min_child_weight=trial.suggest_float("min_child_weight", 1.0, 10.0),
+        subsample=trial.suggest_float("subsample", 0.5, 1.0),
+        colsample_bytree=trial.suggest_float("colsample_bytree", 0.4, 1.0),
+        gamma=trial.suggest_float("gamma", 0.0, 5.0),
+        reg_alpha=trial.suggest_float("reg_alpha", 1e-8, 10.0, log=True),
+        reg_lambda=trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
+        n_estimators=2000,
+        early_stopping_rounds=50,
+    )
+
+    oof_preds = np.zeros(len(y))
+    for tr_idx, va_idx in skf.split(X_eng, y):
+        X_tr_f, X_va_f, _ = preprocess_encoded(X_eng.iloc[tr_idx], X_eng.iloc[va_idx])
+        y_tr, y_va = y[tr_idx], y[va_idx]
+        model = xgb.XGBClassifier(**params)
+        model.fit(X_tr_f, y_tr, eval_set=[(X_va_f, y_va)], verbose=False)
+        oof_preds[va_idx] = model.predict_proba(X_va_f)[:, 1]
+
+    return roc_auc_score(y, oof_preds)
+
+
+print("Running XGBoost Optuna (100 trials)...")
+xgb_study = optuna.create_study(
+    direction="maximize",
+    sampler=optuna.samplers.TPESampler(seed=42),
+)
+xgb_study.optimize(xgb_objective, n_trials=100, timeout=250, show_progress_bar=False)
+xgb_best = xgb_study.best_params
+xgb_best.update({
+    "objective": "binary:logistic",
+    "eval_metric": "auc",
+    "verbosity": 0,
+    "nthread": 4,
+    "seed": 42,
+    "n_estimators": 2000,
+    "early_stopping_rounds": 50,
 })
+print(f"XGBoost best AUC={xgb_study.best_value:.6f} ({len(xgb_study.trials)} trials)")
 
-# ===================== Final 5-Fold CV with best params =====================
 
-oof_preds = np.zeros(len(y))
+# ===================== Final 5-Fold CV: LGB + XGB + CatBoost Ensemble =====================
+
+oof_lgb = np.zeros(len(y))
+oof_xgb = np.zeros(len(y))
+oof_cat = np.zeros(len(y))
 fold_aucs = []
 
 for fold, (tr_idx, va_idx) in enumerate(skf.split(X_eng, y)):
-    X_tr_f, X_va_f, cat_cols = preprocess(X_eng.iloc[tr_idx], X_eng.iloc[va_idx])
     y_tr, y_va = y[tr_idx], y[va_idx]
 
-    ds_tr = lgb.Dataset(X_tr_f, label=y_tr, categorical_feature=cat_cols)
-    ds_va = lgb.Dataset(X_va_f, label=y_va, reference=ds_tr)
-
-    model = lgb.train(
-        best_params,
-        ds_tr,
-        num_boost_round=3000,
+    # --- LightGBM ---
+    X_tr_l, X_va_l, cat_cols_l = preprocess_encoded(X_eng.iloc[tr_idx], X_eng.iloc[va_idx])
+    ds_tr = lgb.Dataset(X_tr_l, label=y_tr, categorical_feature=cat_cols_l)
+    ds_va = lgb.Dataset(X_va_l, label=y_va, reference=ds_tr)
+    lgb_model = lgb.train(
+        lgb_best, ds_tr, num_boost_round=3000,
         valid_sets=[ds_va],
-        callbacks=[
-            lgb.early_stopping(stopping_rounds=100, verbose=False),
-            lgb.log_evaluation(period=0),
-        ],
+        callbacks=[lgb.early_stopping(100, verbose=False), lgb.log_evaluation(0)],
     )
+    oof_lgb[va_idx] = lgb_model.predict(X_va_l)
 
-    oof_preds[va_idx] = model.predict(X_va_f)
-    fold_auc = roc_auc_score(y_va, oof_preds[va_idx])
+    # --- XGBoost ---
+    X_tr_x, X_va_x, _ = preprocess_encoded(X_eng.iloc[tr_idx], X_eng.iloc[va_idx])
+    xgb_model = xgb.XGBClassifier(**xgb_best)
+    xgb_model.fit(X_tr_x, y_tr, eval_set=[(X_va_x, y_va)], verbose=False)
+    oof_xgb[va_idx] = xgb_model.predict_proba(X_va_x)[:, 1]
+
+    # --- CatBoost (handles categoricals natively) ---
+    X_tr_c, X_va_c, cat_cols_c = preprocess_catboost(X_eng.iloc[tr_idx], X_eng.iloc[va_idx])
+    cat_model = CatBoostClassifier(
+        iterations=2000,
+        learning_rate=0.05,
+        depth=6,
+        l2_leaf_reg=3.0,
+        random_seed=42,
+        eval_metric='AUC',
+        early_stopping_rounds=100,
+        verbose=False,
+        train_dir='/tmp/catboost_info',
+    )
+    cat_model.fit(X_tr_c, y_tr, cat_features=cat_cols_c, eval_set=(X_va_c, y_va))
+    oof_cat[va_idx] = cat_model.predict_proba(X_va_c)[:, 1]
+
+    fold_ens = (oof_lgb[va_idx] + oof_xgb[va_idx] + oof_cat[va_idx]) / 3
+    fold_auc = roc_auc_score(y_va, fold_ens)
     fold_aucs.append(fold_auc)
-    print(f"Fold {fold + 1} AUC: {fold_auc:.6f}")
+    lgb_f = roc_auc_score(y_va, oof_lgb[va_idx])
+    xgb_f = roc_auc_score(y_va, oof_xgb[va_idx])
+    cat_f = roc_auc_score(y_va, oof_cat[va_idx])
+    print(f"Fold {fold+1}: LGB={lgb_f:.4f} XGB={xgb_f:.4f} CAT={cat_f:.4f} ENS={fold_auc:.4f}")
 
-oof_auc = roc_auc_score(y, oof_preds)
-print(f"OOF AUC: {oof_auc:.6f} | Mean fold: {np.mean(fold_aucs):.6f} ± {np.std(fold_aucs):.6f}")
+oof_ensemble = (oof_lgb + oof_xgb + oof_cat) / 3
+lgb_auc = roc_auc_score(y, oof_lgb)
+xgb_auc = roc_auc_score(y, oof_xgb)
+cat_auc = roc_auc_score(y, oof_cat)
+oof_auc = roc_auc_score(y, oof_ensemble)
+
+print(f"Individual OOF: LGB={lgb_auc:.6f} XGB={xgb_auc:.6f} CAT={cat_auc:.6f}")
+print(f"Ensemble OOF AUC: {oof_auc:.6f} | Mean fold: {np.mean(fold_aucs):.6f} ± {np.std(fold_aucs):.6f}")
 
 best_val_roc_auc = oof_auc
 print(f"BEST_VAL_ROC_AUC: {best_val_roc_auc:.6f}")
