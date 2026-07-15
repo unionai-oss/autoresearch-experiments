@@ -1,1 +1,2 @@
 experiment_id,description,model_name,metric_name,metric_value,improved,duration_s,commit,notes
+0,"baseline: LightGBM with 5-fold stratified CV on Titanic (N=891) with rich feature engineering — Title from Name, Deck from Cabin, Ticket prefix, family-size features, missingness indicators, and log-Fare; ensemble of 5 fold models for robust val AUC on this small dataset.",,roc_auc,0.838801,true,3.2,f7ce7fc,
