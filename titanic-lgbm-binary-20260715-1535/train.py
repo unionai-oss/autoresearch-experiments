@@ -159,6 +159,14 @@ def engineer_features(X_raw):
     if 'Surname_size' in X.columns and 'IsWoman' in X.columns:
         X['Surname_size_x_IsWoman'] = X['Surname_size'] * X['IsWoman']
 
+    # SibSp × IsWoman (married women = higher lifeboat priority)
+    if 'SibSp' in X.columns and 'IsWoman' in X.columns:
+        X['SibSp_x_IsWoman'] = X['SibSp'] * X['IsWoman']
+
+    # Small family sweet spot (2-4 = best survival; alone or large family = worse)
+    if 'FamilySize' in X.columns:
+        X['SmallFamily'] = ((X['FamilySize'] >= 2) & (X['FamilySize'] <= 4)).astype(int)
+
     # Deck_num × Pclass
     if 'Deck_num' in X.columns and 'Pclass' in X.columns:
         X['Deck_x_Pclass'] = X['Deck_num'] * X['Pclass']
@@ -237,7 +245,7 @@ def run_cat_oof(params, X_df, cat_cols, y, skf):
     return oof
 
 
-def run_mlp_oof(X, y, skf):
+def run_mlp_oof(X, y, skf, hidden_layer_sizes=(128, 64, 32), alpha=0.01, lr=0.001, max_iter=500):
     """MLPClassifier OOF — genuinely different model family from GBMs."""
     oof = np.zeros(len(X))
     for tr_idx, vl_idx in skf.split(X, y):
@@ -245,16 +253,16 @@ def run_mlp_oof(X, y, skf):
         X_tr = scaler.fit_transform(X[tr_idx])
         X_vl = scaler.transform(X[vl_idx])
         m = MLPClassifier(
-            hidden_layer_sizes=(128, 64, 32),
+            hidden_layer_sizes=hidden_layer_sizes,
             activation='relu',
             solver='adam',
-            alpha=0.01,        # L2 regularization
+            alpha=alpha,
             batch_size=32,
-            learning_rate_init=0.001,
-            max_iter=500,
+            learning_rate_init=lr,
+            max_iter=max_iter,
             early_stopping=True,
             validation_fraction=0.15,
-            n_iter_no_change=25,
+            n_iter_no_change=30,
             random_state=42,
             tol=1e-5,
         )
@@ -341,6 +349,28 @@ cat_study.optimize(cat_objective, n_trials=20, show_progress_bar=False)
 print(f"Best CAT AUC={cat_study.best_value:.6f}, params={cat_study.best_params}")
 
 
+# --- MLP tuning ---
+def mlp_objective(trial):
+    n1 = trial.suggest_categorical('n1', [64, 128, 256])
+    n2 = trial.suggest_categorical('n2', [32, 64, 128])
+    n3 = trial.suggest_categorical('n3', [0, 16, 32, 64])
+    alpha = trial.suggest_float('alpha', 1e-4, 0.1, log=True)
+    lr = trial.suggest_float('lr', 5e-4, 5e-3, log=True)
+    sizes = (n1, n2) if n3 == 0 else (n1, n2, n3)
+    oof = run_mlp_oof(X_np, y_np, skf, hidden_layer_sizes=sizes, alpha=alpha, lr=lr, max_iter=800)
+    return roc_auc_score(y_np, oof)
+
+
+print("Tuning MLP (15 trials)...")
+mlp_study = optuna.create_study(direction='maximize',
+                                  sampler=optuna.samplers.TPESampler(seed=42))
+mlp_study.optimize(mlp_objective, n_trials=15, show_progress_bar=False)
+best_mlp_p = mlp_study.best_params
+print(f"Best MLP AUC={mlp_study.best_value:.6f}, params={best_mlp_p}")
+_n3 = best_mlp_p['n3']
+best_mlp_sizes = (best_mlp_p['n1'], best_mlp_p['n2']) if _n3 == 0 else (best_mlp_p['n1'], best_mlp_p['n2'], _n3)
+
+
 # =============================================================
 # Final OOF with best params
 # =============================================================
@@ -377,32 +407,68 @@ oof_cat = run_cat_oof(best_cat_params, X_all, cat_col_names, y_np, skf)
 cat_auc = roc_auc_score(y_np, oof_cat)
 print(f"Final CAT OOF AUC: {cat_auc:.6f}")
 
-# MLP — genuinely different model family (neural net, gradient descent)
-print("Running MLPClassifier OOF...")
-oof_mlp = run_mlp_oof(X_np, y_np, skf)
+# MLP — Optuna-tuned architecture
+print("Running Optuna-tuned MLPClassifier OOF...")
+oof_mlp = run_mlp_oof(X_np, y_np, skf,
+                       hidden_layer_sizes=best_mlp_sizes,
+                       alpha=best_mlp_p['alpha'],
+                       lr=best_mlp_p['lr'],
+                       max_iter=800)
 mlp_auc = roc_auc_score(y_np, oof_mlp)
-print(f"Final MLP OOF AUC: {mlp_auc:.6f}")
+print(f"Final MLP OOF AUC: {mlp_auc:.6f} (architecture={best_mlp_sizes})")
 
 # =============================================================
-# Rank-based ensemble (normalises score distributions)
-# 4-model blend: LGB + XGB + CatBoost + MLP
+# Rank-normalize all OOF predictions
 # =============================================================
 oof_lgb_r = rankdata(oof_lgb) / len(oof_lgb)
 oof_xgb_r = rankdata(oof_xgb) / len(oof_xgb)
 oof_cat_r = rankdata(oof_cat) / len(oof_cat)
 oof_mlp_r = rankdata(oof_mlp) / len(oof_mlp)
 
-# Equal-weight blend across 4 models
+# Equal-weight blend across 4 models (baseline)
 oof_ensemble = (oof_lgb_r + oof_xgb_r + oof_cat_r + oof_mlp_r) / 4.0
 ensemble_auc = roc_auc_score(y_np, oof_ensemble)
 
-# Also try 3-model GBM-only to see if MLP helps
+# GBM-only 3-model ensemble
 oof_gbm_only = (oof_lgb_r + oof_xgb_r + oof_cat_r) / 3.0
 gbm_auc = roc_auc_score(y_np, oof_gbm_only)
 
 print(f"\nIndividual OOF AUCs: LGB={lgb_auc:.6f}, XGB={xgb_auc:.6f}, CAT={cat_auc:.6f}, MLP={mlp_auc:.6f}")
 print(f"GBM-only ensemble AUC: {gbm_auc:.6f}")
-print(f"4-model ensemble AUC (LGB+XGB+CAT+MLP): {ensemble_auc:.6f}")
+print(f"4-model equal-weight ensemble AUC: {ensemble_auc:.6f}")
 
-best_auc = max(ensemble_auc, gbm_auc)
+# =============================================================
+# Optuna-optimize ensemble weights (300 trials)
+# Fit w_lgb, w_xgb, w_cat, w_mlp to maximize AUC on OOF preds
+# OOF are honest (each sample predicted without seeing its label)
+# =============================================================
+print("\nOptimizing ensemble weights with Optuna (300 trials)...")
+
+def ensemble_weight_objective(trial):
+    w1 = trial.suggest_float('w_lgb', 0.1, 1.0)
+    w2 = trial.suggest_float('w_xgb', 0.1, 1.0)
+    w3 = trial.suggest_float('w_cat', 0.1, 1.0)
+    w4 = trial.suggest_float('w_mlp', 0.0, 0.6)
+    total = w1 + w2 + w3 + w4
+    oof_blend = (w1 * oof_lgb_r + w2 * oof_xgb_r + w3 * oof_cat_r + w4 * oof_mlp_r) / total
+    return roc_auc_score(y_np, oof_blend)
+
+weight_study = optuna.create_study(direction='maximize',
+                                    sampler=optuna.samplers.TPESampler(seed=42))
+weight_study.optimize(ensemble_weight_objective, n_trials=300, show_progress_bar=False)
+
+bw = weight_study.best_params
+total_w = bw['w_lgb'] + bw['w_xgb'] + bw['w_cat'] + bw['w_mlp']
+oof_optuna_w = (
+    bw['w_lgb'] * oof_lgb_r +
+    bw['w_xgb'] * oof_xgb_r +
+    bw['w_cat'] * oof_cat_r +
+    bw['w_mlp'] * oof_mlp_r
+) / total_w
+optuna_weighted_auc = roc_auc_score(y_np, oof_optuna_w)
+print(f"Optuna-weighted ensemble AUC: {optuna_weighted_auc:.6f}")
+norm_weights = {k: round(v / total_w, 3) for k, v in bw.items()}
+print(f"Normalized weights: {norm_weights}")
+
+best_auc = max(ensemble_auc, gbm_auc, optuna_weighted_auc)
 print(f"BEST_VAL_ROC_AUC: {best_auc:.6f}")
