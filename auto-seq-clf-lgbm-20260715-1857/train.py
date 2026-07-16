@@ -382,18 +382,74 @@ print(f"[CNN] Val macro_f1: {cnn_f1:.4f}, per-class: {cnn_per_class}")
 
 # ── k-mer TF-IDF + LightGBM complement ─────────────────────────────────────────
 # LGBM captures global k-mer composition (complementary to CNN's positional motifs)
-# Using (3,4)-mers to keep feature count manageable and avoid timeout
-print("\n[LGBM] Training k-mer TF-IDF + LightGBM complement...")
+# Reduced max_features and n_estimators to avoid timeout
+print("\n[LGBM] Training k-mer TF-IDF + LightGBM complement (upgraded)...")
+
+from scipy.sparse import hstack, csr_matrix
+
+def compute_bio_features(seqs):
+    """Compute biological sequence features: mononucleotides, dinucleotides, GC%, CpG ratio, length."""
+    BASES = [65, 84, 71, 67]  # A, T, G, C (ASCII)
+    results = []
+    for seq in seqs:
+        s = np.frombuffer(seq.upper().encode(), dtype=np.uint8)
+        n = len(s)
+        a = int(np.sum(s == 65))
+        t = int(np.sum(s == 84))
+        g = int(np.sum(s == 71))
+        c = int(np.sum(s == 67))
+        total = max(a + t + g + c, 1)
+
+        # Mononucleotide frequencies
+        f_a = a / n
+        f_t = t / n
+        f_g = g / n
+        f_c = c / n
+        gc  = (g + c) / n
+        at  = (a + t) / n
+        pur = (a + g) / n   # purine fraction
+
+        # Length (normalized to 1000)
+        len_norm = n / 1000.0
+
+        # Dinucleotide frequencies (16 features)
+        dinuc_feats = []
+        if n > 1:
+            for b1 in BASES:
+                for b2 in BASES:
+                    cnt = int(np.sum((s[:-1] == b1) & (s[1:] == b2)))
+                    dinuc_feats.append(cnt / (n - 1))
+        else:
+            dinuc_feats = [0.0] * 16
+
+        # CpG ratio (observed CG / expected CG)
+        cpg_obs = dinuc_feats[BASES.index(67) * 4 + BASES.index(71)] if n > 1 else 0.0
+        cpg_exp = f_c * f_g
+        cpg_ratio = cpg_obs / max(cpg_exp, 1e-10)
+
+        feat = [f_a, f_t, f_g, f_c, gc, at, pur, len_norm, cpg_ratio] + dinuc_feats
+        results.append(feat)
+    return np.array(results, dtype=np.float32)
+
+print("[LGBM] Computing biological features...")
+X_train_bio = compute_bio_features(train_seqs)
+X_val_bio   = compute_bio_features(val_seqs)
+print(f"[LGBM] Bio features: {X_train_bio.shape[1]} features")
 
 vectorizer = TfidfVectorizer(
     analyzer='char',
-    ngram_range=(3, 4),
-    max_features=5000,
+    ngram_range=(3, 5),
+    max_features=3000,
     sublinear_tf=True,
 )
 X_train_kmer = vectorizer.fit_transform(train_seqs)
 X_val_kmer   = vectorizer.transform(val_seqs)
-print(f"[LGBM] Feature matrix: train {X_train_kmer.shape}, val {X_val_kmer.shape}")
+print(f"[LGBM] k-mer features: train {X_train_kmer.shape}, val {X_val_kmer.shape}")
+
+# Combine k-mer TF-IDF + biological features
+X_train_all = hstack([X_train_kmer, csr_matrix(X_train_bio)])
+X_val_all   = hstack([X_val_kmer,   csr_matrix(X_val_bio)])
+print(f"[LGBM] Combined features: train {X_train_all.shape}, val {X_val_all.shape}")
 
 # Class weights: compensate for 21x imbalance (class 2 has ~1143 samples)
 counts_arr = np.array([train_dist[c] for c in range(num_classes)], dtype=np.float64)
@@ -403,7 +459,7 @@ print(f"[LGBM] Class weights: {lgbm_cw}")
 
 lgbm_model = lgb.LGBMClassifier(
     n_estimators=200,
-    learning_rate=0.1,
+    learning_rate=0.05,
     num_leaves=31,
     min_child_samples=10,
     class_weight=lgbm_cw,
@@ -413,9 +469,9 @@ lgbm_model = lgb.LGBMClassifier(
     random_state=42,
     verbose=-1,
 )
-lgbm_model.fit(X_train_kmer, train_labels)
+lgbm_model.fit(X_train_all, train_labels)
 
-lgbm_probs_np = lgbm_model.predict_proba(X_val_kmer)
+lgbm_probs_np = lgbm_model.predict_proba(X_val_all)
 lgbm_probs    = torch.tensor(lgbm_probs_np, dtype=torch.float32)
 
 lgbm_preds = lgbm_probs.argmax(1).numpy()
@@ -423,7 +479,7 @@ lgbm_f1    = f1_score(val_labels, lgbm_preds, average='macro')
 lgbm_pc    = f1_score(val_labels, lgbm_preds, average=None)
 print(f"[LGBM] Val macro_f1: {lgbm_f1:.4f}, per-class: {lgbm_pc}")
 
-# ── Heterogeneous ensemble: CNN (positional motifs) + LGBM (global k-mer stats) ─
+# ── Heterogeneous ensemble: CNN (positional motifs) + LGBM (global k-mer + bio stats) ─
 # Fixed 70/30 weighting: CNN is stronger overall but LGBM provides complementary signal
 CNN_WEIGHT  = 0.70
 LGBM_WEIGHT = 0.30
