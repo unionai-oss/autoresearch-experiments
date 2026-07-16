@@ -7,7 +7,10 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import f1_score
+from sklearn.feature_extraction.text import TfidfVectorizer
 from collections import Counter
+
+import lightgbm as lgb
 
 import torch
 import torch.nn as nn
@@ -351,29 +354,84 @@ def get_softmax_probs(model, loader):
     return torch.cat(all_probs, dim=0)
 
 
-# ── Ensemble training ──────────────────────────────────────────────────────────
+# ── Ensemble CNN training ───────────────────────────────────────────────────────
 best_states = []
 for seed in ENSEMBLE_SEEDS:
     print(f"\n[ENSEMBLE] Training model with seed={seed}")
     state = train_one_model(seed)
     best_states.append(state)
 
-# ── Inference: ensemble (2 models) × TTA (fwd + RC) = 4 predictions averaged ─
+# ── CNN Inference: 2 seeds × TTA (fwd + RC) = 4 predictions averaged ──────────
 inference_model = DNACNNv3(num_classes=num_classes).to(device)
-all_probs = []
+all_cnn_probs = []
 
 for i, state in enumerate(best_states):
     inference_model.load_state_dict(state)
     probs_fwd = get_softmax_probs(inference_model, val_loader)
     probs_rc  = get_softmax_probs(inference_model, val_loader_rc)
     model_probs = (probs_fwd + probs_rc) / 2
-    all_probs.append(model_probs)
-    print(f"[INFERENCE] Model {i+1}/{len(best_states)} done")
+    all_cnn_probs.append(model_probs)
+    print(f"[INFERENCE] CNN model {i+1}/{len(best_states)} done")
 
-ensemble_probs = sum(all_probs) / len(all_probs)
-preds = ensemble_probs.argmax(1).numpy()
+cnn_ensemble_probs = sum(all_cnn_probs) / len(all_cnn_probs)
+
+cnn_preds = cnn_ensemble_probs.argmax(1).numpy()
+cnn_f1 = f1_score(val_labels, cnn_preds, average='macro')
+cnn_per_class = f1_score(val_labels, cnn_preds, average=None)
+print(f"[CNN] Val macro_f1: {cnn_f1:.4f}, per-class: {cnn_per_class}")
+
+# ── k-mer TF-IDF + LightGBM complement ─────────────────────────────────────────
+# LGBM captures global k-mer composition (complementary to CNN's positional motifs)
+# Using (3,4)-mers to keep feature count manageable and avoid timeout
+print("\n[LGBM] Training k-mer TF-IDF + LightGBM complement...")
+
+vectorizer = TfidfVectorizer(
+    analyzer='char',
+    ngram_range=(3, 4),
+    max_features=5000,
+    sublinear_tf=True,
+)
+X_train_kmer = vectorizer.fit_transform(train_seqs)
+X_val_kmer   = vectorizer.transform(val_seqs)
+print(f"[LGBM] Feature matrix: train {X_train_kmer.shape}, val {X_val_kmer.shape}")
+
+# Class weights: compensate for 21x imbalance (class 2 has ~1143 samples)
+counts_arr = np.array([train_dist[c] for c in range(num_classes)], dtype=np.float64)
+max_count = counts_arr.max()
+lgbm_cw = {c: max_count / counts_arr[c] for c in range(num_classes)}
+print(f"[LGBM] Class weights: {lgbm_cw}")
+
+lgbm_model = lgb.LGBMClassifier(
+    n_estimators=200,
+    learning_rate=0.1,
+    num_leaves=31,
+    min_child_samples=10,
+    class_weight=lgbm_cw,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    n_jobs=4,
+    random_state=42,
+    verbose=-1,
+)
+lgbm_model.fit(X_train_kmer, train_labels)
+
+lgbm_probs_np = lgbm_model.predict_proba(X_val_kmer)
+lgbm_probs    = torch.tensor(lgbm_probs_np, dtype=torch.float32)
+
+lgbm_preds = lgbm_probs.argmax(1).numpy()
+lgbm_f1    = f1_score(val_labels, lgbm_preds, average='macro')
+lgbm_pc    = f1_score(val_labels, lgbm_preds, average=None)
+print(f"[LGBM] Val macro_f1: {lgbm_f1:.4f}, per-class: {lgbm_pc}")
+
+# ── Heterogeneous ensemble: CNN (positional motifs) + LGBM (global k-mer stats) ─
+# Fixed 70/30 weighting: CNN is stronger overall but LGBM provides complementary signal
+CNN_WEIGHT  = 0.70
+LGBM_WEIGHT = 0.30
+
+combined_probs = CNN_WEIGHT * cnn_ensemble_probs + LGBM_WEIGHT * lgbm_probs
+preds          = combined_probs.argmax(1).numpy()
 
 macro_f1  = f1_score(val_labels, preds, average='macro')
 per_class = f1_score(val_labels, preds, average=None)
-print(f"[EVAL] Per-class F1 (ensemble+TTA): {per_class}")
+print(f"[EVAL] Per-class F1 (CNN+LGBM ensemble+TTA): {per_class}")
 print(f"BEST_VAL_MACRO_F1: {macro_f1:.6f}")
