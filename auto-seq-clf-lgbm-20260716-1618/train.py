@@ -43,7 +43,6 @@ train_seqs, val_seqs, train_labels, val_labels = train_test_split(
     stratify=labels
 )
 
-# Class distribution in full dataset
 num_classes = len(le.classes_)
 class_counts = df[target_col].value_counts().sort_index().to_dict()
 print(
@@ -53,41 +52,45 @@ print(
     f"Class distribution: {class_counts}"
 )
 
-# ── Feature extraction: char n-gram TF-IDF (3–4) ──────────────────────────────
-print("[FEAT] Fitting TF-IDF vectorizer (char_wb ngram 3-4, max_features=50k)...")
-tfidf = TfidfVectorizer(
+y_train = np.array(train_labels)
+y_val = np.array(val_labels)
+
+# Use fewer features and simpler ngram range to avoid timeout
+print("[FEAT] Fitting char_wb TF-IDF (3-5 gram, 50k features)...")
+char_tfidf = TfidfVectorizer(
     analyzer="char_wb",
-    ngram_range=(3, 4),
+    ngram_range=(3, 5),
     max_features=50_000,
     sublinear_tf=True,
     min_df=2,
 )
-X_train = tfidf.fit_transform(train_seqs)
-X_val = tfidf.transform(val_seqs)
+
+X_train = char_tfidf.fit_transform(train_seqs)
+X_val = char_tfidf.transform(val_seqs)
 print(f"[FEAT] Feature matrix: train={X_train.shape}, val={X_val.shape}")
 
-y_train = np.array(train_labels)
-y_val = np.array(val_labels)
-
-# ── Class-balanced sample weights ─────────────────────────────────────────────
-class_sample_counts = np.bincount(y_train)
-class_weights = len(y_train) / (num_classes * class_sample_counts)
+# Inverse-frequency sample weights
+train_class_counts = np.bincount(y_train)
+class_weights = 1.0 / train_class_counts.astype(float)
+# Normalize so weights sum to num_classes (mean weight = 1)
+class_weights = class_weights / class_weights.mean()
 sample_weights = class_weights[y_train]
-print(f"[MODEL] Class weights per class: {class_weights}")
+print(f"[DATA] Class counts (train): {train_class_counts}")
+print(f"[DATA] Normalized class weights: {class_weights}")
 
-# ── LightGBM ───────────────────────────────────────────────────────────────────
+# LightGBM with faster hyperparameters to avoid timeout
 lgb_train = lgb.Dataset(X_train, label=y_train, weight=sample_weights)
 lgb_val = lgb.Dataset(X_val, label=y_val, reference=lgb_train)
 
 params = {
     "objective": "multiclass",
     "num_class": num_classes,
-    "metric": "multi_logloss",
+    "metric": "None",
     "learning_rate": 0.1,
     "num_leaves": 63,
-    "max_depth": 7,
+    "max_depth": -1,
     "min_child_samples": 20,
-    "feature_fraction": 0.5,
+    "feature_fraction": 0.3,
     "bagging_fraction": 0.8,
     "bagging_freq": 5,
     "reg_alpha": 0.1,
@@ -97,21 +100,31 @@ params = {
     "verbose": -1,
 }
 
+# Custom macro F1 metric
+def macro_f1_metric(y_pred, data):
+    y_true = data.get_label().astype(int)
+    n = len(y_true)
+    proba = y_pred.reshape(n, num_classes)
+    y_pred_cls = np.argmax(proba, axis=1)
+    score = f1_score(y_true, y_pred_cls, average="macro")
+    return "macro_f1", score, True  # True = higher is better
+
 callbacks = [
     lgb.early_stopping(stopping_rounds=20, verbose=True),
-    lgb.log_evaluation(period=20),
+    lgb.log_evaluation(period=50),
 ]
 
-print("[MODEL] Training LightGBM...")
+print("[MODEL] Training LightGBM (num_leaves=63, min_child_samples=20, lr=0.1, 300 rounds)...")
 model = lgb.train(
     params,
     lgb_train,
     num_boost_round=300,
     valid_sets=[lgb_val],
+    feval=macro_f1_metric,
     callbacks=callbacks,
 )
 
-# ── Evaluation ─────────────────────────────────────────────────────────────────
+# Evaluation
 y_pred_proba = model.predict(X_val)
 y_pred = np.argmax(y_pred_proba, axis=1)
 
