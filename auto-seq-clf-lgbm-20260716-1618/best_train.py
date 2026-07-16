@@ -9,11 +9,12 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import f1_score
 import lightgbm as lgb
 
+# =====================
+# Load and prepare data
+# =====================
 df = pd.read_parquet(DATA_PATH)
-
 target_col = "label"
 
-# Detect sequence column: non-target string/object column
 seq_col = None
 for col in df.columns:
     if col == target_col:
@@ -21,116 +22,216 @@ for col in df.columns:
     if pd.api.types.is_string_dtype(df[col]) or df[col].dtype == object:
         seq_col = col
         break
-
 if seq_col is None:
-    raise ValueError("Could not detect a sequence (string) column in the dataset.")
+    raise ValueError("Could not detect a sequence (string) column.")
 
-# Encode labels to 0-based integers
 le = LabelEncoder()
 df[target_col] = le.fit_transform(df[target_col])
-class_mapping = {cls: idx for idx, cls in enumerate(le.classes_)}
-print(f"[DATA] Class mapping: {class_mapping}")
+print(f"[DATA] Class mapping: {dict(zip(le.classes_, range(len(le.classes_))))}")
 
 labels = df[target_col].tolist()
 sequences = df[seq_col].tolist()
 
-# Stratified 80/20 split
 train_seqs, val_seqs, train_labels, val_labels = train_test_split(
-    sequences,
-    labels,
-    test_size=0.2,
-    random_state=42,
-    stratify=labels
+    sequences, labels, test_size=0.2, random_state=42, stratify=labels
 )
 
 num_classes = len(le.classes_)
-class_counts = df[target_col].value_counts().sort_index().to_dict()
-print(
-    f"[DATA] Total samples: {len(df)}, "
-    f"Train: {len(train_seqs)}, Val: {len(val_seqs)}, "
-    f"Classes: {num_classes}, "
-    f"Class distribution: {class_counts}"
-)
-
 y_train = np.array(train_labels)
 y_val = np.array(val_labels)
+train_class_counts = np.bincount(y_train)
+val_class_counts = np.bincount(y_val)
+print(f"[DATA] Train={len(y_train)}, Val={len(y_val)}, Classes={num_classes}")
+print(f"[DATA] Train class counts: {train_class_counts}")
+print(f"[DATA] Val class counts: {val_class_counts}")
 
-# Use fewer features and simpler ngram range to avoid timeout
-print("[FEAT] Fitting char_wb TF-IDF (3-5 gram, 50k features)...")
-char_tfidf = TfidfVectorizer(
+# =====================
+# Feature Extraction: char_wb TF-IDF (3-5, 50k) — reduced for speed
+# =====================
+print("\n[FEAT] Fitting char_wb TF-IDF (ngram 3-5, 50k features)...")
+tfidf = TfidfVectorizer(
     analyzer="char_wb",
     ngram_range=(3, 5),
     max_features=50_000,
     sublinear_tf=True,
-    min_df=2,
 )
+X_train = tfidf.fit_transform(train_seqs)
+X_val = tfidf.transform(val_seqs)
+print(f"[FEAT] Shape: train={X_train.shape}, val={X_val.shape}")
 
-X_train = char_tfidf.fit_transform(train_seqs)
-X_val = char_tfidf.transform(val_seqs)
-print(f"[FEAT] Feature matrix: train={X_train.shape}, val={X_val.shape}")
+# =====================
+# Inverse-frequency sample weights (for multiclass model)
+# =====================
+total_train = len(y_train)
+inv_weights = np.array([
+    total_train / (num_classes * train_class_counts[c]) for c in y_train
+])
+print(f"[MC] Sample weight range: [{inv_weights.min():.3f}, {inv_weights.max():.3f}]")
 
-# Inverse-frequency sample weights
-train_class_counts = np.bincount(y_train)
-class_weights = 1.0 / train_class_counts.astype(float)
-# Normalize so weights sum to num_classes (mean weight = 1)
-class_weights = class_weights / class_weights.mean()
-sample_weights = class_weights[y_train]
-print(f"[DATA] Class counts (train): {train_class_counts}")
-print(f"[DATA] Normalized class weights: {class_weights}")
+# =====================
+# Model A: Multiclass LightGBM (reduced complexity for speed)
+# =====================
+print("\n[MODEL A] Multiclass LightGBM...")
 
-# LightGBM with faster hyperparameters to avoid timeout
-lgb_train = lgb.Dataset(X_train, label=y_train, weight=sample_weights)
-lgb_val = lgb.Dataset(X_val, label=y_val, reference=lgb_train)
+def macro_f1_eval(y_pred, dataset):
+    y_true = dataset.get_label().astype(int)
+    y_pred_class = np.argmax(y_pred.reshape(-1, num_classes), axis=1)
+    return "macro_f1", f1_score(y_true, y_pred_class, average="macro"), True
 
-params = {
+params_mc = {
     "objective": "multiclass",
     "num_class": num_classes,
     "metric": "None",
     "learning_rate": 0.1,
     "num_leaves": 63,
-    "max_depth": -1,
     "min_child_samples": 20,
-    "feature_fraction": 0.3,
+    "feature_fraction": 0.5,
     "bagging_fraction": 0.8,
-    "bagging_freq": 5,
-    "reg_alpha": 0.1,
-    "reg_lambda": 0.1,
+    "bagging_freq": 1,
     "n_jobs": -1,
-    "seed": 42,
     "verbose": -1,
+    "seed": 42,
 }
 
-# Custom macro F1 metric
-def macro_f1_metric(y_pred, data):
-    y_true = data.get_label().astype(int)
-    n = len(y_true)
-    proba = y_pred.reshape(n, num_classes)
-    y_pred_cls = np.argmax(proba, axis=1)
-    score = f1_score(y_true, y_pred_cls, average="macro")
-    return "macro_f1", score, True  # True = higher is better
+train_mc = lgb.Dataset(X_train, label=y_train, weight=inv_weights)
+val_mc = lgb.Dataset(X_val, label=y_val, reference=train_mc)
 
-callbacks = [
-    lgb.early_stopping(stopping_rounds=20, verbose=True),
-    lgb.log_evaluation(period=50),
-]
-
-print("[MODEL] Training LightGBM (num_leaves=63, min_child_samples=20, lr=0.1, 300 rounds)...")
-model = lgb.train(
-    params,
-    lgb_train,
+model_mc = lgb.train(
+    params_mc, train_mc,
     num_boost_round=300,
-    valid_sets=[lgb_val],
-    feval=macro_f1_metric,
-    callbacks=callbacks,
+    valid_sets=[val_mc],
+    feval=macro_f1_eval,
+    callbacks=[
+        lgb.early_stopping(stopping_rounds=20, verbose=True),
+        lgb.log_evaluation(period=50),
+    ],
 )
+mc_proba = model_mc.predict(X_val)  # shape [N, 3]
+y_pred_mc = np.argmax(mc_proba, axis=1)
+f1_mc = f1_score(y_val, y_pred_mc, average="macro")
+print(f"[MODEL A] macro_f1={f1_mc:.6f}, per-class={f1_score(y_val, y_pred_mc, average=None)}")
 
-# Evaluation
-y_pred_proba = model.predict(X_val)
-y_pred = np.argmax(y_pred_proba, axis=1)
+# =====================
+# Model B: Binary LightGBM — class 2 vs rest (two-stage: stage 1)
+# =====================
+print("\n[MODEL B] Binary LightGBM (class 2 vs rest)...")
+y_s1_train = (y_train == 2).astype(float)
+y_s1_val = (y_val == 2).astype(float)
+class_ratio = float((y_train != 2).sum()) / float((y_train == 2).sum())
+print(f"[MODEL B] scale_pos_weight={class_ratio:.2f} (minority=class2)")
+
+def binary_f1_eval(y_pred, dataset):
+    y_true = dataset.get_label().astype(int)
+    y_pred_class = (y_pred > 0.5).astype(int)
+    return "binary_f1", f1_score(y_true, y_pred_class, average="binary"), True
+
+params_s1 = {
+    "objective": "binary",
+    "metric": "None",
+    "learning_rate": 0.1,
+    "num_leaves": 63,
+    "min_child_samples": 20,
+    "feature_fraction": 0.5,
+    "bagging_fraction": 0.8,
+    "bagging_freq": 1,
+    "scale_pos_weight": class_ratio,
+    "n_jobs": -1,
+    "verbose": -1,
+    "seed": 42,
+}
+
+train_s1 = lgb.Dataset(X_train, label=y_s1_train)
+val_s1 = lgb.Dataset(X_val, label=y_s1_val, reference=train_s1)
+
+model_s1 = lgb.train(
+    params_s1, train_s1,
+    num_boost_round=300,
+    valid_sets=[val_s1],
+    feval=binary_f1_eval,
+    callbacks=[
+        lgb.early_stopping(stopping_rounds=20, verbose=True),
+        lgb.log_evaluation(period=50),
+    ],
+)
+p2_val = model_s1.predict(X_val)  # P(class == 2)
+c2_f1 = f1_score(y_s1_val, (p2_val > 0.5).astype(int), average="binary")
+print(f"[MODEL B] Class-2 binary F1={c2_f1:.6f}")
+
+# =====================
+# Model C: Binary LightGBM — class 0 vs class 1 (two-stage: stage 2)
+# =====================
+print("\n[MODEL C] Binary LightGBM (class 0 vs class 1 only)...")
+mask_01_train = (y_train != 2)
+X_train_01 = X_train[mask_01_train]
+y_train_01 = y_train[mask_01_train].astype(float)  # 0.0 or 1.0
+
+mask_01_val = (y_val != 2)
+X_val_01 = X_val[mask_01_val]
+y_val_01 = y_val[mask_01_val].astype(float)
+
+print(f"[MODEL C] Train class01 shape={X_train_01.shape}, counts={np.bincount(y_train_01.astype(int))}")
+
+params_s2 = {
+    "objective": "binary",
+    "metric": "binary_logloss",
+    "learning_rate": 0.1,
+    "num_leaves": 63,
+    "min_child_samples": 20,
+    "feature_fraction": 0.5,
+    "bagging_fraction": 0.8,
+    "bagging_freq": 1,
+    "n_jobs": -1,
+    "verbose": -1,
+    "seed": 42,
+}
+
+train_s2 = lgb.Dataset(X_train_01, label=y_train_01)
+val_s2 = lgb.Dataset(X_val_01, label=y_val_01, reference=train_s2)
+
+model_s2 = lgb.train(
+    params_s2, train_s2,
+    num_boost_round=300,
+    valid_sets=[val_s2],
+    callbacks=[
+        lgb.early_stopping(stopping_rounds=20, verbose=True),
+        lgb.log_evaluation(period=50),
+    ],
+)
+# Predict on ALL val samples — P(class == 1 | not class 2)
+p1_given_not2 = model_s2.predict(X_val)
+
+# Evaluate on class-0/1 val subset
+y_pred_s2 = (model_s2.predict(X_val_01) > 0.5).astype(int)
+acc_s2 = (y_pred_s2 == y_val_01.astype(int)).mean()
+print(f"[MODEL C] class-0/1 accuracy={acc_s2:.6f}")
+
+# =====================
+# Hierarchical combination (two-stage decomposition)
+# =====================
+hier_proba = np.column_stack([
+    (1.0 - p2_val) * (1.0 - p1_given_not2),  # P(class 0)
+    (1.0 - p2_val) * p1_given_not2,            # P(class 1)
+    p2_val,                                      # P(class 2)
+])
+
+y_pred_hier = np.argmax(hier_proba, axis=1)
+f1_hier = f1_score(y_val, y_pred_hier, average="macro")
+print(f"\n[HIER] macro_f1={f1_hier:.6f}, per-class={f1_score(y_val, y_pred_hier, average=None)}")
+
+# =====================
+# Blend: 50% multiclass (Model A) + 50% hierarchical (Models B+C)
+# =====================
+mc_norm = mc_proba / mc_proba.sum(axis=1, keepdims=True)
+hier_norm = hier_proba / hier_proba.sum(axis=1, keepdims=True)
+
+blended_proba = 0.5 * mc_norm + 0.5 * hier_norm
+y_pred = np.argmax(blended_proba, axis=1)
 
 macro_f1 = f1_score(y_val, y_pred, average="macro")
 per_class_f1 = f1_score(y_val, y_pred, average=None)
-print(f"[EVAL] Per-class F1: {per_class_f1}")
-print(f"[EVAL] Val macro F1: {macro_f1:.6f}")
+print(f"\n[EVAL] Model A (multiclass) macro_f1: {f1_mc:.6f}")
+print(f"[EVAL] Hierarchical (B+C) macro_f1: {f1_hier:.6f}")
+print(f"[EVAL] Blend 50/50 per-class F1: {per_class_f1}")
+print(f"[EVAL] Blend macro_f1: {macro_f1:.6f}")
 
 print(f"BEST_VAL_MACRO_F1: {macro_f1:.6f}")
