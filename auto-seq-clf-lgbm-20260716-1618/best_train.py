@@ -46,13 +46,13 @@ print(f"[DATA] Train class counts: {train_class_counts}")
 print(f"[DATA] Val class counts: {val_class_counts}")
 
 # =====================
-# Feature Extraction: char_wb TF-IDF (3-5, 50k features) — faster
+# Feature Extraction: char_wb TF-IDF (3-5, 100k features) — reduced for speed
 # =====================
-print("\n[FEAT] Fitting char_wb TF-IDF (ngram 3-5, 50k features)...")
+print("\n[FEAT] Fitting char_wb TF-IDF (ngram 3-5, 100k features)...")
 tfidf = TfidfVectorizer(
     analyzer="char_wb",
     ngram_range=(3, 5),
-    max_features=50_000,
+    max_features=100000,
     sublinear_tf=True,
 )
 X_train = tfidf.fit_transform(train_seqs)
@@ -68,16 +68,15 @@ inv_weights = np.array([
 ])
 print(f"[MC] Sample weight range: [{inv_weights.min():.3f}, {inv_weights.max():.3f}]")
 
-# =====================
-# Custom macro F1 metric for early stopping
-# =====================
+
 def macro_f1_eval(y_pred, dataset):
     y_true = dataset.get_label().astype(int)
     y_pred_class = np.argmax(y_pred.reshape(-1, num_classes), axis=1)
     return "macro_f1", f1_score(y_true, y_pred_class, average="macro"), True
 
+
 # =====================
-# Model A: Multiclass LightGBM — reduced complexity to avoid timeout
+# Model A: Multiclass LightGBM — reduced complexity for speed
 # =====================
 print("\n[MODEL A] Multiclass LightGBM (num_leaves=63, lr=0.1, min_child_samples=20)...")
 
@@ -109,25 +108,29 @@ model_mc = lgb.train(
         lgb.log_evaluation(period=50),
     ],
 )
-mc_proba = model_mc.predict(X_val)  # shape [N, 3]
+mc_proba = model_mc.predict(X_val)
 y_pred_mc = np.argmax(mc_proba, axis=1)
 f1_mc = f1_score(y_val, y_pred_mc, average="macro")
 print(f"[MODEL A] macro_f1={f1_mc:.6f}, per-class={f1_score(y_val, y_pred_mc, average=None)}")
 
 # =====================
-# Model B: Binary LightGBM — class 2 vs rest (two-stage: stage 1)
+# Model B: Binary class-2 vs rest
 # =====================
-print("\n[MODEL B] Binary LightGBM (class 2 vs rest, num_leaves=63)...")
 y_s1_train = (y_train == 2).astype(float)
 y_s1_val = (y_val == 2).astype(float)
 class_ratio = float((y_train != 2).sum()) / float((y_train == 2).sum())
-print(f"[MODEL B] scale_pos_weight={class_ratio:.2f} (minority=class2)")
+spw_boost = 2.0
+boosted_spw = class_ratio * spw_boost
+print(f"\n[BINARY] class_ratio={class_ratio:.2f}, scale_pos_weight={boosted_spw:.2f} (boost={spw_boost}x)")
+
 
 def binary_f1_eval(y_pred, dataset):
     y_true = dataset.get_label().astype(int)
     y_pred_class = (y_pred > 0.5).astype(int)
     return "binary_f1", f1_score(y_true, y_pred_class, average="binary"), True
 
+
+print("\n[MODEL B] Binary LightGBM class-2-vs-rest (num_leaves=63, lr=0.1, min_child_samples=20)...")
 params_s1 = {
     "objective": "binary",
     "metric": "None",
@@ -137,7 +140,7 @@ params_s1 = {
     "feature_fraction": 0.5,
     "bagging_fraction": 0.8,
     "bagging_freq": 1,
-    "scale_pos_weight": class_ratio,
+    "scale_pos_weight": boosted_spw,
     "n_jobs": -1,
     "verbose": -1,
     "seed": 42,
@@ -156,17 +159,18 @@ model_s1 = lgb.train(
         lgb.log_evaluation(period=50),
     ],
 )
-p2_val = model_s1.predict(X_val)  # P(class == 2)
+p2_val = model_s1.predict(X_val)
 c2_f1 = f1_score(y_s1_val, (p2_val > 0.5).astype(int), average="binary")
 print(f"[MODEL B] Class-2 binary F1={c2_f1:.6f}")
+print(f"[MODEL B] Class-2 predicted positives: {(p2_val > 0.5).sum()} / {len(p2_val)}")
 
 # =====================
-# Model C: Binary LightGBM — class 0 vs class 1 (two-stage: stage 2)
+# Model C: Binary class-0 vs class-1
 # =====================
-print("\n[MODEL C] Binary LightGBM (class 0 vs class 1 only, num_leaves=63)...")
+print("\n[MODEL C] Binary LightGBM (class 0 vs class 1 only)...")
 mask_01_train = (y_train != 2)
 X_train_01 = X_train[mask_01_train]
-y_train_01 = y_train[mask_01_train].astype(float)  # 0.0 or 1.0
+y_train_01 = y_train[mask_01_train].astype(float)
 
 mask_01_val = (y_val != 2)
 X_val_01 = X_val[mask_01_val]
@@ -179,7 +183,7 @@ params_s2 = {
     "metric": "binary_logloss",
     "learning_rate": 0.1,
     "num_leaves": 63,
-    "min_child_samples": 10,
+    "min_child_samples": 20,
     "feature_fraction": 0.5,
     "bagging_fraction": 0.8,
     "bagging_freq": 1,
@@ -200,10 +204,8 @@ model_s2 = lgb.train(
         lgb.log_evaluation(period=50),
     ],
 )
-# Predict on ALL val samples — P(class == 1 | not class 2)
 p1_given_not2 = model_s2.predict(X_val)
 
-# Evaluate on class-0/1 val subset
 y_pred_s2 = (model_s2.predict(X_val_01) > 0.5).astype(int)
 acc_s2 = (y_pred_s2 == y_val_01.astype(int)).mean()
 print(f"[MODEL C] class-0/1 accuracy={acc_s2:.6f}")
