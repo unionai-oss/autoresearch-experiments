@@ -46,7 +46,7 @@ print(f"[DATA] Train class counts: {train_class_counts}")
 print(f"[DATA] Val class counts: {val_class_counts}")
 
 # =====================
-# Feature Extraction: char_wb TF-IDF (3-5, 50k) — reduced for speed
+# Feature Extraction: char_wb TF-IDF (3-5, 50k features) — faster
 # =====================
 print("\n[FEAT] Fitting char_wb TF-IDF (ngram 3-5, 50k features)...")
 tfidf = TfidfVectorizer(
@@ -69,14 +69,17 @@ inv_weights = np.array([
 print(f"[MC] Sample weight range: [{inv_weights.min():.3f}, {inv_weights.max():.3f}]")
 
 # =====================
-# Model A: Multiclass LightGBM (reduced complexity for speed)
+# Custom macro F1 metric for early stopping
 # =====================
-print("\n[MODEL A] Multiclass LightGBM...")
-
 def macro_f1_eval(y_pred, dataset):
     y_true = dataset.get_label().astype(int)
     y_pred_class = np.argmax(y_pred.reshape(-1, num_classes), axis=1)
     return "macro_f1", f1_score(y_true, y_pred_class, average="macro"), True
+
+# =====================
+# Model A: Multiclass LightGBM — reduced complexity to avoid timeout
+# =====================
+print("\n[MODEL A] Multiclass LightGBM (num_leaves=63, lr=0.1, min_child_samples=20)...")
 
 params_mc = {
     "objective": "multiclass",
@@ -102,7 +105,7 @@ model_mc = lgb.train(
     valid_sets=[val_mc],
     feval=macro_f1_eval,
     callbacks=[
-        lgb.early_stopping(stopping_rounds=20, verbose=True),
+        lgb.early_stopping(stopping_rounds=30, verbose=True),
         lgb.log_evaluation(period=50),
     ],
 )
@@ -114,7 +117,7 @@ print(f"[MODEL A] macro_f1={f1_mc:.6f}, per-class={f1_score(y_val, y_pred_mc, av
 # =====================
 # Model B: Binary LightGBM — class 2 vs rest (two-stage: stage 1)
 # =====================
-print("\n[MODEL B] Binary LightGBM (class 2 vs rest)...")
+print("\n[MODEL B] Binary LightGBM (class 2 vs rest, num_leaves=63)...")
 y_s1_train = (y_train == 2).astype(float)
 y_s1_val = (y_val == 2).astype(float)
 class_ratio = float((y_train != 2).sum()) / float((y_train == 2).sum())
@@ -149,7 +152,7 @@ model_s1 = lgb.train(
     valid_sets=[val_s1],
     feval=binary_f1_eval,
     callbacks=[
-        lgb.early_stopping(stopping_rounds=20, verbose=True),
+        lgb.early_stopping(stopping_rounds=30, verbose=True),
         lgb.log_evaluation(period=50),
     ],
 )
@@ -160,7 +163,7 @@ print(f"[MODEL B] Class-2 binary F1={c2_f1:.6f}")
 # =====================
 # Model C: Binary LightGBM — class 0 vs class 1 (two-stage: stage 2)
 # =====================
-print("\n[MODEL C] Binary LightGBM (class 0 vs class 1 only)...")
+print("\n[MODEL C] Binary LightGBM (class 0 vs class 1 only, num_leaves=63)...")
 mask_01_train = (y_train != 2)
 X_train_01 = X_train[mask_01_train]
 y_train_01 = y_train[mask_01_train].astype(float)  # 0.0 or 1.0
@@ -176,7 +179,7 @@ params_s2 = {
     "metric": "binary_logloss",
     "learning_rate": 0.1,
     "num_leaves": 63,
-    "min_child_samples": 20,
+    "min_child_samples": 10,
     "feature_fraction": 0.5,
     "bagging_fraction": 0.8,
     "bagging_freq": 1,
@@ -193,7 +196,7 @@ model_s2 = lgb.train(
     num_boost_round=300,
     valid_sets=[val_s2],
     callbacks=[
-        lgb.early_stopping(stopping_rounds=20, verbose=True),
+        lgb.early_stopping(stopping_rounds=30, verbose=True),
         lgb.log_evaluation(period=50),
     ],
 )
