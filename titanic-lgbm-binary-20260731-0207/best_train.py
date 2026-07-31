@@ -8,7 +8,8 @@ import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.preprocessing import LabelEncoder
-from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import LogisticRegressionCV
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import roc_auc_score
 import lightgbm as lgb
 import xgboost as xgb
@@ -64,7 +65,6 @@ def compute_fill_values(df_in):
     temp['_title'] = titles
     global_med = df_in['Age'].median()
     title_age = temp.groupby('_title')['Age'].median().to_dict()
-    # Fill any title with no median with global median
     for t in ['Mr', 'Miss', 'Mrs', 'Master', 'Officer', 'Rare', 'Royalty']:
         if t not in title_age or pd.isna(title_age.get(t, np.nan)):
             title_age[t] = global_med
@@ -118,7 +118,6 @@ def transform_features(df_in, fill_vals, ticket_sizes):
             d['Age'] = d['Age'].fillna(global_med)
         d['IsChild'] = (d['Age'] < 15).astype(int)
         d['IsElder'] = (d['Age'] > 60).astype(int)
-        # Age bins: infant, child, teen, young adult, adult, middle age, senior, elderly
         d['AgeBin'] = pd.cut(
             d['Age'], bins=[0, 5, 12, 18, 25, 35, 50, 65, 200],
             labels=False, right=True
@@ -141,17 +140,16 @@ def transform_features(df_in, fill_vals, ticket_sizes):
         d['FamilySize'] = d['SibSp'] + d['Parch'] + 1
         d['IsAlone'] = (d['FamilySize'] == 1).astype(int)
         d['FamilyBucket'] = d['FamilySize'].clip(upper=5)
+        d['IsSmallFamily'] = ((d['FamilySize'] >= 2) & (d['FamilySize'] <= 4)).astype(int)
 
     # ── "Women and children first" features ──────────────────────────────────
     sex_str = d['Sex'].astype(str) if 'Sex' in d.columns else None
     title_col = d['Title'] if 'Title' in d.columns else None
 
     if sex_str is not None and title_col is not None:
-        # Core survival signal: female or Master (young boy)
         d['WomanOrMasterBoy'] = (
             (sex_str == 'female') | (title_col == 'Master')
         ).astype(int)
-        # Mother: adult female with children aboard, not unmarried
         if 'Age' in d.columns and 'Parch' in d.columns:
             d['IsMother'] = (
                 (sex_str == 'female') &
@@ -159,6 +157,8 @@ def transform_features(df_in, fill_vals, ticket_sizes):
                 (d['Age'] > 18) &
                 (title_col != 'Miss')
             ).astype(int)
+        if 'Age' in d.columns:
+            d['Age_x_Female'] = d['Age'] * (sex_str == 'female').astype(int)
 
     # ── Interaction features ──────────────────────────────────────────────────
     if 'Age' in d.columns and 'Pclass' in d.columns:
@@ -172,6 +172,12 @@ def transform_features(df_in, fill_vals, ticket_sizes):
 
     if 'FamilySize' in d.columns and 'Pclass' in d.columns:
         d['FamilySize_x_Pclass'] = d['FamilySize'] * d['Pclass']
+
+    if 'Fare_Log' in d.columns and 'Pclass' in d.columns:
+        d['FareLog_x_Pclass'] = d['Fare_Log'] * d['Pclass']
+
+    if 'WomanOrMasterBoy' in d.columns and 'Pclass' in d.columns:
+        d['WoM_x_Pclass'] = d['WomanOrMasterBoy'] * d['Pclass']
 
     return d
 
@@ -203,6 +209,46 @@ fill_vals = compute_fill_values(X_train)
 
 X_train_raw = transform_features(X_train, fill_vals, ticket_sizes_global)
 X_val_raw   = transform_features(X_val,   fill_vals, ticket_sizes_global)
+
+
+# ── CV-based target encoding (no leakage) ────────────────────────────────────
+def cv_target_encode(X_tr_raw, y_tr, X_vl_raw, col, n_splits=5, alpha=5.0):
+    """OOF target encoding for train; smoothed mean for val (from full train)."""
+    global_mean = float(y_tr.mean())
+    oof = np.zeros(len(X_tr_raw))
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+
+    for t_idx, v_idx in skf.split(X_tr_raw, y_tr):
+        col_tr = X_tr_raw.iloc[t_idx][col].astype(str).values
+        y_fold  = y_tr[t_idx]
+        col_vl  = X_tr_raw.iloc[v_idx][col].astype(str).values
+
+        df_tmp = pd.DataFrame({'cat': col_tr, 'y': y_fold})
+        stats  = df_tmp.groupby('cat')['y'].agg(['sum', 'count'])
+        stats['enc'] = (stats['sum'] + global_mean * alpha) / (stats['count'] + alpha)
+        enc_map = stats['enc'].to_dict()
+
+        oof[v_idx] = pd.Series(col_vl).map(enc_map).fillna(global_mean).values
+
+    # Val set: smoothed mean from full training set
+    col_all = X_tr_raw[col].astype(str).values
+    df_full  = pd.DataFrame({'cat': col_all, 'y': y_tr})
+    stats_full = df_full.groupby('cat')['y'].agg(['sum', 'count'])
+    stats_full['enc'] = (stats_full['sum'] + global_mean * alpha) / (stats_full['count'] + alpha)
+    enc_map_full = stats_full['enc'].to_dict()
+    val_enc = X_vl_raw[col].astype(str).map(enc_map_full).fillna(global_mean).values
+
+    return oof, val_enc
+
+
+te_features = ['Title', 'Sex_Pclass', 'Deck', 'Ticket_Prefix', 'Pclass_Embarked']
+for feat in te_features:
+    if feat in X_train_raw.columns and feat in X_val_raw.columns:
+        oof_enc, val_enc = cv_target_encode(X_train_raw, y_train, X_val_raw, feat)
+        X_train_raw[f'TE_{feat}'] = oof_enc
+        X_val_raw[f'TE_{feat}']   = val_enc
+
+print(f"Applied target encoding for: {te_features}")
 
 X_train_fe, cat_encs = label_encode(X_train_raw, fit=True)
 X_val_fe,   _        = label_encode(X_val_raw, encoders=cat_encs, fit=False)
@@ -314,9 +360,7 @@ best_xgb_params.update({
     'early_stopping_rounds': 150,
 })
 final_xgb = xgb.XGBClassifier(**best_xgb_params)
-final_xgb.fit(X_train_fe, y_train,
-              eval_set=[(X_val_fe, y_val)],
-              verbose=False)
+final_xgb.fit(X_train_fe, y_train, eval_set=[(X_val_fe, y_val)], verbose=False)
 xgb_preds = final_xgb.predict_proba(X_val_fe)[:, 1]
 xgb_auc   = roc_auc_score(y_val, xgb_preds)
 print(f"XGB  val AUC: {xgb_auc:.6f}")
@@ -372,12 +416,59 @@ cat_preds = final_cat.predict_proba(X_val_fe)[:, 1]
 cat_auc   = roc_auc_score(y_val, cat_preds)
 print(f"CatBoost val AUC: {cat_auc:.6f}")
 
-# ── Stacking: OOF-based meta-learner (LogisticRegression) ────────────────────
+# ── RandomForest Optuna HPO ───────────────────────────────────────────────────
+
+def objective_rf(trial):
+    params = {
+        'n_estimators':      500,
+        'max_depth':         trial.suggest_int('max_depth', 5, 30),
+        'min_samples_split': trial.suggest_int('min_samples_split', 2, 20),
+        'min_samples_leaf':  trial.suggest_int('min_samples_leaf', 1, 10),
+        'max_features':      trial.suggest_float('max_features', 0.2, 1.0),
+        'bootstrap':         trial.suggest_categorical('bootstrap', [True, False]),
+        'class_weight':      'balanced',
+        'random_state':      42,
+        'n_jobs':            -1,
+    }
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    aucs = []
+    for tr_idx, vl_idx in skf.split(X_train_fe, y_train):
+        Xf_tr, Xf_val = X_train_fe.iloc[tr_idx], X_train_fe.iloc[vl_idx]
+        yf_tr, yf_val = y_train[tr_idx],          y_train[vl_idx]
+        clf = RandomForestClassifier(**params)
+        clf.fit(Xf_tr, yf_tr)
+        aucs.append(roc_auc_score(yf_val, clf.predict_proba(Xf_val)[:, 1]))
+    return float(np.mean(aucs))
+
+
+print("RandomForest HPO: 40 trials …")
+study_rf = optuna.create_study(
+    direction='maximize',
+    sampler=optuna.samplers.TPESampler(seed=42),
+)
+study_rf.optimize(objective_rf, n_trials=40, show_progress_bar=False)
+print(f"Best RF CV AUC: {study_rf.best_value:.6f}")
+
+best_rf_params = study_rf.best_params.copy()
+best_rf_params.update({
+    'n_estimators': 500,
+    'class_weight': 'balanced',
+    'random_state': 42,
+    'n_jobs':       -1,
+})
+final_rf = RandomForestClassifier(**best_rf_params)
+final_rf.fit(X_train_fe, y_train)
+rf_preds = final_rf.predict_proba(X_val_fe)[:, 1]
+rf_auc   = roc_auc_score(y_val, rf_preds)
+print(f"RF   val AUC: {rf_auc:.6f}")
+
+# ── Stacking: OOF-based meta-learner ─────────────────────────────────────────
 print("Generating OOF predictions for stacking …")
 skf5 = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 oof_lgbm = np.zeros(len(X_train_fe))
 oof_xgb  = np.zeros(len(X_train_fe))
 oof_cat  = np.zeros(len(X_train_fe))
+oof_rf   = np.zeros(len(X_train_fe))
 
 for tr_idx, vl_idx in skf5.split(X_train_fe, y_train):
     Xf_tr, Xf_vl = X_train_fe.iloc[tr_idx], X_train_fe.iloc[vl_idx]
@@ -398,36 +489,51 @@ for tr_idx, vl_idx in skf5.split(X_train_fe, y_train):
     _cat.fit(Xf_tr, yf_tr, eval_set=(Xf_vl, yf_vl), verbose=False)
     oof_cat[vl_idx] = _cat.predict_proba(Xf_vl)[:, 1]
 
+    _rf = RandomForestClassifier(**best_rf_params)
+    _rf.fit(Xf_tr, yf_tr)
+    oof_rf[vl_idx] = _rf.predict_proba(Xf_vl)[:, 1]
+
 oof_auc_lgbm = roc_auc_score(y_train, oof_lgbm)
 oof_auc_xgb  = roc_auc_score(y_train, oof_xgb)
 oof_auc_cat  = roc_auc_score(y_train, oof_cat)
-print(f"OOF AUC — LGBM: {oof_auc_lgbm:.4f}, XGB: {oof_auc_xgb:.4f}, Cat: {oof_auc_cat:.4f}")
+oof_auc_rf   = roc_auc_score(y_train, oof_rf)
+print(f"OOF AUC — LGBM:{oof_auc_lgbm:.4f}, XGB:{oof_auc_xgb:.4f}, Cat:{oof_auc_cat:.4f}, RF:{oof_auc_rf:.4f}")
 
-# Train meta-learner on OOF (no val label leakage)
-oof_meta = np.column_stack([oof_lgbm, oof_xgb, oof_cat])
-val_meta = np.column_stack([lgbm_preds, xgb_preds, cat_preds])
+# Train meta-learner on OOF — tune C via inner CV (no val label leakage)
+oof_meta = np.column_stack([oof_lgbm, oof_xgb, oof_cat, oof_rf])
+val_meta = np.column_stack([lgbm_preds, xgb_preds, cat_preds, rf_preds])
 
-meta_lr = LogisticRegression(C=10, max_iter=1000, random_state=42)
+meta_lr = LogisticRegressionCV(
+    Cs=[0.001, 0.01, 0.1, 1, 10, 100],
+    cv=5,
+    max_iter=1000,
+    random_state=42,
+    scoring='roc_auc',
+)
 meta_lr.fit(oof_meta, y_train)
 stacked_preds = meta_lr.predict_proba(val_meta)[:, 1]
 stacked_auc   = roc_auc_score(y_val, stacked_preds)
 print(f"Stacked LR val AUC: {stacked_auc:.6f}")
 
 # ── Ensemble comparison ──────────────────────────────────────────────────────
-ens_equal = (lgbm_preds + xgb_preds + cat_preds) / 3.0
+ens_equal = (lgbm_preds + xgb_preds + cat_preds + rf_preds) / 4.0
 ens_equal_auc = roc_auc_score(y_val, ens_equal)
 
 # Weight by CV AUC scores
-cv_aucs = np.array([study_lgbm.best_value, study_xgb.best_value, study_cat.best_value])
+cv_aucs = np.array([
+    study_lgbm.best_value, study_xgb.best_value,
+    study_cat.best_value,  study_rf.best_value,
+])
 weights = cv_aucs / cv_aucs.sum()
-ens_weighted = weights[0] * lgbm_preds + weights[1] * xgb_preds + weights[2] * cat_preds
+ens_weighted = (weights[0]*lgbm_preds + weights[1]*xgb_preds +
+                weights[2]*cat_preds  + weights[3]*rf_preds)
 ens_weighted_auc = roc_auc_score(y_val, ens_weighted)
 
 print(f"Ensemble equal    AUC: {ens_equal_auc:.6f}")
 print(f"Ensemble weighted AUC: {ens_weighted_auc:.6f}")
 
 best_val_roc_auc = max(
-    lgbm_auc, xgb_auc, cat_auc,
+    lgbm_auc, xgb_auc, cat_auc, rf_auc,
     ens_equal_auc, ens_weighted_auc, stacked_auc
 )
 print(f"BEST_VAL_ROC_AUC: {best_val_roc_auc:.6f}")
