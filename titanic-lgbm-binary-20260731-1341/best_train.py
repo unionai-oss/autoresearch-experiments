@@ -5,7 +5,10 @@ import pandas as pd
 import numpy as np
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
 import lightgbm as lgb
+import xgboost as xgb
 
 # ── Load data ──────────────────────────────────────────────────────────────────
 df = pd.read_parquet(DATA_PATH)
@@ -71,6 +74,9 @@ def engineer(df_in):
         if 'TicketGroupSize' in X.columns:
             X['FarePerTicketGroup'] = X['Fare'] / X['TicketGroupSize'].clip(lower=1)
             X['FarePerTicketGroup_log'] = np.log1p(X['FarePerTicketGroup'].clip(lower=0).fillna(0))
+        # TicketGroupSize minus FamilySize → non-family companions
+        if 'FamilySize' in X.columns and 'TicketGroupSize' in X.columns:
+            X['NonFamilyCompanions'] = (X['TicketGroupSize'] - X['FamilySize']).clip(lower=0)
 
     return X
 
@@ -150,6 +156,9 @@ def preprocess_fit_transform(X_tr_in, X_vl_in, y_tr_in=None):
             X['Pclass_IsAlone'] = X['Pclass'] * X['IsAlone']
         if 'Age' in X.columns and 'Pclass' in X.columns:
             X['Age_x_Pclass'] = X['Age'] * X['Pclass']
+        if 'Age' in X.columns and 'Sex' in X.columns:
+            # Age matters very differently for males vs females
+            X['Age_x_Sex'] = X['Age'] * X['Sex']
         if 'Sex' in X.columns and 'IsChild' in X.columns:
             # Women and children first: female=0 or child=1 → high survival
             X['WomenOrChild'] = ((X['Sex'] == 0) | (X['IsChild'] == 1)).astype(int)
@@ -159,6 +168,8 @@ def preprocess_fit_transform(X_tr_in, X_vl_in, y_tr_in=None):
             X['FamilySize_x_Pclass'] = X['FamilySize'] * X['Pclass']
         if 'Fare' in X.columns and 'Sex' in X.columns:
             X['Fare_x_Sex'] = X['Fare'] * X['Sex']
+        if 'Fare_log' in X.columns and 'Pclass' in X.columns:
+            X['FareLog_x_Pclass'] = X['Fare_log'] * X['Pclass']
 
     # Align columns (val might miss a column if a category didn't appear)
     cols = X_tr.columns.tolist()
@@ -178,14 +189,43 @@ neg_count, pos_count = counts[0], counts[1]
 spw = float(neg_count) / float(pos_count)
 print(f"[INFO] scale_pos_weight={spw:.4f}")
 
-
-# ── Random Search HPO (no optuna — not available in this env) ─────────────────
 rng = np.random.RandomState(42)
-N_TRIALS = 60  # 60 trials × 5 folds = 300 fits, ~3-5 min on N=891
 
 
-def sample_params():
-    return dict(
+# ── Helper: run HPO trial ─────────────────────────────────────────────────────
+
+def lgbm_cv(params):
+    scores = []
+    for tr_idx, vl_idx in splits:
+        y_tr, y_vl = y[tr_idx], y[vl_idx]
+        X_tr, X_vl = preprocess_fit_transform(X_feat.iloc[tr_idx], X_feat.iloc[vl_idx], y_tr_in=y_tr)
+        clf = lgb.LGBMClassifier(**params)
+        clf.fit(X_tr, y_tr,
+                eval_X=X_vl, eval_y=y_vl,
+                callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)])
+        scores.append(roc_auc_score(y_vl, clf.predict_proba(X_vl)[:, 1]))
+    return float(np.mean(scores))
+
+
+def xgb_cv(params):
+    scores = []
+    for tr_idx, vl_idx in splits:
+        y_tr, y_vl = y[tr_idx], y[vl_idx]
+        X_tr, X_vl = preprocess_fit_transform(X_feat.iloc[tr_idx], X_feat.iloc[vl_idx], y_tr_in=y_tr)
+        clf = xgb.XGBClassifier(**params)
+        clf.fit(X_tr, y_tr, eval_set=[(X_vl, y_vl)], verbose=False)
+        scores.append(roc_auc_score(y_vl, clf.predict_proba(X_vl)[:, 1]))
+    return float(np.mean(scores))
+
+
+# ── LightGBM HPO ──────────────────────────────────────────────────────────────
+print("\n[LGBM] Running HPO (80 trials)...")
+N_LGBM = 80
+best_lgbm_score = -1.0
+best_lgbm_params = None
+
+for trial_idx in range(N_LGBM):
+    params = dict(
         objective='binary',
         metric='auc',
         n_estimators=2000,
@@ -204,61 +244,111 @@ def sample_params():
         verbose=-1,
         random_state=42,
     )
+    score = lgbm_cv(params)
+    if score > best_lgbm_score:
+        best_lgbm_score = score
+        best_lgbm_params = params.copy()
+        print(f"  [LGBM Trial {trial_idx:3d}] New best: {best_lgbm_score:.6f}")
+
+print(f"[LGBM] Best CV AUC: {best_lgbm_score:.6f}")
 
 
-best_score = -1.0
-best_params = None
+# ── XGBoost HPO ───────────────────────────────────────────────────────────────
+print("\n[XGB] Running HPO (50 trials)...")
+N_XGB = 50
+best_xgb_score = -1.0
+best_xgb_params = None
 
-for trial_idx in range(N_TRIALS):
-    params = sample_params()
-    scores = []
-    for tr_idx, vl_idx in splits:
-        y_tr, y_vl = y[tr_idx], y[vl_idx]
-        X_tr, X_vl = preprocess_fit_transform(
-            X_feat.iloc[tr_idx], X_feat.iloc[vl_idx], y_tr_in=y_tr
-        )
-        clf = lgb.LGBMClassifier(**params)
-        clf.fit(
-            X_tr, y_tr,
-            eval_set=[(X_vl, y_vl)],
-            callbacks=[lgb.early_stopping(50, verbose=False),
-                       lgb.log_evaluation(-1)],
-        )
-        scores.append(roc_auc_score(y_vl, clf.predict_proba(X_vl)[:, 1]))
+for trial_idx in range(N_XGB):
+    params = dict(
+        n_estimators=2000,
+        max_depth=int(rng.randint(3, 10)),
+        learning_rate=float(np.exp(rng.uniform(np.log(0.005), np.log(0.3)))),
+        min_child_weight=int(rng.randint(1, 20)),
+        subsample=float(rng.uniform(0.5, 1.0)),
+        colsample_bytree=float(rng.uniform(0.4, 1.0)),
+        colsample_bylevel=float(rng.uniform(0.4, 1.0)),
+        reg_alpha=float(np.exp(rng.uniform(np.log(1e-8), np.log(10.0)))),
+        reg_lambda=float(np.exp(rng.uniform(np.log(1e-8), np.log(10.0)))),
+        scale_pos_weight=float(rng.uniform(0.5, spw * 2.0)),
+        eval_metric='auc',
+        early_stopping_rounds=50,
+        random_state=42,
+        n_jobs=-1,
+        verbosity=0,
+    )
+    score = xgb_cv(params)
+    if score > best_xgb_score:
+        best_xgb_score = score
+        best_xgb_params = params.copy()
+        print(f"  [XGB Trial {trial_idx:3d}] New best: {best_xgb_score:.6f}")
 
-    mean_score = float(np.mean(scores))
-    if mean_score > best_score:
-        best_score = mean_score
-        best_params = params.copy()
-        print(f"[Trial {trial_idx:3d}] New best: {best_score:.6f}")
-
-print(f"[SEARCH] Best CV AUC: {best_score:.6f}")
-print(f"[SEARCH] Best params: {best_params}")
+print(f"[XGB] Best CV AUC: {best_xgb_score:.6f}")
 
 
-# ── Final OOF evaluation with best hyperparameters ─────────────────────────────
-final_params = dict(**best_params)
-final_params['n_estimators'] = 3000
+# ── Final OOF with best params from each model ─────────────────────────────────
+print("\n[FINAL] Building OOF predictions from best models...")
 
-oof_preds = np.zeros(len(y))
+final_lgbm_params = dict(**best_lgbm_params)
+final_lgbm_params['n_estimators'] = 3000
+
+final_xgb_params = dict(**best_xgb_params)
+final_xgb_params['n_estimators'] = 3000
+
+oof_lgbm = np.zeros(len(y))
+oof_xgb = np.zeros(len(y))
+
 for fold, (tr_idx, vl_idx) in enumerate(splits):
     y_tr, y_vl = y[tr_idx], y[vl_idx]
-    X_tr, X_vl = preprocess_fit_transform(
-        X_feat.iloc[tr_idx], X_feat.iloc[vl_idx], y_tr_in=y_tr
-    )
+    X_tr, X_vl = preprocess_fit_transform(X_feat.iloc[tr_idx], X_feat.iloc[vl_idx], y_tr_in=y_tr)
 
-    clf = lgb.LGBMClassifier(**final_params)
-    clf.fit(
-        X_tr, y_tr,
-        eval_set=[(X_vl, y_vl)],
-        callbacks=[lgb.early_stopping(150, verbose=False),
-                   lgb.log_evaluation(-1)],
-    )
-    oof_preds[vl_idx] = clf.predict_proba(X_vl)[:, 1]
-    fold_auc = roc_auc_score(y_vl, oof_preds[vl_idx])
-    print(f"  Fold {fold+1}/{N_SPLITS}  AUC: {fold_auc:.4f}  "
-          f"best_iter: {clf.best_iteration_}")
+    # LightGBM
+    clf_lgbm = lgb.LGBMClassifier(**final_lgbm_params)
+    clf_lgbm.fit(X_tr, y_tr,
+                 eval_X=X_vl, eval_y=y_vl,
+                 callbacks=[lgb.early_stopping(150, verbose=False), lgb.log_evaluation(-1)])
+    oof_lgbm[vl_idx] = clf_lgbm.predict_proba(X_vl)[:, 1]
 
-oof_auc = roc_auc_score(y, oof_preds)
-print(f"[RESULT] OOF ROC-AUC (5-fold CV on all {len(y)} samples): {oof_auc:.6f}")
-print(f"BEST_VAL_ROC_AUC: {oof_auc:.6f}")
+    # XGBoost
+    clf_xgb = xgb.XGBClassifier(**final_xgb_params)
+    clf_xgb.fit(X_tr, y_tr, eval_set=[(X_vl, y_vl)], verbose=False)
+    oof_xgb[vl_idx] = clf_xgb.predict_proba(X_vl)[:, 1]
+
+    fold_auc_lgbm = roc_auc_score(y_vl, oof_lgbm[vl_idx])
+    fold_auc_xgb = roc_auc_score(y_vl, oof_xgb[vl_idx])
+    print(f"  Fold {fold+1}/{N_SPLITS}: LGBM={fold_auc_lgbm:.4f}, XGB={fold_auc_xgb:.4f}  "
+          f"(lgbm_iter={clf_lgbm.best_iteration_}, xgb_iter={clf_xgb.best_iteration})")
+
+lgbm_auc = roc_auc_score(y, oof_lgbm)
+xgb_auc = roc_auc_score(y, oof_xgb)
+print(f"\n[OOF] LGBM={lgbm_auc:.6f}, XGB={xgb_auc:.6f}")
+
+# Simple average ensemble
+avg_preds = (oof_lgbm + oof_xgb) / 2.0
+avg_auc = roc_auc_score(y, avg_preds)
+print(f"[OOF] Simple average ensemble: {avg_auc:.6f}")
+
+# Weighted average by individual AUC
+w_lgbm = lgbm_auc / (lgbm_auc + xgb_auc)
+w_xgb = xgb_auc / (lgbm_auc + xgb_auc)
+weighted_preds = w_lgbm * oof_lgbm + w_xgb * oof_xgb
+weighted_auc = roc_auc_score(y, weighted_preds)
+print(f"[OOF] Weighted average (w_lgbm={w_lgbm:.3f}, w_xgb={w_xgb:.3f}): {weighted_auc:.6f}")
+
+# Stacking meta-learner (cross-validated to avoid overfitting)
+stack_X = np.column_stack([oof_lgbm, oof_xgb])
+stack_oof = np.zeros(len(y))
+meta_skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=99)
+for meta_tr_idx, meta_vl_idx in meta_skf.split(stack_X, y):
+    meta_clf = LogisticRegression(C=1.0, random_state=42, max_iter=500)
+    meta_clf.fit(stack_X[meta_tr_idx], y[meta_tr_idx])
+    stack_oof[meta_vl_idx] = meta_clf.predict_proba(stack_X[meta_vl_idx])[:, 1]
+stack_auc = roc_auc_score(y, stack_oof)
+print(f"[OOF] Stacking (CV meta-learner): {stack_auc:.6f}")
+
+# Pick best
+final_auc = max(lgbm_auc, xgb_auc, avg_auc, weighted_auc, stack_auc)
+method = ['LGBM', 'XGB', 'SimpleAvg', 'WeightedAvg', 'Stack'][
+    [lgbm_auc, xgb_auc, avg_auc, weighted_auc, stack_auc].index(final_auc)]
+print(f"\n[RESULT] Best OOF AUC: {final_auc:.6f} ({method})")
+print(f"BEST_VAL_ROC_AUC: {final_auc:.6f}")
