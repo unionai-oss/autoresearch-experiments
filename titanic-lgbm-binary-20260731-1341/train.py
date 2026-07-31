@@ -1,14 +1,28 @@
 import os
 DATA_PATH = os.environ.get("DATA_PATH", "/tmp/data")
 
+import sys
+import site as _site_mod
+# Make CatBoost available from user site-packages if not already in venv
+_user_site = _site_mod.getusersitepackages()
+if _user_site not in sys.path:
+    sys.path.insert(0, _user_site)
+
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import roc_auc_score
 from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
 import lightgbm as lgb
 import xgboost as xgb
+
+try:
+    from catboost import CatBoostClassifier, Pool
+    CATBOOST_AVAILABLE = True
+    print("[INFO] CatBoost available")
+except ImportError:
+    CATBOOST_AVAILABLE = False
+    print("[WARNING] CatBoost not available — skipping")
 
 # ── Load data ──────────────────────────────────────────────────────────────────
 df = pd.read_parquet(DATA_PATH)
@@ -87,6 +101,28 @@ def preprocess_fit_transform(X_tr_in, X_vl_in, y_tr_in=None):
     X_tr = X_tr_in.copy()
     X_vl = X_vl_in.copy()
 
+    # ── Better Age imputation: group median by (Title, Pclass) ──────────────────
+    # Done BEFORE missing indicators so the imputed values are used in derived feats
+    if 'Age' in X_tr.columns and 'Title' in X_tr.columns and 'Pclass' in X_tr.columns:
+        age_group_medians = X_tr.groupby(['Title', 'Pclass'])['Age'].median()
+        age_title_medians = X_tr.groupby('Title')['Age'].median()
+        global_age_median = X_tr['Age'].median()
+
+        for Xdf in [X_tr, X_vl]:
+            mask = Xdf['Age'].isna()
+            if mask.any():
+                keys = list(zip(Xdf.loc[mask, 'Title'].values,
+                                Xdf.loc[mask, 'Pclass'].values))
+                filled = []
+                for k in keys:
+                    if k in age_group_medians.index:
+                        filled.append(age_group_medians[k])
+                    elif k[0] in age_title_medians.index:
+                        filled.append(age_title_medians[k[0]])
+                    else:
+                        filled.append(global_age_median)
+                Xdf.loc[mask, 'Age'] = filled
+
     # Missing indicators for numerics with >5% missing (fit on train)
     num_cols = X_tr.select_dtypes(include=[np.number]).columns.tolist()
     miss_cols = [c for c in num_cols if X_tr[c].isnull().mean() > 0.05]
@@ -94,7 +130,7 @@ def preprocess_fit_transform(X_tr_in, X_vl_in, y_tr_in=None):
         X_tr[f'{c}_miss'] = X_tr[c].isnull().astype(int)
         X_vl[f'{c}_miss'] = X_vl[c].isnull().astype(int)
 
-    # Numeric imputation with train medians
+    # Numeric imputation with train medians (Age mostly already imputed above)
     num_cols2 = X_tr.select_dtypes(include=[np.number]).columns.tolist()
     medians = {c: X_tr[c].median() for c in num_cols2}
     for c, m in medians.items():
@@ -103,20 +139,20 @@ def preprocess_fit_transform(X_tr_in, X_vl_in, y_tr_in=None):
 
     # Age-derived bins (after imputation)
     if 'Age' in X_tr.columns:
-        for X in [X_tr, X_vl]:
-            X['IsChild'] = (X['Age'] < 12).astype(int)
-            X['IsSenior'] = (X['Age'] > 60).astype(int)
-            X['AgeBand'] = (pd.cut(X['Age'],
-                                   bins=[0, 12, 18, 35, 60, 100],
-                                   labels=False)
-                            .fillna(2).astype(int))
+        for Xdf in [X_tr, X_vl]:
+            Xdf['IsChild'] = (Xdf['Age'] < 12).astype(int)
+            Xdf['IsSenior'] = (Xdf['Age'] > 60).astype(int)
+            Xdf['AgeBand'] = (pd.cut(Xdf['Age'],
+                                     bins=[0, 12, 18, 35, 60, 100],
+                                     labels=False)
+                              .fillna(2).astype(int))
 
     # Fare quartile bin (fit on train)
     if 'Fare' in X_tr.columns:
         fare_qs = X_tr['Fare'].quantile([0.25, 0.5, 0.75]).values
-        for X in [X_tr, X_vl]:
-            X['FareBin'] = pd.cut(
-                X['Fare'],
+        for Xdf in [X_tr, X_vl]:
+            Xdf['FareBin'] = pd.cut(
+                Xdf['Fare'],
                 bins=[-np.inf, fare_qs[0], fare_qs[1], fare_qs[2], np.inf],
                 labels=False
             ).fillna(0).astype(int)
@@ -149,27 +185,32 @@ def preprocess_fit_transform(X_tr_in, X_vl_in, y_tr_in=None):
         X_vl[c] = X_vl[c].map(cats).fillna(-1).astype(int)
 
     # Interaction features (after encoding)
-    for X in [X_tr, X_vl]:
-        if 'Pclass' in X.columns and 'Sex' in X.columns:
-            X['Pclass_Sex'] = X['Pclass'] * 10 + X['Sex']
-        if 'Pclass' in X.columns and 'IsAlone' in X.columns:
-            X['Pclass_IsAlone'] = X['Pclass'] * X['IsAlone']
-        if 'Age' in X.columns and 'Pclass' in X.columns:
-            X['Age_x_Pclass'] = X['Age'] * X['Pclass']
-        if 'Age' in X.columns and 'Sex' in X.columns:
-            # Age matters very differently for males vs females
-            X['Age_x_Sex'] = X['Age'] * X['Sex']
-        if 'Sex' in X.columns and 'IsChild' in X.columns:
-            # Women and children first: female=0 or child=1 → high survival
-            X['WomenOrChild'] = ((X['Sex'] == 0) | (X['IsChild'] == 1)).astype(int)
-        if 'TitlePriority' in X.columns and 'Pclass' in X.columns:
-            X['TitlePriority_x_Pclass'] = X['TitlePriority'] * X['Pclass']
-        if 'FamilySize' in X.columns and 'Pclass' in X.columns:
-            X['FamilySize_x_Pclass'] = X['FamilySize'] * X['Pclass']
-        if 'Fare' in X.columns and 'Sex' in X.columns:
-            X['Fare_x_Sex'] = X['Fare'] * X['Sex']
-        if 'Fare_log' in X.columns and 'Pclass' in X.columns:
-            X['FareLog_x_Pclass'] = X['Fare_log'] * X['Pclass']
+    for Xdf in [X_tr, X_vl]:
+        if 'Pclass' in Xdf.columns and 'Sex' in Xdf.columns:
+            Xdf['Pclass_Sex'] = Xdf['Pclass'] * 10 + Xdf['Sex']
+        if 'Pclass' in Xdf.columns and 'IsAlone' in Xdf.columns:
+            Xdf['Pclass_IsAlone'] = Xdf['Pclass'] * Xdf['IsAlone']
+        if 'Age' in Xdf.columns and 'Pclass' in Xdf.columns:
+            Xdf['Age_x_Pclass'] = Xdf['Age'] * Xdf['Pclass']
+        if 'Age' in Xdf.columns and 'Sex' in Xdf.columns:
+            Xdf['Age_x_Sex'] = Xdf['Age'] * Xdf['Sex']
+        if 'Sex' in Xdf.columns and 'IsChild' in Xdf.columns:
+            Xdf['WomenOrChild'] = ((Xdf['Sex'] == 0) | (Xdf['IsChild'] == 1)).astype(int)
+        if 'WomenOrChild' in Xdf.columns and 'Pclass' in Xdf.columns:
+            # Women/children in 1st class had near 100% survival; 3rd class much lower
+            Xdf['WomenOrChild_x_Pclass'] = Xdf['WomenOrChild'] * Xdf['Pclass']
+        if 'IsChild' in Xdf.columns and 'Pclass' in Xdf.columns:
+            Xdf['IsChild_x_Pclass'] = Xdf['IsChild'] * Xdf['Pclass']
+        if 'TitlePriority' in Xdf.columns and 'Pclass' in Xdf.columns:
+            Xdf['TitlePriority_x_Pclass'] = Xdf['TitlePriority'] * Xdf['Pclass']
+        if 'FamilySize' in Xdf.columns and 'Pclass' in Xdf.columns:
+            Xdf['FamilySize_x_Pclass'] = Xdf['FamilySize'] * Xdf['Pclass']
+        if 'Fare' in Xdf.columns and 'Sex' in Xdf.columns:
+            Xdf['Fare_x_Sex'] = Xdf['Fare'] * Xdf['Sex']
+        if 'Fare_log' in Xdf.columns and 'Pclass' in Xdf.columns:
+            Xdf['FareLog_x_Pclass'] = Xdf['Fare_log'] * Xdf['Pclass']
+        if 'AgeBand' in Xdf.columns and 'Sex' in Xdf.columns:
+            Xdf['AgeBand_x_Sex'] = Xdf['AgeBand'] * (Xdf['Sex'] + 1)
 
     # Align columns (val might miss a column if a category didn't appear)
     cols = X_tr.columns.tolist()
@@ -214,6 +255,19 @@ def xgb_cv(params):
         X_tr, X_vl = preprocess_fit_transform(X_feat.iloc[tr_idx], X_feat.iloc[vl_idx], y_tr_in=y_tr)
         clf = xgb.XGBClassifier(**params)
         clf.fit(X_tr, y_tr, eval_set=[(X_vl, y_vl)], verbose=False)
+        scores.append(roc_auc_score(y_vl, clf.predict_proba(X_vl)[:, 1]))
+    return float(np.mean(scores))
+
+
+def cb_cv(params):
+    scores = []
+    for tr_idx, vl_idx in splits:
+        y_tr, y_vl = y[tr_idx], y[vl_idx]
+        X_tr, X_vl = preprocess_fit_transform(X_feat.iloc[tr_idx], X_feat.iloc[vl_idx], y_tr_in=y_tr)
+        pool_tr = Pool(X_tr, y_tr)
+        pool_vl = Pool(X_vl, y_vl)
+        clf = CatBoostClassifier(**params)
+        clf.fit(pool_tr, eval_set=pool_vl, use_best_model=True, verbose=False)
         scores.append(roc_auc_score(y_vl, clf.predict_proba(X_vl)[:, 1]))
     return float(np.mean(scores))
 
@@ -286,6 +340,41 @@ for trial_idx in range(N_XGB):
 print(f"[XGB] Best CV AUC: {best_xgb_score:.6f}")
 
 
+# ── CatBoost HPO ──────────────────────────────────────────────────────────────
+best_cb_score = -1.0
+best_cb_params = None
+
+if CATBOOST_AVAILABLE:
+    print("\n[CB] Running HPO (40 trials)...")
+    N_CB = 40
+    for trial_idx in range(N_CB):
+        params = dict(
+            iterations=2000,
+            learning_rate=float(np.exp(rng.uniform(np.log(0.01), np.log(0.3)))),
+            depth=int(rng.randint(4, 11)),
+            l2_leaf_reg=float(np.exp(rng.uniform(np.log(1.0), np.log(30.0)))),
+            border_count=int(rng.choice([32, 64, 128, 254])),
+            bagging_temperature=float(rng.uniform(0.0, 1.5)),
+            random_strength=float(rng.uniform(0.5, 5.0)),
+            early_stopping_rounds=50,
+            eval_metric='AUC',
+            loss_function='Logloss',
+            random_state=42,
+            train_dir='/tmp/catboost_info',
+        )
+        try:
+            score = cb_cv(params)
+            if score > best_cb_score:
+                best_cb_score = score
+                best_cb_params = params.copy()
+                print(f"  [CB Trial {trial_idx:3d}] New best: {best_cb_score:.6f}")
+        except Exception as e:
+            print(f"  [CB Trial {trial_idx:3d}] Error: {e}")
+    print(f"[CB] Best CV AUC: {best_cb_score:.6f}")
+else:
+    print("\n[CB] Skipped (not available)")
+
+
 # ── Final OOF with best params from each model ─────────────────────────────────
 print("\n[FINAL] Building OOF predictions from best models...")
 
@@ -297,6 +386,7 @@ final_xgb_params['n_estimators'] = 3000
 
 oof_lgbm = np.zeros(len(y))
 oof_xgb = np.zeros(len(y))
+oof_cb = np.zeros(len(y))
 
 for fold, (tr_idx, vl_idx) in enumerate(splits):
     y_tr, y_vl = y[tr_idx], y[vl_idx]
@@ -314,29 +404,54 @@ for fold, (tr_idx, vl_idx) in enumerate(splits):
     clf_xgb.fit(X_tr, y_tr, eval_set=[(X_vl, y_vl)], verbose=False)
     oof_xgb[vl_idx] = clf_xgb.predict_proba(X_vl)[:, 1]
 
+    # CatBoost
+    if CATBOOST_AVAILABLE and best_cb_params is not None:
+        final_cb_params = dict(**best_cb_params)
+        final_cb_params['iterations'] = 3000
+        pool_tr = Pool(X_tr, y_tr)
+        pool_vl = Pool(X_vl, y_vl)
+        clf_cb = CatBoostClassifier(**final_cb_params)
+        clf_cb.fit(pool_tr, eval_set=pool_vl, use_best_model=True, verbose=False)
+        oof_cb[vl_idx] = clf_cb.predict_proba(X_vl)[:, 1]
+
     fold_auc_lgbm = roc_auc_score(y_vl, oof_lgbm[vl_idx])
     fold_auc_xgb = roc_auc_score(y_vl, oof_xgb[vl_idx])
-    print(f"  Fold {fold+1}/{N_SPLITS}: LGBM={fold_auc_lgbm:.4f}, XGB={fold_auc_xgb:.4f}  "
-          f"(lgbm_iter={clf_lgbm.best_iteration_}, xgb_iter={clf_xgb.best_iteration})")
+    msg = f"  Fold {fold+1}/{N_SPLITS}: LGBM={fold_auc_lgbm:.4f}, XGB={fold_auc_xgb:.4f}"
+    if CATBOOST_AVAILABLE and best_cb_params is not None:
+        fold_auc_cb = roc_auc_score(y_vl, oof_cb[vl_idx])
+        msg += f", CB={fold_auc_cb:.4f}"
+    print(msg)
 
 lgbm_auc = roc_auc_score(y, oof_lgbm)
 xgb_auc = roc_auc_score(y, oof_xgb)
 print(f"\n[OOF] LGBM={lgbm_auc:.6f}, XGB={xgb_auc:.6f}")
 
+# Build candidate predictions list
+candidates = [oof_lgbm, oof_xgb]
+candidate_aucs = [lgbm_auc, xgb_auc]
+candidate_names = ['LGBM', 'XGB']
+
+if CATBOOST_AVAILABLE and best_cb_params is not None:
+    cb_auc = roc_auc_score(y, oof_cb)
+    print(f"[OOF] CB={cb_auc:.6f}")
+    candidates.append(oof_cb)
+    candidate_aucs.append(cb_auc)
+    candidate_names.append('CB')
+
 # Simple average ensemble
-avg_preds = (oof_lgbm + oof_xgb) / 2.0
+avg_preds = np.mean(candidates, axis=0)
 avg_auc = roc_auc_score(y, avg_preds)
 print(f"[OOF] Simple average ensemble: {avg_auc:.6f}")
 
 # Weighted average by individual AUC
-w_lgbm = lgbm_auc / (lgbm_auc + xgb_auc)
-w_xgb = xgb_auc / (lgbm_auc + xgb_auc)
-weighted_preds = w_lgbm * oof_lgbm + w_xgb * oof_xgb
+total_auc = sum(candidate_aucs)
+weighted_preds = sum(w * p for w, p in zip([a / total_auc for a in candidate_aucs], candidates))
 weighted_auc = roc_auc_score(y, weighted_preds)
-print(f"[OOF] Weighted average (w_lgbm={w_lgbm:.3f}, w_xgb={w_xgb:.3f}): {weighted_auc:.6f}")
+weights_str = ", ".join(f"{n}={a/total_auc:.3f}" for n, a in zip(candidate_names, candidate_aucs))
+print(f"[OOF] Weighted average ({weights_str}): {weighted_auc:.6f}")
 
 # Stacking meta-learner (cross-validated to avoid overfitting)
-stack_X = np.column_stack([oof_lgbm, oof_xgb])
+stack_X = np.column_stack(candidates)
 stack_oof = np.zeros(len(y))
 meta_skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=99)
 for meta_tr_idx, meta_vl_idx in meta_skf.split(stack_X, y):
@@ -347,8 +462,10 @@ stack_auc = roc_auc_score(y, stack_oof)
 print(f"[OOF] Stacking (CV meta-learner): {stack_auc:.6f}")
 
 # Pick best
-final_auc = max(lgbm_auc, xgb_auc, avg_auc, weighted_auc, stack_auc)
-method = ['LGBM', 'XGB', 'SimpleAvg', 'WeightedAvg', 'Stack'][
-    [lgbm_auc, xgb_auc, avg_auc, weighted_auc, stack_auc].index(final_auc)]
+all_preds = candidates + [avg_preds, weighted_preds, stack_oof]
+all_aucs = candidate_aucs + [avg_auc, weighted_auc, stack_auc]
+all_names = candidate_names + ['SimpleAvg', 'WeightedAvg', 'Stack']
+final_auc = max(all_aucs)
+method = all_names[all_aucs.index(final_auc)]
 print(f"\n[RESULT] Best OOF AUC: {final_auc:.6f} ({method})")
 print(f"BEST_VAL_ROC_AUC: {final_auc:.6f}")
