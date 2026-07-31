@@ -14,6 +14,7 @@ from sklearn.metrics import roc_auc_score
 import lightgbm as lgb
 import xgboost as xgb
 from catboost import CatBoostClassifier
+from scipy.optimize import minimize
 import optuna
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -302,11 +303,12 @@ print(f"Features ({len(X_train_fe.columns)}): {list(X_train_fe.columns)}")
 # ── LightGBM Optuna HPO ───────────────────────────────────────────────────────
 
 def objective_lgbm(trial):
+    boosting_type = trial.suggest_categorical('boosting_type', ['gbdt', 'dart'])
     params = {
         'objective':         'binary',
         'metric':            'auc',
         'verbosity':         -1,
-        'boosting_type':     'gbdt',
+        'boosting_type':     boosting_type,
         'num_leaves':        trial.suggest_int('num_leaves', 15, 127),
         'learning_rate':     trial.suggest_float('learning_rate', 0.005, 0.2, log=True),
         'min_child_samples': trial.suggest_int('min_child_samples', 3, 50),
@@ -319,16 +321,23 @@ def objective_lgbm(trial):
         'n_estimators':      500,
         'random_state':      42,
     }
+    if boosting_type == 'dart':
+        params['drop_rate']  = trial.suggest_float('drop_rate', 0.05, 0.5)
+        params['skip_drop']  = trial.suggest_float('skip_drop', 0.1, 0.9)
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     aucs = []
     for tr_idx, vl_idx in skf.split(X_train_fe, y_train):
         Xf_tr, Xf_val = X_train_fe.iloc[tr_idx], X_train_fe.iloc[vl_idx]
         yf_tr, yf_val = y_train[tr_idx],          y_train[vl_idx]
         clf = lgb.LGBMClassifier(**params)
-        clf.fit(Xf_tr, yf_tr,
-                eval_set=[(Xf_val, yf_val)],
-                callbacks=[lgb.early_stopping(50, verbose=False),
-                           lgb.log_evaluation(period=-1)])
+        if boosting_type == 'dart':
+            # DART does not support early stopping reliably — use fixed n_estimators
+            clf.fit(Xf_tr, yf_tr)
+        else:
+            clf.fit(Xf_tr, yf_tr,
+                    eval_set=[(Xf_val, yf_val)],
+                    callbacks=[lgb.early_stopping(50, verbose=False),
+                               lgb.log_evaluation(period=-1)])
         aucs.append(roc_auc_score(yf_val, clf.predict_proba(Xf_val)[:, 1]))
     return float(np.mean(aucs))
 
@@ -342,16 +351,22 @@ study_lgbm.optimize(objective_lgbm, n_trials=80, show_progress_bar=False)
 print(f"Best LGBM CV AUC: {study_lgbm.best_value:.6f}")
 
 best_lgbm_params = study_lgbm.best_params.copy()
+lgbm_boosting = best_lgbm_params.get('boosting_type', 'gbdt')
+print(f"Best LGBM boosting type: {lgbm_boosting}")
 best_lgbm_params.update({
     'objective': 'binary', 'metric': 'auc', 'verbosity': -1,
-    'boosting_type': 'gbdt', 'bagging_freq': 1,
-    'n_estimators': 2000, 'random_state': 42,
+    'bagging_freq': 1, 'random_state': 42,
+    # DART: fixed iters (no early stopping); GBDT: large cap with early stopping
+    'n_estimators': 500 if lgbm_boosting == 'dart' else 2000,
 })
 final_lgbm = lgb.LGBMClassifier(**best_lgbm_params)
-final_lgbm.fit(X_train_fe, y_train,
-               eval_set=[(X_val_fe, y_val)],
-               callbacks=[lgb.early_stopping(150, verbose=False),
-                          lgb.log_evaluation(period=-1)])
+if lgbm_boosting == 'dart':
+    final_lgbm.fit(X_train_fe, y_train)
+else:
+    final_lgbm.fit(X_train_fe, y_train,
+                   eval_set=[(X_val_fe, y_val)],
+                   callbacks=[lgb.early_stopping(150, verbose=False),
+                              lgb.log_evaluation(period=-1)])
 lgbm_preds = final_lgbm.predict_proba(X_val_fe)[:, 1]
 lgbm_auc   = roc_auc_score(y_val, lgbm_preds)
 print(f"LGBM val AUC: {lgbm_auc:.6f}")
@@ -557,10 +572,13 @@ for tr_idx, vl_idx in skf5.split(X_train_fe, y_train):
     yf_tr, yf_vl = y_train[tr_idx], y_train[vl_idx]
 
     _lgbm = lgb.LGBMClassifier(**best_lgbm_params)
-    _lgbm.fit(Xf_tr, yf_tr,
-              eval_set=[(Xf_vl, yf_vl)],
-              callbacks=[lgb.early_stopping(150, verbose=False),
-                         lgb.log_evaluation(period=-1)])
+    if lgbm_boosting == 'dart':
+        _lgbm.fit(Xf_tr, yf_tr)
+    else:
+        _lgbm.fit(Xf_tr, yf_tr,
+                  eval_set=[(Xf_vl, yf_vl)],
+                  callbacks=[lgb.early_stopping(150, verbose=False),
+                             lgb.log_evaluation(period=-1)])
     oof_lgbm[vl_idx] = _lgbm.predict_proba(Xf_vl)[:, 1]
 
     _xgb = xgb.XGBClassifier(**best_xgb_params)
@@ -586,6 +604,29 @@ oof_auc_rf   = roc_auc_score(y_train, oof_rf)
 oof_auc_hist = roc_auc_score(y_train, oof_hist)
 print(f"OOF AUC — LGBM:{oof_auc_lgbm:.4f}, XGB:{oof_auc_xgb:.4f}, "
       f"Cat:{oof_auc_cat:.4f}, RF:{oof_auc_rf:.4f}, Hist:{oof_auc_hist:.4f}")
+
+# ── Nelder-Mead optimal blend on OOF (no val leakage) ────────────────────────
+_oof_list = [oof_lgbm, oof_xgb, oof_cat, oof_rf, oof_hist]
+_val_list  = [lgbm_preds, xgb_preds, cat_preds, rf_preds, hist_preds]
+
+def _neg_auc_oof(raw_w):
+    w = np.abs(raw_w)
+    s = w.sum()
+    if s < 1e-12:
+        return 1.0
+    w = w / s
+    blend = sum(w[i] * _oof_list[i] for i in range(5))
+    return -roc_auc_score(y_train, blend)
+
+_init = np.ones(5) / 5
+_res  = minimize(_neg_auc_oof, _init, method='Nelder-Mead',
+                 options={'maxiter': 20000, 'xatol': 1e-9, 'fatol': 1e-9})
+_opt_w = np.abs(_res.x); _opt_w /= _opt_w.sum()
+print(f"NM weights: LGBM={_opt_w[0]:.3f} XGB={_opt_w[1]:.3f} "
+      f"Cat={_opt_w[2]:.3f} RF={_opt_w[3]:.3f} Hist={_opt_w[4]:.3f}")
+nelder_preds = sum(_opt_w[i] * _val_list[i] for i in range(5))
+nelder_auc   = roc_auc_score(y_val, nelder_preds)
+print(f"Nelder-Mead blend val AUC: {nelder_auc:.6f}")
 
 # Build augmented meta-learner features: 5 OOF preds + key raw features
 # Adding WomanOrMasterBoy, Pclass, TE_Title, TE_Sex_Pclass to help meta-learner
@@ -636,6 +677,6 @@ print(f"Ensemble weighted AUC: {ens_weighted_auc:.6f}")
 
 best_val_roc_auc = max(
     lgbm_auc, xgb_auc, cat_auc, rf_auc, hist_auc,
-    ens_equal_auc, ens_weighted_auc, stacked_auc
+    ens_equal_auc, ens_weighted_auc, stacked_auc, nelder_auc
 )
 print(f"BEST_VAL_ROC_AUC: {best_val_roc_auc:.6f}")
