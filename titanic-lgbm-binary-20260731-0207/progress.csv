@@ -1,2 +1,3 @@
 experiment_id,description,model_name,metric_name,metric_value,improved,duration_s,commit,notes
 0,"baseline: LightGBM with Optuna HPO (50 trials, 5-fold CV) on Titanic tabular data — optimal for N=891 small tabular dataset with mixed numeric/categorical features where GBMs dominate over deep models",,roc_auc,,false,2.5,,"ValueError: pandas dtypes must be int, float or bool."
+1,"Fix crash (Arrow StringDtype not detected as categorical → force numpy dtypes); add richer features (HasCabin from fill sentinel, TicketGroupSize, Fare_PerPerson, IsChild/IsElder, Sex_Pclass interaction); ensemble LightGBM+XGBoost with Optuna HPO (80+60 trials)",,roc_auc,0.857839,true,49.2,ddec6c4,

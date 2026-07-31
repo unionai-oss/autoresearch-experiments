@@ -8,18 +8,17 @@ import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.preprocessing import LabelEncoder
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 import lightgbm as lgb
 import xgboost as xgb
+from catboost import CatBoostClassifier
 import optuna
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 # ── Load data ────────────────────────────────────────────────────────────────
 df = pd.read_parquet(DATA_PATH)
 
-# Convert Arrow/nullable extension dtypes to standard numpy types.
-# Pandas 2+ uses StringDtype (Arrow-backed), Int64Dtype, Float64Dtype which
-# LightGBM / XGBoost reject with "pandas dtypes must be int, float or bool."
 def to_numpy_dtypes(frame):
     frame = frame.copy()
     for col in frame.columns:
@@ -27,7 +26,6 @@ def to_numpy_dtypes(frame):
         if isinstance(dtype, pd.StringDtype) or str(dtype) in ('str', 'string'):
             frame[col] = frame[col].astype(object)
         elif pd.api.types.is_extension_array_dtype(dtype):
-            # Handles Int64Dtype, Float64Dtype, BooleanDtype, ArrowDtype…
             numpy_dtype = getattr(dtype, 'numpy_dtype', np.float64)
             frame[col] = frame[col].to_numpy(dtype=numpy_dtype, na_value=np.nan)
     return frame
@@ -36,7 +34,7 @@ df = to_numpy_dtypes(df)
 
 target_col = "Survived"
 X = df.drop(columns=[target_col])
-y = df[target_col].astype(int).values   # plain numpy int array
+y = df[target_col].astype(int).values
 
 X_train, X_val, y_train, y_val = train_test_split(
     X, y, test_size=0.2, stratify=y, random_state=42
@@ -46,41 +44,52 @@ print(f"Dataset: total={len(df)}, train={len(X_train)}, val={len(X_val)}")
 print(f"Class dist — 0:{(y==0).sum()}, 1:{(y==1).sum()}")
 
 # ── Feature engineering ──────────────────────────────────────────────────────
-
-# Compute ticket-group sizes from the full X (structural feature, not label-derived)
 ticket_sizes_global = X['Ticket'].value_counts().to_dict()
 
+TITLE_MAP = {
+    'Mr': 'Mr', 'Miss': 'Miss', 'Mrs': 'Mrs', 'Master': 'Master',
+    'Mlle': 'Miss', 'Ms': 'Miss', 'Mme': 'Mrs',
+    'Col': 'Officer', 'Major': 'Officer', 'Capt': 'Officer',
+    'Dr': 'Rare', 'Rev': 'Rare', 'Sir': 'Royalty', 'Lady': 'Royalty',
+    'Don': 'Royalty', 'Countess': 'Royalty', 'Jonkheer': 'Royalty',
+}
+
+
 def compute_fill_values(df_in):
+    """Compute fill values from training set only — no val leakage."""
     fv = {}
-    fv['Age_median']      = df_in['Age'].median()
-    fv['Fare_median']     = df_in['Fare'].median()
+    titles_raw = df_in['Name'].str.extract(r' ([A-Za-z]+)\.', expand=False)
+    titles = titles_raw.map(TITLE_MAP).fillna('Rare')
+    temp = df_in.copy()
+    temp['_title'] = titles
+    global_med = df_in['Age'].median()
+    title_age = temp.groupby('_title')['Age'].median().to_dict()
+    # Fill any title with no median with global median
+    for t in ['Mr', 'Miss', 'Mrs', 'Master', 'Officer', 'Rare', 'Royalty']:
+        if t not in title_age or pd.isna(title_age.get(t, np.nan)):
+            title_age[t] = global_med
+    fv['Age_by_Title'] = title_age
+    fv['Age_global_median'] = global_med
+    fv['Fare_median'] = df_in['Fare'].median()
     mode = df_in['Embarked'].mode()
-    fv['Embarked_mode']   = mode.iloc[0] if len(mode) > 0 else 'S'
+    fv['Embarked_mode'] = mode.iloc[0] if len(mode) > 0 else 'S'
     return fv
 
 
 def transform_features(df_in, fill_vals, ticket_sizes):
     d = df_in.copy()
 
-    # PassengerId — random ID, no signal
     if 'PassengerId' in d.columns:
         d = d.drop(columns=['PassengerId'])
 
-    # ── Name → Title ─────────────────────────────────────────────────────────
+    # ── Name → Title + NameLen ───────────────────────────────────────────────
     if 'Name' in d.columns:
+        d['NameLen'] = d['Name'].str.len()
         d['Title'] = d['Name'].str.extract(r' ([A-Za-z]+)\.', expand=False)
-        title_map = {
-            'Mr': 'Mr', 'Miss': 'Miss', 'Mrs': 'Mrs', 'Master': 'Master',
-            'Mlle': 'Miss', 'Ms': 'Miss', 'Mme': 'Mrs',
-            'Col': 'Officer', 'Major': 'Officer', 'Capt': 'Officer',
-            'Dr': 'Rare', 'Rev': 'Rare', 'Sir': 'Royalty', 'Lady': 'Royalty',
-            'Don': 'Royalty', 'Countess': 'Royalty', 'Jonkheer': 'Royalty',
-        }
-        d['Title'] = d['Title'].map(title_map).fillna('Rare')
+        d['Title'] = d['Title'].map(TITLE_MAP).fillna('Rare')
         d = d.drop(columns=['Name'])
 
     # ── Cabin → HasCabin + Deck ───────────────────────────────────────────────
-    # In this dataset the NaN fill value for Cabin is 'B96 B98' (dominant value)
     if 'Cabin' in d.columns:
         CABIN_FILL = 'B96 B98'
         d['HasCabin'] = (d['Cabin'] != CABIN_FILL).astype(int)
@@ -89,7 +98,7 @@ def transform_features(df_in, fill_vals, ticket_sizes):
         d['Deck'] = d['Deck'].fillna('U')
         d = d.drop(columns=['Cabin'])
 
-    # ── Ticket → group size + prefix ─────────────────────────────────────────
+    # ── Ticket → TicketGroupSize + Prefix ────────────────────────────────────
     if 'Ticket' in d.columns:
         d['TicketGroupSize'] = d['Ticket'].map(ticket_sizes).fillna(1).astype(float)
         d['Ticket_Prefix'] = (
@@ -97,12 +106,23 @@ def transform_features(df_in, fill_vals, ticket_sizes):
         )
         d = d.drop(columns=['Ticket'])
 
-    # ── Age ───────────────────────────────────────────────────────────────────
+    # ── Age: title-based imputation ───────────────────────────────────────────
     if 'Age' in d.columns:
         d['Age_Missing'] = d['Age'].isna().astype(int)
-        d['Age'] = d['Age'].fillna(fill_vals['Age_median'])
+        age_by_title = fill_vals['Age_by_Title']
+        global_med = fill_vals['Age_global_median']
+        if 'Title' in d.columns:
+            mask = d['Age'].isna()
+            d.loc[mask, 'Age'] = d.loc[mask, 'Title'].map(age_by_title).fillna(global_med)
+        else:
+            d['Age'] = d['Age'].fillna(global_med)
         d['IsChild'] = (d['Age'] < 15).astype(int)
         d['IsElder'] = (d['Age'] > 60).astype(int)
+        # Age bins: infant, child, teen, young adult, adult, middle age, senior, elderly
+        d['AgeBin'] = pd.cut(
+            d['Age'], bins=[0, 5, 12, 18, 25, 35, 50, 65, 200],
+            labels=False, right=True
+        ).fillna(0).astype(int)
 
     # ── Embarked ──────────────────────────────────────────────────────────────
     if 'Embarked' in d.columns:
@@ -113,25 +133,45 @@ def transform_features(df_in, fill_vals, ticket_sizes):
         d['Fare'] = d['Fare'].fillna(fill_vals['Fare_median'])
         d['Fare_Log'] = np.log1p(d['Fare'])
         if 'TicketGroupSize' in d.columns:
-            d['Fare_PerPerson']     = d['Fare'] / d['TicketGroupSize'].clip(lower=1)
+            d['Fare_PerPerson'] = d['Fare'] / d['TicketGroupSize'].clip(lower=1)
             d['Fare_PerPerson_Log'] = np.log1p(d['Fare_PerPerson'])
 
     # ── Family size ───────────────────────────────────────────────────────────
     if 'SibSp' in d.columns and 'Parch' in d.columns:
         d['FamilySize'] = d['SibSp'] + d['Parch'] + 1
-        d['IsAlone']    = (d['FamilySize'] == 1).astype(int)
-        # Ordinal family category: 1=alone, 2-4=small, 5+=large
+        d['IsAlone'] = (d['FamilySize'] == 1).astype(int)
         d['FamilyBucket'] = d['FamilySize'].clip(upper=5)
+
+    # ── "Women and children first" features ──────────────────────────────────
+    sex_str = d['Sex'].astype(str) if 'Sex' in d.columns else None
+    title_col = d['Title'] if 'Title' in d.columns else None
+
+    if sex_str is not None and title_col is not None:
+        # Core survival signal: female or Master (young boy)
+        d['WomanOrMasterBoy'] = (
+            (sex_str == 'female') | (title_col == 'Master')
+        ).astype(int)
+        # Mother: adult female with children aboard, not unmarried
+        if 'Age' in d.columns and 'Parch' in d.columns:
+            d['IsMother'] = (
+                (sex_str == 'female') &
+                (d['Parch'] > 0) &
+                (d['Age'] > 18) &
+                (title_col != 'Miss')
+            ).astype(int)
 
     # ── Interaction features ──────────────────────────────────────────────────
     if 'Age' in d.columns and 'Pclass' in d.columns:
         d['Age_x_Pclass'] = d['Age'] * d['Pclass']
 
     if 'Sex' in d.columns and 'Pclass' in d.columns:
-        # Encode before interaction so both sides are numeric later
-        d['Sex_Pclass'] = (
-            d['Sex'].astype(str) + '_' + d['Pclass'].astype(str)
-        )
+        d['Sex_Pclass'] = d['Sex'].astype(str) + '_' + d['Pclass'].astype(str)
+
+    if 'Pclass' in d.columns and 'Embarked' in d.columns:
+        d['Pclass_Embarked'] = d['Pclass'].astype(str) + '_' + d['Embarked'].astype(str)
+
+    if 'FamilySize' in d.columns and 'Pclass' in d.columns:
+        d['FamilySize_x_Pclass'] = d['FamilySize'] * d['Pclass']
 
     return d
 
@@ -151,7 +191,7 @@ def label_encode(df_in, encoders=None, fit=False):
                 enc = encoders.get(c)
                 if enc is not None:
                     col_str = df_in[c].astype(str)
-                    known   = set(enc.classes_)
+                    known = set(enc.classes_)
                     col_str = col_str.map(lambda v: v if v in known else enc.classes_[0])
                     df_in[c] = enc.transform(col_str)
                 else:
@@ -167,7 +207,6 @@ X_val_raw   = transform_features(X_val,   fill_vals, ticket_sizes_global)
 X_train_fe, cat_encs = label_encode(X_train_raw, fit=True)
 X_val_fe,   _        = label_encode(X_val_raw, encoders=cat_encs, fit=False)
 
-# Force all columns to float64 — guarantees compatibility with both LGBM and XGB
 X_train_fe = X_train_fe.astype(np.float64)
 X_val_fe   = X_val_fe.astype(np.float64)
 
@@ -215,13 +254,13 @@ study_lgbm = optuna.create_study(
 study_lgbm.optimize(objective_lgbm, n_trials=80, show_progress_bar=False)
 print(f"Best LGBM CV AUC: {study_lgbm.best_value:.6f}")
 
-best_lgbm = study_lgbm.best_params.copy()
-best_lgbm.update({
+best_lgbm_params = study_lgbm.best_params.copy()
+best_lgbm_params.update({
     'objective': 'binary', 'metric': 'auc', 'verbosity': -1,
     'boosting_type': 'gbdt', 'bagging_freq': 1,
     'n_estimators': 2000, 'random_state': 42,
 })
-final_lgbm = lgb.LGBMClassifier(**best_lgbm)
+final_lgbm = lgb.LGBMClassifier(**best_lgbm_params)
 final_lgbm.fit(X_train_fe, y_train,
                eval_set=[(X_val_fe, y_val)],
                callbacks=[lgb.early_stopping(150, verbose=False),
@@ -268,13 +307,13 @@ study_xgb = optuna.create_study(
 study_xgb.optimize(objective_xgb, n_trials=60, show_progress_bar=False)
 print(f"Best XGB CV AUC: {study_xgb.best_value:.6f}")
 
-best_xgb = study_xgb.best_params.copy()
-best_xgb.update({
+best_xgb_params = study_xgb.best_params.copy()
+best_xgb_params.update({
     'objective': 'binary:logistic', 'eval_metric': 'auc',
     'n_estimators': 2000, 'random_state': 42, 'verbosity': 0,
     'early_stopping_rounds': 150,
 })
-final_xgb = xgb.XGBClassifier(**best_xgb)
+final_xgb = xgb.XGBClassifier(**best_xgb_params)
 final_xgb.fit(X_train_fe, y_train,
               eval_set=[(X_val_fe, y_val)],
               verbose=False)
@@ -282,10 +321,113 @@ xgb_preds = final_xgb.predict_proba(X_val_fe)[:, 1]
 xgb_auc   = roc_auc_score(y_val, xgb_preds)
 print(f"XGB  val AUC: {xgb_auc:.6f}")
 
-# ── Ensemble ─────────────────────────────────────────────────────────────────
-ens_preds = (lgbm_preds + xgb_preds) / 2.0
-ens_auc   = roc_auc_score(y_val, ens_preds)
-print(f"Ensemble AUC: {ens_auc:.6f}")
+# ── CatBoost Optuna HPO ───────────────────────────────────────────────────────
 
-best_val_roc_auc = max(lgbm_auc, xgb_auc, ens_auc)
+def objective_cat(trial):
+    params = {
+        'iterations':          500,
+        'learning_rate':       trial.suggest_float('learning_rate', 0.01, 0.3, log=True),
+        'depth':               trial.suggest_int('depth', 4, 10),
+        'l2_leaf_reg':         trial.suggest_float('l2_leaf_reg', 1e-2, 10.0, log=True),
+        'border_count':        trial.suggest_int('border_count', 32, 255),
+        'bagging_temperature': trial.suggest_float('bagging_temperature', 0.0, 1.0),
+        'random_strength':     trial.suggest_float('random_strength', 0.5, 5.0),
+        'eval_metric':         'AUC',
+        'random_seed':         42,
+        'verbose':             0,
+        'train_dir':           '/tmp/catboost_info',
+        'early_stopping_rounds': 50,
+    }
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    aucs = []
+    for tr_idx, vl_idx in skf.split(X_train_fe, y_train):
+        Xf_tr, Xf_val = X_train_fe.iloc[tr_idx], X_train_fe.iloc[vl_idx]
+        yf_tr, yf_val = y_train[tr_idx],          y_train[vl_idx]
+        clf = CatBoostClassifier(**params)
+        clf.fit(Xf_tr, yf_tr, eval_set=(Xf_val, yf_val), verbose=False)
+        aucs.append(roc_auc_score(yf_val, clf.predict_proba(Xf_val)[:, 1]))
+    return float(np.mean(aucs))
+
+
+print("CatBoost HPO: 50 trials …")
+study_cat = optuna.create_study(
+    direction='maximize',
+    sampler=optuna.samplers.TPESampler(seed=42),
+)
+study_cat.optimize(objective_cat, n_trials=50, show_progress_bar=False)
+print(f"Best CatBoost CV AUC: {study_cat.best_value:.6f}")
+
+best_cat_params = study_cat.best_params.copy()
+best_cat_params.update({
+    'eval_metric':  'AUC',
+    'random_seed':  42,
+    'verbose':      0,
+    'train_dir':    '/tmp/catboost_info',
+    'iterations':   2000,
+    'early_stopping_rounds': 150,
+})
+final_cat = CatBoostClassifier(**best_cat_params)
+final_cat.fit(X_train_fe, y_train, eval_set=(X_val_fe, y_val), verbose=False)
+cat_preds = final_cat.predict_proba(X_val_fe)[:, 1]
+cat_auc   = roc_auc_score(y_val, cat_preds)
+print(f"CatBoost val AUC: {cat_auc:.6f}")
+
+# ── Stacking: OOF-based meta-learner (LogisticRegression) ────────────────────
+print("Generating OOF predictions for stacking …")
+skf5 = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+oof_lgbm = np.zeros(len(X_train_fe))
+oof_xgb  = np.zeros(len(X_train_fe))
+oof_cat  = np.zeros(len(X_train_fe))
+
+for tr_idx, vl_idx in skf5.split(X_train_fe, y_train):
+    Xf_tr, Xf_vl = X_train_fe.iloc[tr_idx], X_train_fe.iloc[vl_idx]
+    yf_tr, yf_vl = y_train[tr_idx], y_train[vl_idx]
+
+    _lgbm = lgb.LGBMClassifier(**best_lgbm_params)
+    _lgbm.fit(Xf_tr, yf_tr,
+              eval_set=[(Xf_vl, yf_vl)],
+              callbacks=[lgb.early_stopping(150, verbose=False),
+                         lgb.log_evaluation(period=-1)])
+    oof_lgbm[vl_idx] = _lgbm.predict_proba(Xf_vl)[:, 1]
+
+    _xgb = xgb.XGBClassifier(**best_xgb_params)
+    _xgb.fit(Xf_tr, yf_tr, eval_set=[(Xf_vl, yf_vl)], verbose=False)
+    oof_xgb[vl_idx] = _xgb.predict_proba(Xf_vl)[:, 1]
+
+    _cat = CatBoostClassifier(**best_cat_params)
+    _cat.fit(Xf_tr, yf_tr, eval_set=(Xf_vl, yf_vl), verbose=False)
+    oof_cat[vl_idx] = _cat.predict_proba(Xf_vl)[:, 1]
+
+oof_auc_lgbm = roc_auc_score(y_train, oof_lgbm)
+oof_auc_xgb  = roc_auc_score(y_train, oof_xgb)
+oof_auc_cat  = roc_auc_score(y_train, oof_cat)
+print(f"OOF AUC — LGBM: {oof_auc_lgbm:.4f}, XGB: {oof_auc_xgb:.4f}, Cat: {oof_auc_cat:.4f}")
+
+# Train meta-learner on OOF (no val label leakage)
+oof_meta = np.column_stack([oof_lgbm, oof_xgb, oof_cat])
+val_meta = np.column_stack([lgbm_preds, xgb_preds, cat_preds])
+
+meta_lr = LogisticRegression(C=10, max_iter=1000, random_state=42)
+meta_lr.fit(oof_meta, y_train)
+stacked_preds = meta_lr.predict_proba(val_meta)[:, 1]
+stacked_auc   = roc_auc_score(y_val, stacked_preds)
+print(f"Stacked LR val AUC: {stacked_auc:.6f}")
+
+# ── Ensemble comparison ──────────────────────────────────────────────────────
+ens_equal = (lgbm_preds + xgb_preds + cat_preds) / 3.0
+ens_equal_auc = roc_auc_score(y_val, ens_equal)
+
+# Weight by CV AUC scores
+cv_aucs = np.array([study_lgbm.best_value, study_xgb.best_value, study_cat.best_value])
+weights = cv_aucs / cv_aucs.sum()
+ens_weighted = weights[0] * lgbm_preds + weights[1] * xgb_preds + weights[2] * cat_preds
+ens_weighted_auc = roc_auc_score(y_val, ens_weighted)
+
+print(f"Ensemble equal    AUC: {ens_equal_auc:.6f}")
+print(f"Ensemble weighted AUC: {ens_weighted_auc:.6f}")
+
+best_val_roc_auc = max(
+    lgbm_auc, xgb_auc, cat_auc,
+    ens_equal_auc, ens_weighted_auc, stacked_auc
+)
 print(f"BEST_VAL_ROC_AUC: {best_val_roc_auc:.6f}")
