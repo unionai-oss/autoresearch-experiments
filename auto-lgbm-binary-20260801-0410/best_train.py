@@ -103,6 +103,7 @@ def engineer(df_tr: pd.DataFrame, df_va: pd.DataFrame):
             df['FareLog'] = np.log1p(df['Fare'])
             if 'FamilySize' in df.columns:
                 df['FarePerPerson'] = df['Fare'] / df['FamilySize'].clip(lower=1)
+                df['FarePerPersonLog'] = np.log1p(df['FarePerPerson'])
 
         # Age features (now using properly imputed Age)
         if 'Age' in df.columns:
@@ -118,6 +119,11 @@ def engineer(df_tr: pd.DataFrame, df_va: pd.DataFrame):
         if 'Sex' in df.columns and 'Age' in df.columns:
             df['IsAdultMale'] = (
                 (df['Sex'] == 'male') & (df['Age'] >= 16)
+            ).astype(np.int8)
+            # Combined "protected group" flag: captures interaction that
+            # IsAdultMale + IsChild alone don't cover (e.g. male teens 14-15)
+            df['WomenChild'] = (
+                (df['Sex'] == 'female') | (df['Age'] < 14)
             ).astype(np.int8)
             if 'Parch' in df.columns and 'Pclass' in df.columns:
                 df['IsMother'] = (
@@ -139,6 +145,10 @@ def engineer(df_tr: pd.DataFrame, df_va: pd.DataFrame):
         # Sex × Pclass interaction
         if 'Sex' in df.columns and 'Pclass' in df.columns:
             df['SexPclass'] = df['Sex'].astype(str) + '_' + df['Pclass'].astype(str)
+
+        # Title × Pclass interaction (finer-grained than SexPclass)
+        if 'Title' in df.columns and 'Pclass' in df.columns:
+            df['TitlePclass'] = df['Title'].astype(str) + '_' + df['Pclass'].astype(str)
 
         frames[i] = df
 
@@ -271,7 +281,7 @@ def lgbm_objective(trial):
 
 lgbm_sampler = optuna.samplers.TPESampler(seed=42)
 lgbm_study = optuna.create_study(direction='maximize', sampler=lgbm_sampler)
-lgbm_study.optimize(lgbm_objective, n_trials=60, show_progress_bar=False)
+lgbm_study.optimize(lgbm_objective, n_trials=80, show_progress_bar=False)
 
 lgbm_best_cv_auc = lgbm_study.best_value
 lgbm_best_params = lgbm_study.best_params
@@ -319,7 +329,7 @@ def catboost_objective(trial):
 
 cat_sampler = optuna.samplers.TPESampler(seed=123)
 cat_study = optuna.create_study(direction='maximize', sampler=cat_sampler)
-cat_study.optimize(catboost_objective, n_trials=30, show_progress_bar=False)
+cat_study.optimize(catboost_objective, n_trials=40, show_progress_bar=False)
 
 cat_best_cv_auc = cat_study.best_value
 cat_best_params = cat_study.best_params
