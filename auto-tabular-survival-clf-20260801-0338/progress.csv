@@ -1,1 +1,2 @@
 experiment_id,description,model_name,metric_name,metric_value,improved,duration_s,commit,notes
+0,"baseline: LightGBM (Optuna-tuned, 5-fold CV) + CatBoost ensemble for a 100-sample binary tabular task — GBMs are the correct choice at N=100 and CatBoost's native categorical handling suits the 5 categorical columns",,roc_auc,0.614583,true,19.5,38c7a1a,
