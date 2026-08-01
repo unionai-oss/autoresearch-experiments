@@ -1,1 +1,2 @@
 experiment_id,description,model_name,metric_name,metric_value,improved,duration_s,commit,notes
+0,"baseline: LightGBM with 5-fold stratified CV on Titanic tabular data (N=100); Titanic-aware feature engineering (title extraction, cabin deck, family size, log-Fare); OOF AUC reported as primary metric per small-N guidance",,roc_auc,0.816875,true,2.7,cdcfbf3,
