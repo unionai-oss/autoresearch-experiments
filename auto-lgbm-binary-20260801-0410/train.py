@@ -59,20 +59,43 @@ def engineer(df_tr: pd.DataFrame, df_va: pd.DataFrame):
     """
     frames = [df_tr.copy(), df_va.copy()]
 
+    # ── Step 1: Drop IDs and extract Title (needed for Age imputation) ─────────
     for i, df in enumerate(frames):
-        # Drop PassengerId – it's just a sequential ID, not predictive
         if 'PassengerId' in df.columns:
             df = df.drop(columns=['PassengerId'])
-
-        # Title from Name
         if 'Name' in df.columns:
             df['Title'] = df['Name'].apply(get_title)
             df = df.drop(columns=['Name'])
+        frames[i] = df
 
-        # Family size
+    # ── Step 2: Smart Age imputation from training group medians ─────────────
+    # Must be computed from train only to avoid data leakage
+    if 'Age' in frames[0].columns:
+        age_group_med = frames[0].groupby(['Title', 'Pclass'])['Age'].median()
+        overall_age_med = frames[0]['Age'].median()
+
+        def fill_age(row, grp_med=age_group_med, overall=overall_age_med):
+            if pd.notna(row['Age']):
+                return row['Age']
+            key = (row['Title'], row['Pclass'])
+            if key in grp_med.index and pd.notna(grp_med[key]):
+                return grp_med[key]
+            return overall
+
+        for i, df in enumerate(frames):
+            df['AgeMissing'] = df['Age'].isna().astype(np.int8)
+            df['Age'] = df.apply(fill_age, axis=1)
+            frames[i] = df
+
+    # ── Step 3: Remaining features ────────────────────────────────────────────
+    for i, df in enumerate(frames):
+        # Family size & groups
         if 'SibSp' in df.columns and 'Parch' in df.columns:
             df['FamilySize'] = df['SibSp'] + df['Parch'] + 1
             df['IsAlone'] = (df['FamilySize'] == 1).astype(np.int8)
+            # Alone=0, Small (2-4)=1, Large (5+)=2
+            df['FamilyGroup'] = np.where(df['FamilySize'] == 1, 0,
+                                 np.where(df['FamilySize'] <= 4, 1, 2)).astype(np.int8)
 
         # Fare features
         if 'Fare' in df.columns:
@@ -80,11 +103,28 @@ def engineer(df_tr: pd.DataFrame, df_va: pd.DataFrame):
             if 'FamilySize' in df.columns:
                 df['FarePerPerson'] = df['Fare'] / df['FamilySize'].clip(lower=1)
 
-        # Age features
+        # Age features (now using properly imputed Age)
         if 'Age' in df.columns:
             df['IsChild'] = (df['Age'] < 14).astype(np.int8)
+            # Age bins: 0=child(0-12), 1=teen(13-18), 2=young(19-35), 3=mid(36-60), 4=senior(61+)
+            df['AgeBin'] = pd.cut(
+                df['Age'], bins=[0, 12, 18, 35, 60, 150], labels=False
+            ).fillna(0).astype(np.int8)
             if 'Pclass' in df.columns:
                 df['AgePclass'] = df['Age'] * df['Pclass']
+
+        # Adult male / mother flags — strong "women and children first" signals
+        if 'Sex' in df.columns and 'Age' in df.columns:
+            df['IsAdultMale'] = (
+                (df['Sex'] == 'male') & (df['Age'] >= 16)
+            ).astype(np.int8)
+            if 'Parch' in df.columns and 'Pclass' in df.columns:
+                df['IsMother'] = (
+                    (df['Sex'] == 'female') &
+                    (df['Age'] > 18) &
+                    (df['Parch'] > 0) &
+                    (df['Pclass'] != 3)
+                ).astype(np.int8)
 
         # Cabin: single-char 'D' is the unknown-cabin fill
         if 'Cabin' in df.columns:
@@ -278,7 +318,7 @@ def catboost_objective(trial):
 
 cat_sampler = optuna.samplers.TPESampler(seed=123)
 cat_study = optuna.create_study(direction='maximize', sampler=cat_sampler)
-cat_study.optimize(catboost_objective, n_trials=20, show_progress_bar=False)
+cat_study.optimize(catboost_objective, n_trials=30, show_progress_bar=False)
 
 cat_best_cv_auc = cat_study.best_value
 cat_best_params = cat_study.best_params
