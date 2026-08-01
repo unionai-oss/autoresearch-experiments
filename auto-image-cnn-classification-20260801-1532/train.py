@@ -45,13 +45,13 @@ train_idx, val_idx = train_test_split(
 
 # Compute class distribution in train and val splits
 train_labels_list = [all_labels[i] for i in train_idx]
-val_labels_list = [all_labels[i] for i in val_idx]
+val_labels_list   = [all_labels[i] for i in val_idx]
 
 train_class_dist = Counter(train_labels_list)
-val_class_dist = Counter(val_labels_list)
+val_class_dist   = Counter(val_labels_list)
 
 train_class_dist_named = {idx_to_class[k]: v for k, v in sorted(train_class_dist.items())}
-val_class_dist_named = {idx_to_class[k]: v for k, v in sorted(val_class_dist.items())}
+val_class_dist_named   = {idx_to_class[k]: v for k, v in sorted(val_class_dist.items())}
 print(f"[DATA] Train class dist: {train_class_dist_named}")
 print(f"[DATA] Val class dist:   {val_class_dist_named}")
 
@@ -76,14 +76,22 @@ if img_channels == 1:
 else:
     _ch_pre = []
 
-# Training transform — augmentation including random crop, flip, jitter, erasing
+# Training transform — augmentation including h-flip, v-flip, 90°-rotation, jitter, erasing
+# 90°-multiple rotations are natural for nadir satellite imagery (4-fold symmetry)
 train_transform = transforms.Compose(
     _ch_pre + [
         transforms.Resize((native_h, native_w)),
         transforms.RandomHorizontalFlip(),
         transforms.RandomVerticalFlip(),
+        transforms.RandomApply([
+            transforms.RandomChoice([
+                transforms.RandomRotation((90, 90)),
+                transforms.RandomRotation((180, 180)),
+                transforms.RandomRotation((270, 270)),
+            ])
+        ], p=0.5),
         transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1),
-        transforms.RandomRotation(15),
+        transforms.RandomRotation(10),
         transforms.ToTensor(),
         transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
         transforms.RandomErasing(p=0.25),
@@ -122,16 +130,19 @@ val_loader = DataLoader(
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"[TRAIN] Device: {device}")
 
-# ConvNeXt-Tiny — 28M params, stronger than EfficientNet-B2 on benchmarks
-# Modern architecture with depthwise convolutions, outperforms EfficientNet at similar speed
-model = timm.create_model("convnext_tiny", pretrained=True, num_classes=num_classes)
+# ConvNeXt V2-Tiny — 28M params, same scale as V1-Tiny but:
+#   - Global Response Normalization (GRN) layers replace Channel LayerNorm → better feature diversity
+#   - Pretrained with FCMAE (Fully Convolutional Masked Autoencoder) on ImageNet
+#   - Achieves 82.9% IN1K top-1 vs ConvNeXt V1-Tiny 82.1%
+# This is a direct architecture upgrade over the best exp 1 backbone at identical inference cost.
+model = timm.create_model("convnextv2_tiny", pretrained=True, num_classes=num_classes)
 model = model.to(device)
-print(f"[MODEL] convnext_tiny | params={sum(p.numel() for p in model.parameters()):,}")
+print(f"[MODEL] convnextv2_tiny | params={sum(p.numel() for p in model.parameters()):,}")
 
-# Mixed precision for faster training (reduces memory, allows AMP speedup)
+# Mixed precision for faster training
 scaler = torch.cuda.amp.GradScaler()
 
-# CutMix augmentation — proven to push classification benchmarks 0.5-1% higher
+# CutMix only (same as exp 1 which achieved 0.9848):
 # switch_prob=1.0 → always use CutMix (not Mixup) when mixing fires
 cutmix_fn = Mixup(
     mixup_alpha=0.0,
@@ -146,10 +157,24 @@ cutmix_fn = Mixup(
 # SoftTargetCrossEntropy handles the soft labels produced by CutMix
 criterion = SoftTargetCrossEntropy()
 
-# Optimizer + cosine LR — full fine-tune from epoch 0
-NUM_EPOCHS = 40
-optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS, eta_min=1e-6)
+# AdamW with linear warmup (5 epochs) + cosine decay
+NUM_EPOCHS    = 40
+WARMUP_EPOCHS = 5
+LR            = 1e-4
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
+
+warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+    optimizer, start_factor=0.01, end_factor=1.0, total_iters=WARMUP_EPOCHS
+)
+cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    optimizer, T_max=NUM_EPOCHS - WARMUP_EPOCHS, eta_min=1e-6
+)
+scheduler = torch.optim.lr_scheduler.SequentialLR(
+    optimizer,
+    schedulers=[warmup_scheduler, cosine_scheduler],
+    milestones=[WARMUP_EPOCHS],
+)
 
 # Training loop with CutMix + AMP
 best_val_f1 = 0.0
@@ -167,7 +192,7 @@ for epoch in range(1, NUM_EPOCHS + 1):
         optimizer.zero_grad()
         with torch.cuda.amp.autocast():
             outputs = model(imgs)
-            loss = criterion(outputs, soft_labels)
+            loss    = criterion(outputs, soft_labels)
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
@@ -176,22 +201,21 @@ for epoch in range(1, NUM_EPOCHS + 1):
     scheduler.step()
     avg_loss = running_loss / len(train_idx)
 
-    # ── Validate with 3-view TTA (original + h-flip + v-flip) ──
+    # ── Validate with 5-view TTA ──
+    # Views: original, h-flip, v-flip, rot90, rot270
+    # All 4 rotational symmetries are natural for nadir satellite imagery
     model.eval()
-    all_preds = []
-    all_true  = []
+    all_preds, all_true = [], []
     with torch.no_grad():
         for imgs, labels in val_loader:
             imgs = imgs.to(device)
             with torch.cuda.amp.autocast():
-                # Original view
-                probs_orig  = torch.softmax(model(imgs), dim=1)
-                # Horizontal flip
-                probs_hflip = torch.softmax(model(torch.flip(imgs, dims=[-1])), dim=1)
-                # Vertical flip
-                probs_vflip = torch.softmax(model(torch.flip(imgs, dims=[-2])), dim=1)
-            # Average TTA predictions
-            avg_probs = (probs_orig + probs_hflip + probs_vflip) / 3.0
+                p0 = torch.softmax(model(imgs), dim=1)
+                p1 = torch.softmax(model(torch.flip(imgs, dims=[-1])), dim=1)
+                p2 = torch.softmax(model(torch.flip(imgs, dims=[-2])), dim=1)
+                p3 = torch.softmax(model(torch.rot90(imgs, k=1, dims=[-2, -1])), dim=1)
+                p4 = torch.softmax(model(torch.rot90(imgs, k=3, dims=[-2, -1])), dim=1)
+            avg_probs = (p0 + p1 + p2 + p3 + p4) / 5.0
             preds = torch.argmax(avg_probs, dim=1).cpu().numpy()
             all_preds.extend(preds)
             all_true.extend(labels.numpy())
