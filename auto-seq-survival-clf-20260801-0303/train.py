@@ -5,6 +5,7 @@ import pandas as pd
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
@@ -79,13 +80,12 @@ CHAR_TO_IDX = {'A': 0, 'C': 1, 'G': 2, 'T': 3, 'N': -1}
 MAX_LEN = 1000  # all sequences ≤ 1000bp
 
 def one_hot_encode_batch(seqs, max_len=MAX_LEN):
-    """Encode list of DNA sequences as one-hot (N, 4, max_len)."""
+    """Encode list of DNA sequences as one-hot (N, 4, max_len). Center-padded."""
     N = len(seqs)
     arr = np.zeros((N, 4, max_len), dtype=np.float32)
     for i, seq in enumerate(seqs):
         seq = seq.upper()
         L = min(len(seq), max_len)
-        # Center the sequence in the window
         offset = (max_len - L) // 2
         for j, c in enumerate(seq[:L]):
             idx = CHAR_TO_IDX.get(c, -1)
@@ -98,75 +98,183 @@ train_X = one_hot_encode_batch(train_seqs)
 val_X = one_hot_encode_batch(val_seqs)
 print(f"[DATA] train_X shape: {train_X.shape}, val_X shape: {val_X.shape}")
 
+
+# ── Reverse complement ──
+def reverse_complement(x):
+    """Reverse complement of one-hot DNA. x: (B, 4, L), channels = ACGT.
+    Complement: A<->T (0<->3), C<->G (1<->2); Reverse: flip L dim."""
+    return x[:, [3, 2, 1, 0], :].flip(-1)
+
+
 # ── Dataset ──
 class DNADataset(Dataset):
-    def __init__(self, X, labels, task_ids):
+    def __init__(self, X, labels, task_ids, augment=False):
         self.X = torch.tensor(X, dtype=torch.float32)
         self.labels = torch.tensor(labels, dtype=torch.long)
         self.task_ids = torch.tensor(task_ids, dtype=torch.long)
+        self.augment = augment
 
     def __len__(self):
         return len(self.labels)
 
     def __getitem__(self, idx):
-        return self.X[idx], self.task_ids[idx], self.labels[idx]
+        x = self.X[idx]
+        if self.augment and torch.rand(1).item() < 0.5:
+            # Reverse complement augmentation
+            x = x[[3, 2, 1, 0], :].flip(-1)
+        return x, self.task_ids[idx], self.labels[idx]
 
-# ── 1D-CNN Model ──
-class DNAConvNet(nn.Module):
-    def __init__(self, num_tasks, num_classes, conv_channels=(64, 128, 256, 512), dropout=0.5):
+
+# ── Architecture ──
+
+class SEBlock(nn.Module):
+    """Squeeze-and-Excitation channel attention."""
+    def __init__(self, channels, ratio=8):
         super().__init__()
-        in_ch = 4
-        layers = []
-        for out_ch in conv_channels:
-            layers += [
-                nn.Conv1d(in_ch, out_ch, kernel_size=9, padding=4),
-                nn.BatchNorm1d(out_ch),
-                nn.ReLU(),
-                nn.MaxPool1d(2),
-            ]
-            in_ch = out_ch
-        # Final global average pool
-        layers.append(nn.AdaptiveAvgPool1d(1))
-        self.conv = nn.Sequential(*layers)
-
-        # Task embedding
-        self.task_emb = nn.Embedding(num_tasks, 64)
-
-        feat_dim = conv_channels[-1] + 64
-        self.head = nn.Sequential(
-            nn.Linear(feat_dim, 256),
-            nn.BatchNorm1d(256),
+        mid = max(1, channels // ratio)
+        self.se = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+            nn.Linear(channels, mid),
             nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(256, 128),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(128, num_classes),
+            nn.Linear(mid, channels),
+            nn.Sigmoid(),
         )
 
+    def forward(self, x):
+        scale = self.se(x).unsqueeze(-1)
+        return x * scale
+
+
+class ResBlock(nn.Module):
+    """Residual dilated conv block with SE attention."""
+    def __init__(self, channels, kernel_size=9, dilation=1, dropout=0.3):
+        super().__init__()
+        pad = dilation * (kernel_size - 1) // 2
+        self.conv1 = nn.Conv1d(channels, channels, kernel_size, padding=pad, dilation=dilation)
+        self.bn1 = nn.BatchNorm1d(channels)
+        self.conv2 = nn.Conv1d(channels, channels, kernel_size, padding=pad, dilation=dilation)
+        self.bn2 = nn.BatchNorm1d(channels)
+        self.se = SEBlock(channels)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x):
+        residual = x
+        out = F.gelu(self.bn1(self.conv1(x)))
+        out = self.drop(out)
+        out = self.bn2(self.conv2(out))
+        out = self.se(out)
+        return F.gelu(out + residual)
+
+
+class AttentionPool(nn.Module):
+    """Soft attention pooling over sequence length."""
+    def __init__(self, channels):
+        super().__init__()
+        self.attn = nn.Linear(channels, 1)
+
+    def forward(self, x):
+        # x: (B, C, L)
+        xt = x.transpose(1, 2)           # (B, L, C)
+        a = F.softmax(self.attn(xt), dim=1)  # (B, L, 1)
+        return (xt * a).sum(dim=1)       # (B, C)
+
+
+class ImprovedDNACNN(nn.Module):
+    def __init__(self, num_tasks, num_classes, dropout=0.4):
+        super().__init__()
+
+        # Stem: capture local motifs
+        self.stem = nn.Sequential(
+            nn.Conv1d(4, 128, kernel_size=15, padding=7),
+            nn.BatchNorm1d(128),
+            nn.GELU(),
+            nn.MaxPool1d(4),              # 1000 → 250
+        )
+
+        # Tower: dilated residual blocks
+        self.tower = nn.Sequential(
+            ResBlock(128, kernel_size=9, dilation=1, dropout=dropout),
+            ResBlock(128, kernel_size=9, dilation=2, dropout=dropout),
+            ResBlock(128, kernel_size=9, dilation=4, dropout=dropout),
+            # Expand channels
+            nn.Conv1d(128, 256, 1),
+            nn.BatchNorm1d(256),
+            nn.GELU(),
+            nn.MaxPool1d(2),              # 250 → 125
+            ResBlock(256, kernel_size=7, dilation=1, dropout=dropout),
+            ResBlock(256, kernel_size=7, dilation=2, dropout=dropout),
+            ResBlock(256, kernel_size=7, dilation=4, dropout=dropout),
+            # Expand channels
+            nn.Conv1d(256, 512, 1),
+            nn.BatchNorm1d(512),
+            nn.GELU(),
+            nn.MaxPool1d(2),              # 125 → 62
+            ResBlock(512, kernel_size=5, dilation=1, dropout=dropout),
+            ResBlock(512, kernel_size=5, dilation=2, dropout=dropout),
+        )
+
+        # Dual pooling: average + attention
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        self.attn_pool = AttentionPool(512)
+
+        # Task embedding
+        task_emb_dim = 64
+        self.task_emb = nn.Embedding(num_tasks, task_emb_dim)
+
+        # Classifier head
+        feat_dim = 512 + 512 + task_emb_dim  # avg + attn + task
+        self.head = nn.Sequential(
+            nn.LayerNorm(feat_dim),
+            nn.Linear(feat_dim, 512),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(512, 256),
+            nn.GELU(),
+            nn.Dropout(dropout * 0.5),
+            nn.Linear(256, num_classes),
+        )
+
+    def encode(self, x):
+        feat = self.tower(self.stem(x))
+        avg = self.avg_pool(feat).squeeze(-1)
+        attn = self.attn_pool(feat)
+        return avg, attn
+
     def forward(self, x, task_id):
-        # x: (B, 4, L)
-        feat = self.conv(x).squeeze(-1)         # (B, 512)
-        task_feat = self.task_emb(task_id)      # (B, 64)
-        combined = torch.cat([feat, task_feat], dim=1)  # (B, 576)
+        avg, attn = self.encode(x)
+        task_feat = self.task_emb(task_id)
+        combined = torch.cat([avg, attn, task_feat], dim=1)
         return self.head(combined)
+
+    def forward_with_rc(self, x, task_id):
+        """Ensemble original + reverse complement predictions."""
+        avg, attn = self.encode(x)
+        # Reverse complement
+        xrc = x[:, [3, 2, 1, 0], :].flip(-1)
+        avg_rc, attn_rc = self.encode(xrc)
+        avg_e = (avg + avg_rc) / 2
+        attn_e = (attn + attn_rc) / 2
+        task_feat = self.task_emb(task_id)
+        combined = torch.cat([avg_e, attn_e, task_feat], dim=1)
+        return self.head(combined)
+
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"[MODEL] Device: {device}")
 
-BATCH_SIZE = 256
-N_EPOCHS = 60
+BATCH_SIZE = 128
+N_EPOCHS = 80
 LR = 3e-4
-WARMUP_EPOCHS = 3
-PATIENCE = 15
+WARMUP_EPOCHS = 5
+PATIENCE = 20
 
-train_ds = DNADataset(train_X, train_labels, train_tasks)
-val_ds   = DNADataset(val_X,   val_labels,   val_tasks)
+train_ds = DNADataset(train_X, train_labels, train_tasks, augment=True)
+val_ds   = DNADataset(val_X,   val_labels,   val_tasks,  augment=False)
 train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  num_workers=0)
 val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
-model = DNAConvNet(num_tasks=num_tasks, num_classes=num_classes).to(device)
+model = ImprovedDNACNN(num_tasks=num_tasks, num_classes=num_classes).to(device)
 print(f"[MODEL] Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
 # Class-weighted loss for imbalanced data
@@ -217,13 +325,14 @@ for epoch in range(1, N_EPOCHS + 1):
         scheduler.step()
         total_loss += loss.item()
 
+    # Validation with RC ensemble
     model.eval()
     correct = total = 0
     with torch.no_grad():
         for X_b, task_b, y_b in val_loader:
             X_b, task_b, y_b = X_b.to(device), task_b.to(device), y_b.to(device)
             with torch.cuda.amp.autocast(enabled=device.type == "cuda"):
-                logits = model(X_b, task_b)
+                logits = model.forward_with_rc(X_b, task_b)
             preds = logits.argmax(dim=1)
             correct += (preds == y_b).sum().item()
             total += y_b.size(0)

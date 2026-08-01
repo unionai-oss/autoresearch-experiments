@@ -1,3 +1,4 @@
 experiment_id,description,model_name,metric_name,metric_value,improved,duration_s,commit,notes
 0,"baseline: frozen distilbert-base-uncased CLS embeddings + linear probe — correct tier for N=30k NLP text, compute-efficient before committing to full fine-tuning",,accuracy,,false,2.5,,"KeyError: ""Could not find 'Survived' column in dataset. Available columns: ['sequence', 'name', 'label', 'task']"""
 1,Fix KeyError crash by detecting target column as 'label' (not 'survived') and sequence column as 'sequence'; keep frozen DistilBERT CLS + linear probe which is the correct tier for N=30k NLP text,,accuracy,0.492333,true,32.8,4f0efc9,
+2,"Switch from DistilBERT (wrong for DNA) to 1D-CNN on one-hot-encoded DNA + task embeddings — sequences are ACGT genomic data (splice sites, histone marks, enhancers), LR=3e-4, dropout=0.5, label smoothing=0.05 to reduce overfitting",,accuracy,0.661500,true,120.2,7358c94,
