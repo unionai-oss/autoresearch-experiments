@@ -52,19 +52,15 @@ def get_title(name):
 
 
 def safe_logit(p, eps=1e-6):
-    """Logit (log-odds) transform for meta-learner: maps probabilities to log-odds space.
-    LR meta-learner is linear in log-odds space, so this makes the combination theoretically optimal."""
     p_clipped = np.clip(p, eps, 1 - eps)
     return np.log(p_clipped / (1 - p_clipped))
 
 
 def get_ticket_prefix(ticket):
     t = str(ticket).strip().upper()
-    # Match leading alphabetic prefix (before any space or digit)
-    # e.g. "SOTON/O2 3101294" -> "SOTON", "PC 17599" -> "PC", "113803" -> "NUMERIC"
     m = re.match(r'^([A-Z][A-Z./]*)', t)
     if m:
-        prefix = re.sub(r'[^A-Z]', '', m.group(1))  # keep only letters
+        prefix = re.sub(r'[^A-Z]', '', m.group(1))
         return prefix if prefix else 'NUMERIC'
     return 'NUMERIC'
 
@@ -126,7 +122,6 @@ def engineer(df_tr: pd.DataFrame, df_va: pd.DataFrame):
                 (df['Sex'] == 'female') | (df['Age'] < 14)
             ).astype(np.int8)
             if 'Pclass' in df.columns:
-                # Explicit class-stratified survival advantage: 1st class women/children ~97%, 3rd class ~50%
                 df['WomenChildPclass'] = df['WomenChild'] * (4 - df['Pclass'])
             if 'Parch' in df.columns and 'Pclass' in df.columns:
                 df['IsMother'] = (
@@ -156,15 +151,11 @@ def engineer(df_tr: pd.DataFrame, df_va: pd.DataFrame):
         ticket_freq = frames[0]['Ticket'].value_counts().to_dict()
         for i, df in enumerate(frames):
             frames[i]['TicketFreq'] = df['Ticket'].map(ticket_freq).fillna(1).astype(float)
-            # TicketPrefix: alphabetic prefix of ticket captures booking class/agent correlations
-            # e.g. "PC" -> 1st class Cherbourg, "SOTON" -> Southampton working class, "NUMERIC" -> often 3rd class
             frames[i]['TicketPrefix'] = df['Ticket'].apply(get_ticket_prefix)
             frames[i] = frames[i].drop(columns=['Ticket'])
 
-    # FareRankByClass: within-Pclass fare percentile (computed from train only, applied to val)
-    # Captures relative wealth within class — orthogonal to raw Fare and FarePerPerson
     if 'Fare' in frames[0].columns and 'Pclass' in frames[0].columns:
-        frames[0]['FareRankByClass'] = 0.5  # default
+        frames[0]['FareRankByClass'] = 0.5
         frames[1]['FareRankByClass'] = 0.5
         for pclass_val in sorted(frames[0]['Pclass'].dropna().unique()):
             tr_mask = frames[0]['Pclass'] == pclass_val
@@ -172,11 +163,9 @@ def engineer(df_tr: pd.DataFrame, df_va: pd.DataFrame):
             tr_fares = frames[0].loc[tr_mask, 'Fare'].fillna(0).values
             if len(tr_fares) == 0:
                 continue
-            # Training: standard percentile rank
             frames[0].loc[tr_mask, 'FareRankByClass'] = (
                 pd.Series(tr_fares).rank(pct=True).values
             )
-            # Val: rank each val fare against the training distribution
             va_fares = frames[1].loc[va_mask, 'Fare'].fillna(0).values
             if len(va_fares) > 0:
                 frames[1].loc[va_mask, 'FareRankByClass'] = np.array([
@@ -186,7 +175,6 @@ def engineer(df_tr: pd.DataFrame, df_va: pd.DataFrame):
     return frames[0], frames[1]
 
 
-# Save tickets before engineer() drops them — needed for OOF TicketGroupSurvival
 tickets_tr = X_tr_raw['Ticket'].reset_index(drop=True).copy() if 'Ticket' in X_tr_raw.columns else None
 tickets_va = X_va_raw['Ticket'].reset_index(drop=True).copy() if 'Ticket' in X_va_raw.columns else None
 
@@ -245,9 +233,6 @@ for col in cat_cols:
 X_train_np = X_train.values.astype(np.float64)
 X_val_np = X_val.values.astype(np.float64)
 
-# OOF TicketGroupSurvival: leak-free target encoding by ticket group
-# Passengers sharing a ticket had correlated fates — this captures group survival signal
-# different from TicketFreq (group size) which doesn't tell you WHO survived
 if tickets_tr is not None:
     _tgs_skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     tgs_train_arr = np.full(len(X_train), y_train.mean())
@@ -264,7 +249,6 @@ if tickets_tr is not None:
         _va_tix = tickets_tr.iloc[_va_idx]
         tgs_train_arr[_va_idx] = np.array([_surv_map.get(t, _overall) for t in _va_tix])
 
-    # Val set: use full training ticket survival rates (leak-free — val labels not used)
     _full_surv = {}
     for _tix in tickets_tr.unique():
         _m = (tickets_tr == _tix).values
@@ -479,46 +463,28 @@ cat_val_preds = np.mean(cat_preds_list, axis=0)
 cat_val_auc = roc_auc_score(y_val, cat_val_preds)
 print(f"CatBoost seed-ensemble Val AUC: {cat_val_auc:.6f}")
 
-# Enrich meta-learner with nonlinear terms and domain anchors
-# Use WomenChildPclass/3 instead of binary WomenChild: 4-level signal (0, 1/3, 2/3, 1)
-# capturing the survival gradient across classes — 3rd class women/children ~50%, 1st class ~97%
-# This allows the meta-learner to calibrate differently for high vs low class women/children
 _wc_tr = X_train['WomenChildPclass'].values.astype(float) / 3.0
 _wc_va = X_val['WomenChildPclass'].values.astype(float) / 3.0
 _tgs_tr = X_train['TicketGroupSurvival'].values.astype(float) if 'TicketGroupSurvival' in X_train.columns else np.full(len(X_train), y_train.mean())
 _tgs_va = X_val['TicketGroupSurvival'].values.astype(float) if 'TicketGroupSurvival' in X_val.columns else np.full(len(X_val), y_train.mean())
-# Pclass_norm: direct class signal for ALL passengers (not just women/children like WCPclass)
-# Maps 1st→1.0, 2nd→0.67, 3rd→0.33 — crucial for calibrating adult male predictions
-# where 1st class (~37% survival) vs 3rd class (~15%) is not captured by WCPclass alone
 _pclass_tr = (4.0 - X_train['Pclass'].values.astype(float)) / 3.0
 _pclass_va = (4.0 - X_val['Pclass'].values.astype(float)) / 3.0
 
-# Transform base model predictions to logit (log-odds) space before meta-learner.
-# LR is a linear classifier in log-odds space — feeding logit(p) makes the relationship
-# between base-model outputs and the ensemble output exactly linear (theoretically optimal).
-# Interaction terms in logit space also capture model agreement/disagreement more sharply:
-# logit(0.9)*logit(0.1) << 0 (strong disagreement), logit(0.9)*logit(0.9) >> 0 (both high).
 lgbm_oof_l = safe_logit(lgbm_oof)
 cat_oof_l = safe_logit(cat_oof)
 lgbm_val_l = safe_logit(lgbm_val_preds)
 cat_val_l = safe_logit(cat_val_preds)
 
-# 14-feature meta-learner: extends exp 26's 13-feature logit-space design with
-# TGS × Pclass_norm interaction.
-# This captures class-stratified trust in the group survival signal:
-# 1st class passengers with high TGS → very strong survival signal (high class + group survived)
-# 3rd class passengers with same TGS → weaker signal (class drag reduces group priority effect)
-# Currently missing: all TGS interactions are with model logits or WCPclass, but NOT with Pclass directly.
 meta_X_train = np.column_stack([
     lgbm_oof_l, cat_oof_l, lgbm_oof_l * cat_oof_l,
     _wc_tr, _tgs_tr,
     lgbm_oof_l * _wc_tr, cat_oof_l * _wc_tr,
     lgbm_oof_l * _tgs_tr, cat_oof_l * _tgs_tr,
     _wc_tr * _tgs_tr,
-    _pclass_tr,                          # direct Pclass signal for all passengers
-    lgbm_oof_l * _pclass_tr,             # class-stratified LGBM logit calibration
-    cat_oof_l * _pclass_tr,              # class-stratified CatBoost logit calibration
-    _tgs_tr * _pclass_tr,                # NEW: class-stratified group survival trust
+    _pclass_tr,
+    lgbm_oof_l * _pclass_tr,
+    cat_oof_l * _pclass_tr,
+    _tgs_tr * _pclass_tr,
 ])
 meta_X_val = np.column_stack([
     lgbm_val_l, cat_val_l, lgbm_val_l * cat_val_l,
@@ -529,46 +495,92 @@ meta_X_val = np.column_stack([
     _pclass_va,
     lgbm_val_l * _pclass_va,
     cat_val_l * _pclass_va,
-    _tgs_va * _pclass_va,                # NEW: class-stratified group survival trust
+    _tgs_va * _pclass_va,
 ])
 
-# Tune meta-learner C via inner 5-fold CV using a StandardScaler+LR pipeline.
-# StandardScaler ensures L2 regularization (C) penalizes all 14 features equally,
-# critical because logit features (~[-4,4]) and domain anchors ([0,1]) have very different scales.
-# Pipeline fits scaler within each CV fold (no leakage).
 from sklearn.model_selection import cross_val_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler as MetaScaler
+from sklearn.neural_network import MLPClassifier
 
-best_c, best_c_auc = 1.0, -1.0
+# Tune LR meta-learner over C grid
+best_c, best_lr_auc = 1.0, -1.0
 for c_val in [0.01, 0.05, 0.1, 0.3, 0.5, 1.0, 2.0, 5.0, 10.0]:
     pipe_tmp = Pipeline([
         ('scaler', MetaScaler()),
-        ('lr', LogisticRegression(C=c_val, random_state=42, max_iter=1000)),
+        ('lr', LogisticRegression(C=c_val, random_state=42, max_iter=5000)),
     ])
     inner_scores = cross_val_score(pipe_tmp, meta_X_train, y_train, cv=5, scoring='roc_auc')
     c_auc = inner_scores.mean()
-    if c_auc > best_c_auc:
-        best_c_auc = c_auc
+    if c_auc > best_lr_auc:
+        best_lr_auc = c_auc
         best_c = c_val
-print(f"Best meta C={best_c} (inner CV AUC={best_c_auc:.6f})")
+print(f"Best meta LR C={best_c} (inner CV AUC={best_lr_auc:.6f})")
 
-# Final meta-learner: fit scaler on all training meta features, apply to val
+# Tune MLP meta-learner: non-linear meta-learner to capture threshold/3-way interactions
+# that LR's explicit product terms can't represent (e.g., sigmoid activations on logit features)
+best_mlp_hidden, best_mlp_alpha, best_mlp_auc = (4,), 0.1, -1.0
+for hidden in [(4,), (8,), (6, 3), (4, 2)]:
+    for alpha in [0.001, 0.01, 0.1, 1.0]:
+        pipe_tmp = Pipeline([
+            ('scaler', MetaScaler()),
+            ('mlp', MLPClassifier(hidden_layer_sizes=hidden, alpha=alpha,
+                                  activation='relu', solver='lbfgs',
+                                  max_iter=2000, random_state=42)),
+        ])
+        inner_scores = cross_val_score(pipe_tmp, meta_X_train, y_train, cv=5, scoring='roc_auc')
+        m_auc = inner_scores.mean()
+        if m_auc > best_mlp_auc:
+            best_mlp_auc = m_auc
+            best_mlp_hidden = hidden
+            best_mlp_alpha = alpha
+print(f"Best meta MLP hidden={best_mlp_hidden} alpha={best_mlp_alpha} (inner CV AUC={best_mlp_auc:.6f})")
+
 meta_scaler = MetaScaler()
 meta_X_train_s = meta_scaler.fit_transform(meta_X_train)
 meta_X_val_s = meta_scaler.transform(meta_X_val)
 
-meta = LogisticRegression(C=best_c, random_state=42, max_iter=1000)
-meta.fit(meta_X_train_s, y_train)
-meta_coef = meta.coef_[0]
+# Fit LR meta-learner
+meta_lr = LogisticRegression(C=best_c, random_state=42, max_iter=5000)
+meta_lr.fit(meta_X_train_s, y_train)
+meta_coef = meta_lr.coef_[0]
 _meta_feature_names = ['logit_LGBM', 'logit_Cat', 'logit_LGBM*logit_Cat', 'WCPclass', 'TGS',
                        'logitLGBM*WCPclass', 'logitCat*WCPclass', 'logitLGBM*TGS', 'logitCat*TGS',
                        'WCPclass*TGS', 'Pclass_norm', 'logitLGBM*Pclass', 'logitCat*Pclass',
                        'TGS*Pclass_norm']
 _coef_str = ', '.join([f"{n}={v:.4f}" for n, v in zip(_meta_feature_names, meta_coef)])
-print(f"Meta-learner weights: {_coef_str}")
+print(f"LR meta weights: {_coef_str}")
+lr_val_preds = meta_lr.predict_proba(meta_X_val_s)[:, 1]
+lr_val_auc = roc_auc_score(y_val, lr_val_preds)
+print(f"LR meta Val AUC: {lr_val_auc:.6f}")
 
-val_preds = meta.predict_proba(meta_X_val_s)[:, 1]
+# Fit MLP meta-learner
+meta_mlp = MLPClassifier(hidden_layer_sizes=best_mlp_hidden, alpha=best_mlp_alpha,
+                          activation='relu', solver='lbfgs',
+                          max_iter=2000, random_state=42)
+meta_mlp.fit(meta_X_train_s, y_train)
+mlp_val_preds = meta_mlp.predict_proba(meta_X_val_s)[:, 1]
+mlp_val_auc = roc_auc_score(y_val, mlp_val_preds)
+print(f"MLP meta Val AUC: {mlp_val_auc:.6f}")
+
+# Blend LR and MLP weighted by inner CV AUCs (softmax with T=0.01, normalized for numerical stability)
+max_auc = max(best_lr_auc, best_mlp_auc)
+T = 0.01
+w_lr = np.exp((best_lr_auc - max_auc) / T)
+w_mlp = np.exp((best_mlp_auc - max_auc) / T)
+w_total = w_lr + w_mlp
+w_lr /= w_total
+w_mlp /= w_total
+print(f"Blend weights: LR={w_lr:.3f}, MLP={w_mlp:.3f}")
+
+# Only blend if MLP is competitive (inner CV AUC within 0.005 of LR)
+if best_mlp_auc >= best_lr_auc - 0.005:
+    val_preds = w_lr * lr_val_preds + w_mlp * mlp_val_preds
+    print(f"Using LR+MLP blend")
+else:
+    val_preds = lr_val_preds
+    print(f"Using LR only (MLP not competitive)")
+
 val_auc = roc_auc_score(y_val, val_preds)
 print(f"Stacked Val AUC: {val_auc:.6f}")
 print(f"Individual: LGBM={lgbm_val_auc:.6f}, CatBoost={cat_val_auc:.6f}")
