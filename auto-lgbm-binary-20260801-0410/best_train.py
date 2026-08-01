@@ -51,6 +51,13 @@ def get_title(name):
     return title
 
 
+def safe_logit(p, eps=1e-6):
+    """Logit (log-odds) transform for meta-learner: maps probabilities to log-odds space.
+    LR meta-learner is linear in log-odds space, so this makes the combination theoretically optimal."""
+    p_clipped = np.clip(p, eps, 1 - eps)
+    return np.log(p_clipped / (1 - p_clipped))
+
+
 def get_ticket_prefix(ticket):
     t = str(ticket).strip().upper()
     # Match leading alphabetic prefix (before any space or digit)
@@ -481,48 +488,72 @@ _wc_va = X_val['WomenChildPclass'].values.astype(float) / 3.0
 _tgs_tr = X_train['TicketGroupSurvival'].values.astype(float) if 'TicketGroupSurvival' in X_train.columns else np.full(len(X_train), y_train.mean())
 _tgs_va = X_val['TicketGroupSurvival'].values.astype(float) if 'TicketGroupSurvival' in X_val.columns else np.full(len(X_val), y_train.mean())
 
-# Extended interaction features for meta-learner (10 features, same structure as exp 19):
-# - lgbm*cat: base nonlinear product
-# - WCPclass (WomenChildPclass/3), TGS: domain anchors (richer than binary WomenChild)
-# - lgbm*WCPclass, cat*WCPclass: model-specific calibration across class-stratified sex/age groups
-# - lgbm*TGS, cat*TGS: model-specific calibration for ticket-group-survival signal
-# - WCPclass*TGS: domain anchor for women/children in surviving groups
+# Transform base model predictions to logit (log-odds) space before meta-learner.
+# LR is a linear classifier in log-odds space — feeding logit(p) makes the relationship
+# between base-model outputs and the ensemble output exactly linear (theoretically optimal).
+# Interaction terms in logit space also capture model agreement/disagreement more sharply:
+# logit(0.9)*logit(0.1) << 0 (strong disagreement), logit(0.9)*logit(0.9) >> 0 (both high).
+lgbm_oof_l = safe_logit(lgbm_oof)
+cat_oof_l = safe_logit(cat_oof)
+lgbm_val_l = safe_logit(lgbm_val_preds)
+cat_val_l = safe_logit(cat_val_preds)
+
+# 10-feature meta-learner (same structure as exp 19/24) but with logit base predictions:
+# - logit_lgbm, logit_cat: log-odds of base model predictions
+# - logit_lgbm * logit_cat: captures agreement (both high/low = positive, disagreement = negative)
+# - WCPclass, TGS: domain anchors (bounded [0,1] — not logit-transformed, kept in original scale)
+# - logit*WCPclass, logit*TGS interactions: subgroup-specific calibration
+# - WCPclass*TGS: domain anchor interaction
 meta_X_train = np.column_stack([
-    lgbm_oof, cat_oof, lgbm_oof * cat_oof,
+    lgbm_oof_l, cat_oof_l, lgbm_oof_l * cat_oof_l,
     _wc_tr, _tgs_tr,
-    lgbm_oof * _wc_tr, cat_oof * _wc_tr,
-    lgbm_oof * _tgs_tr, cat_oof * _tgs_tr,
+    lgbm_oof_l * _wc_tr, cat_oof_l * _wc_tr,
+    lgbm_oof_l * _tgs_tr, cat_oof_l * _tgs_tr,
     _wc_tr * _tgs_tr,
 ])
 meta_X_val = np.column_stack([
-    lgbm_val_preds, cat_val_preds, lgbm_val_preds * cat_val_preds,
+    lgbm_val_l, cat_val_l, lgbm_val_l * cat_val_l,
     _wc_va, _tgs_va,
-    lgbm_val_preds * _wc_va, cat_val_preds * _wc_va,
-    lgbm_val_preds * _tgs_va, cat_val_preds * _tgs_va,
+    lgbm_val_l * _wc_va, cat_val_l * _wc_va,
+    lgbm_val_l * _tgs_va, cat_val_l * _tgs_va,
     _wc_va * _tgs_va,
 ])
 
-# Tune meta-learner C via inner 5-fold CV on OOF predictions
+# Tune meta-learner C via inner 5-fold CV using a StandardScaler+LR pipeline.
+# StandardScaler ensures L2 regularization (C) penalizes all 10 features equally,
+# critical because logit features (~[-4,4]) and domain anchors ([0,1]) have very different scales.
+# Pipeline fits scaler within each CV fold (no leakage).
 from sklearn.model_selection import cross_val_score
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler as MetaScaler
+
 best_c, best_c_auc = 1.0, -1.0
 for c_val in [0.01, 0.05, 0.1, 0.3, 0.5, 1.0, 2.0, 5.0, 10.0]:
-    lr_tmp = LogisticRegression(C=c_val, random_state=42, max_iter=1000)
-    inner_scores = cross_val_score(lr_tmp, meta_X_train, y_train, cv=5, scoring='roc_auc')
+    pipe_tmp = Pipeline([
+        ('scaler', MetaScaler()),
+        ('lr', LogisticRegression(C=c_val, random_state=42, max_iter=1000)),
+    ])
+    inner_scores = cross_val_score(pipe_tmp, meta_X_train, y_train, cv=5, scoring='roc_auc')
     c_auc = inner_scores.mean()
     if c_auc > best_c_auc:
         best_c_auc = c_auc
         best_c = c_val
 print(f"Best meta C={best_c} (inner CV AUC={best_c_auc:.6f})")
 
+# Final meta-learner: fit scaler on all training meta features, apply to val
+meta_scaler = MetaScaler()
+meta_X_train_s = meta_scaler.fit_transform(meta_X_train)
+meta_X_val_s = meta_scaler.transform(meta_X_val)
+
 meta = LogisticRegression(C=best_c, random_state=42, max_iter=1000)
-meta.fit(meta_X_train, y_train)
+meta.fit(meta_X_train_s, y_train)
 meta_coef = meta.coef_[0]
-_meta_feature_names = ['LGBM', 'CatBoost', 'LGBM*Cat', 'WCPclass', 'TGS',
-                       'LGBM*WCPclass', 'Cat*WCPclass', 'LGBM*TGS', 'Cat*TGS', 'WCPclass*TGS']
+_meta_feature_names = ['logit_LGBM', 'logit_Cat', 'logit_LGBM*logit_Cat', 'WCPclass', 'TGS',
+                       'logitLGBM*WCPclass', 'logitCat*WCPclass', 'logitLGBM*TGS', 'logitCat*TGS', 'WCPclass*TGS']
 _coef_str = ', '.join([f"{n}={v:.4f}" for n, v in zip(_meta_feature_names, meta_coef)])
 print(f"Meta-learner weights: {_coef_str}")
 
-val_preds = meta.predict_proba(meta_X_val)[:, 1]
+val_preds = meta.predict_proba(meta_X_val_s)[:, 1]
 val_auc = roc_auc_score(y_val, val_preds)
 print(f"Stacked Val AUC: {val_auc:.6f}")
 print(f"Individual: LGBM={lgbm_val_auc:.6f}, CatBoost={cat_val_auc:.6f}")
