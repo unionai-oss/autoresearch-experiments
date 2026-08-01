@@ -192,6 +192,10 @@ class DNANet(nn.Module):
             ResBlock(128, kernel_size=9, dilation=2, dropout=dropout),
             ResBlock(128, kernel_size=9, dilation=4, dropout=dropout),
         )
+        # Multi-scale pooling: extract features from tower1 output
+        self.pool1_avg = nn.AdaptiveAvgPool1d(1)
+        self.pool1_attn = AttentionPool(128)
+
         self.expand1 = nn.Sequential(
             nn.Conv1d(128, 256, 1, bias=False),
             nn.BatchNorm1d(256),
@@ -204,25 +208,32 @@ class DNANet(nn.Module):
             ResBlock(256, kernel_size=7, dilation=2, dropout=dropout),
             ResBlock(256, kernel_size=7, dilation=4, dropout=dropout),
         )
+        # Multi-scale pooling: extract features from tower2 output
+        self.pool2_avg = nn.AdaptiveAvgPool1d(1)
+        self.pool2_attn = AttentionPool(256)
+
         self.expand2 = nn.Sequential(
             nn.Conv1d(256, 512, 1, bias=False),
             nn.BatchNorm1d(512),
             nn.GELU(),
             nn.MaxPool1d(2),   # 125 -> 62
         )
-        # Tower 3: dilated blocks at 512 channels
+        # Tower 3: dilated blocks at 512 channels — 3 blocks for deeper long-range coverage
         self.tower3 = nn.Sequential(
             ResBlock(512, kernel_size=5, dilation=1, dropout=dropout),
             ResBlock(512, kernel_size=5, dilation=2, dropout=dropout),
+            ResBlock(512, kernel_size=5, dilation=4, dropout=dropout),
         )
 
+        # Final pooling of tower3
         self.avg_pool = nn.AdaptiveAvgPool1d(1)
         self.attn_pool = AttentionPool(512)
 
         task_emb_dim = 64
         self.task_emb = nn.Embedding(num_tasks, task_emb_dim)
 
-        feat_dim = 512 + 512 + task_emb_dim
+        # Multi-scale concat: tower1(128+128) + tower2(256+256) + tower3(512+512) + task_emb(64)
+        feat_dim = 128 + 128 + 256 + 256 + 512 + 512 + task_emb_dim
         self.head = nn.Sequential(
             nn.LayerNorm(feat_dim),
             nn.Linear(feat_dim, 512),
@@ -237,30 +248,54 @@ class DNANet(nn.Module):
     def encode(self, x):
         x = self.stem(x)
         x = self.tower1(x)
+        # Extract local-scale features (128-ch, ~4bp resolution)
+        f1_avg = self.pool1_avg(x).squeeze(-1)   # (B, 128)
+        f1_attn = self.pool1_attn(x)              # (B, 128)
+
         x = self.expand1(x)
         x = self.tower2(x)
+        # Extract mid-scale features (256-ch, ~8bp resolution)
+        f2_avg = self.pool2_avg(x).squeeze(-1)   # (B, 256)
+        f2_attn = self.pool2_attn(x)              # (B, 256)
+
         x = self.expand2(x)
         x = self.tower3(x)
-        avg = self.avg_pool(x).squeeze(-1)
-        attn = self.attn_pool(x)
-        return avg, attn
+        # Extract global-scale features (512-ch, ~16bp resolution)
+        f3_avg = self.avg_pool(x).squeeze(-1)    # (B, 512)
+        f3_attn = self.attn_pool(x)               # (B, 512)
+
+        return f1_avg, f1_attn, f2_avg, f2_attn, f3_avg, f3_attn
+
+    def _cat_features(self, f1_avg, f1_attn, f2_avg, f2_attn, f3_avg, f3_attn, task_id):
+        t = self.task_emb(task_id)
+        return torch.cat([f1_avg, f1_attn, f2_avg, f2_attn, f3_avg, f3_attn, t], dim=1)
 
     def forward(self, x, task_id):
-        avg, attn = self.encode(x)
-        t = self.task_emb(task_id)
-        return self.head(torch.cat([avg, attn, t], dim=1))
+        f1_avg, f1_attn, f2_avg, f2_attn, f3_avg, f3_attn = self.encode(x)
+        feat = self._cat_features(f1_avg, f1_attn, f2_avg, f2_attn, f3_avg, f3_attn, task_id)
+        return self.head(feat)
 
     def forward_with_rc(self, x, task_id):
-        avg, attn = self.encode(x)
+        # Forward strand features
+        f1_avg, f1_attn, f2_avg, f2_attn, f3_avg, f3_attn = self.encode(x)
+        # Reverse complement features: A<->T (idx 0<->3), C<->G (idx 1<->2), flip L
         xrc = x[:, [3, 2, 1, 0], :].flip(-1)
-        avg_rc, attn_rc = self.encode(xrc)
-        avg_e = (avg + avg_rc) / 2.0
-        attn_e = (attn + attn_rc) / 2.0
-        t = self.task_emb(task_id)
-        return self.head(torch.cat([avg_e, attn_e, t], dim=1))
+        f1_avg_rc, f1_attn_rc, f2_avg_rc, f2_attn_rc, f3_avg_rc, f3_attn_rc = self.encode(xrc)
+
+        # Average at each scale for RC-invariant representation
+        f1_avg = (f1_avg + f1_avg_rc) * 0.5
+        f1_attn = (f1_attn + f1_attn_rc) * 0.5
+        f2_avg = (f2_avg + f2_avg_rc) * 0.5
+        f2_attn = (f2_attn + f2_attn_rc) * 0.5
+        f3_avg = (f3_avg + f3_avg_rc) * 0.5
+        f3_attn = (f3_attn + f3_attn_rc) * 0.5
+
+        feat = self._cat_features(f1_avg, f1_attn, f2_avg, f2_attn, f3_avg, f3_attn, task_id)
+        return self.head(feat)
 
 
-def mixup_criterion(logits, y1, y2, lam, num_classes, label_smoothing=0.05):
+def mixed_criterion(logits, y1, y2, lam, num_classes, label_smoothing=0.05):
+    """Unified Mixup/CutMix criterion with label smoothing."""
     log_probs = F.log_softmax(logits, dim=1)
     y1_oh = F.one_hot(y1, num_classes).float()
     y2_oh = F.one_hot(y2, num_classes).float()
@@ -269,13 +304,31 @@ def mixup_criterion(logits, y1, y2, lam, num_classes, label_smoothing=0.05):
     return -(soft * log_probs).sum(dim=1).mean()
 
 
+def cutmix_data(X_b, y_b, alpha=0.4):
+    """CutMix for DNA: swap a contiguous segment between two samples.
+    Creates biologically realistic chimeric sequences (like recombination).
+    """
+    lam = float(np.random.beta(alpha, alpha))
+    lam = max(lam, 1.0 - lam)  # Keep lam >= 0.5 (keep majority of original)
+    idx = torch.randperm(X_b.size(0), device=X_b.device)
+    L = X_b.size(-1)
+    cut_len = int(L * (1.0 - lam))
+    if cut_len == 0:
+        return X_b, y_b, y_b[idx], 1.0
+    cut_start = int(np.random.randint(0, L - cut_len + 1))
+    X_mix = X_b.clone()
+    X_mix[:, :, cut_start:cut_start + cut_len] = X_b[idx, :, cut_start:cut_start + cut_len]
+    actual_lam = 1.0 - cut_len / L  # Fraction of original sequence retained
+    return X_mix, y_b, y_b[idx], actual_lam
+
+
 BATCH_SIZE = 128
-N_EPOCHS = 90
+N_EPOCHS = 100
 LR = 3e-4
-PATIENCE = 22
+PATIENCE = 25
 WEIGHT_DECAY = 1e-4
 WARMUP_EPOCHS = 5
-MIXUP_ALPHA = 0.3
+MIXUP_ALPHA = 0.4  # Slightly more aggressive mixing
 
 train_ds = DNADataset(train_X, train_labels, train_tasks, augment=True)
 val_ds   = DNADataset(val_X,   val_labels,   val_tasks,  augment=False)
@@ -320,17 +373,22 @@ for epoch in range(1, N_EPOCHS + 1):
         task_b = task_b.to(device, non_blocking=True)
         y_b = y_b.to(device, non_blocking=True)
 
-        # Mixup
-        lam = float(np.random.beta(MIXUP_ALPHA, MIXUP_ALPHA))
-        lam = max(lam, 1.0 - lam)
-        idx = torch.randperm(X_b.size(0), device=device)
-        X_mix = lam * X_b + (1.0 - lam) * X_b[idx]
-        y_b2 = y_b[idx]
+        # Randomly choose Mixup or CutMix (50/50)
+        if np.random.random() < 0.5:
+            # Mixup: interpolate full sequences (smooth augmentation)
+            lam = float(np.random.beta(MIXUP_ALPHA, MIXUP_ALPHA))
+            lam = max(lam, 1.0 - lam)
+            idx = torch.randperm(X_b.size(0), device=device)
+            X_mix = lam * X_b + (1.0 - lam) * X_b[idx]
+            y_b2 = y_b[idx]
+        else:
+            # CutMix: swap contiguous segment (biologically realistic chimera)
+            X_mix, y_b, y_b2, lam = cutmix_data(X_b, y_b, MIXUP_ALPHA)
 
         optimizer.zero_grad()
         with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
             logits = model(X_mix, task_b)
-            loss = mixup_criterion(logits, y_b, y_b2, lam, num_classes, label_smoothing=0.05)
+            loss = mixed_criterion(logits, y_b, y_b2, lam, num_classes, label_smoothing=0.05)
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
