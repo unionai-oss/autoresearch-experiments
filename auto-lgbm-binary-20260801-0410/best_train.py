@@ -458,22 +458,53 @@ cat_val_preds = np.mean(cat_preds_list, axis=0)
 cat_val_auc = roc_auc_score(y_val, cat_val_preds)
 print(f"CatBoost seed-ensemble Val AUC: {cat_val_auc:.6f}")
 
-# Enrich meta-learner with nonlinear term and domain anchors
+# Enrich meta-learner with nonlinear terms and domain anchors
 _wc_tr = X_train['WomenChild'].values.astype(float)
 _wc_va = X_val['WomenChild'].values.astype(float)
 _tgs_tr = X_train['TicketGroupSurvival'].values.astype(float) if 'TicketGroupSurvival' in X_train.columns else np.full(len(X_train), y_train.mean())
 _tgs_va = X_val['TicketGroupSurvival'].values.astype(float) if 'TicketGroupSurvival' in X_val.columns else np.full(len(X_val), y_train.mean())
 
-# Product term: LR cannot learn lgbm*cat interaction from [lgbm, cat] alone
-# WomenChild: domain anchor — strongest survival predictor, corrects edge-case mispredictions
-# TicketGroupSurvival: group-level survival anchor for confused individual predictions
-meta_X_train = np.column_stack([lgbm_oof, cat_oof, lgbm_oof * cat_oof, _wc_tr, _tgs_tr])
-meta_X_val = np.column_stack([lgbm_val_preds, cat_val_preds, lgbm_val_preds * cat_val_preds, _wc_va, _tgs_va])
+# Extended interaction features for meta-learner:
+# - lgbm*cat: base nonlinear product (from exp 18)
+# - WomenChild, TGS: domain anchors (from exp 18)
+# - lgbm*WC, cat*WC: model-specific calibration for women/children subgroup
+#   (LR cannot learn "trust LGBM more than CatBoost for women/children" without this)
+# - lgbm*TGS, cat*TGS: model-specific calibration for ticket-group-survival signal
+# - WC*TGS: domain anchor for women/children in surviving groups (~100% survival rate)
+meta_X_train = np.column_stack([
+    lgbm_oof, cat_oof, lgbm_oof * cat_oof,
+    _wc_tr, _tgs_tr,
+    lgbm_oof * _wc_tr, cat_oof * _wc_tr,
+    lgbm_oof * _tgs_tr, cat_oof * _tgs_tr,
+    _wc_tr * _tgs_tr,
+])
+meta_X_val = np.column_stack([
+    lgbm_val_preds, cat_val_preds, lgbm_val_preds * cat_val_preds,
+    _wc_va, _tgs_va,
+    lgbm_val_preds * _wc_va, cat_val_preds * _wc_va,
+    lgbm_val_preds * _tgs_va, cat_val_preds * _tgs_va,
+    _wc_va * _tgs_va,
+])
 
-meta = LogisticRegression(C=1.0, random_state=42, max_iter=1000)
+# Tune meta-learner C via inner 5-fold CV on OOF predictions
+from sklearn.model_selection import cross_val_score
+best_c, best_c_auc = 1.0, -1.0
+for c_val in [0.01, 0.05, 0.1, 0.3, 0.5, 1.0, 2.0, 5.0, 10.0]:
+    lr_tmp = LogisticRegression(C=c_val, random_state=42, max_iter=1000)
+    inner_scores = cross_val_score(lr_tmp, meta_X_train, y_train, cv=5, scoring='roc_auc')
+    c_auc = inner_scores.mean()
+    if c_auc > best_c_auc:
+        best_c_auc = c_auc
+        best_c = c_val
+print(f"Best meta C={best_c} (inner CV AUC={best_c_auc:.6f})")
+
+meta = LogisticRegression(C=best_c, random_state=42, max_iter=1000)
 meta.fit(meta_X_train, y_train)
 meta_coef = meta.coef_[0]
-print(f"Meta-learner weights: LGBM={meta_coef[0]:.4f}, CatBoost={meta_coef[1]:.4f}, Product={meta_coef[2]:.4f}, WomenChild={meta_coef[3]:.4f}, TGS={meta_coef[4]:.4f}")
+_meta_feature_names = ['LGBM', 'CatBoost', 'LGBM*Cat', 'WomenChild', 'TGS',
+                       'LGBM*WC', 'Cat*WC', 'LGBM*TGS', 'Cat*TGS', 'WC*TGS']
+_coef_str = ', '.join([f"{n}={v:.4f}" for n, v in zip(_meta_feature_names, meta_coef)])
+print(f"Meta-learner weights: {_coef_str}")
 
 val_preds = meta.predict_proba(meta_X_val)[:, 1]
 val_auc = roc_auc_score(y_val, val_preds)
