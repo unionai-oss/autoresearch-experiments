@@ -51,6 +51,17 @@ def get_title(name):
     return title
 
 
+def get_ticket_prefix(ticket):
+    t = str(ticket).strip().upper()
+    # Match leading alphabetic prefix (before any space or digit)
+    # e.g. "SOTON/O2 3101294" -> "SOTON", "PC 17599" -> "PC", "113803" -> "NUMERIC"
+    m = re.match(r'^([A-Z][A-Z./]*)', t)
+    if m:
+        prefix = re.sub(r'[^A-Z]', '', m.group(1))  # keep only letters
+        return prefix if prefix else 'NUMERIC'
+    return 'NUMERIC'
+
+
 def engineer(df_tr: pd.DataFrame, df_va: pd.DataFrame):
     frames = [df_tr.copy(), df_va.copy()]
 
@@ -138,6 +149,9 @@ def engineer(df_tr: pd.DataFrame, df_va: pd.DataFrame):
         ticket_freq = frames[0]['Ticket'].value_counts().to_dict()
         for i, df in enumerate(frames):
             frames[i]['TicketFreq'] = df['Ticket'].map(ticket_freq).fillna(1).astype(float)
+            # TicketPrefix: alphabetic prefix of ticket captures booking class/agent correlations
+            # e.g. "PC" -> 1st class Cherbourg, "SOTON" -> Southampton working class, "NUMERIC" -> often 3rd class
+            frames[i]['TicketPrefix'] = df['Ticket'].apply(get_ticket_prefix)
             frames[i] = frames[i].drop(columns=['Ticket'])
 
     # FareRankByClass: within-Pclass fare percentile (computed from train only, applied to val)
@@ -459,18 +473,20 @@ cat_val_auc = roc_auc_score(y_val, cat_val_preds)
 print(f"CatBoost seed-ensemble Val AUC: {cat_val_auc:.6f}")
 
 # Enrich meta-learner with nonlinear terms and domain anchors
-_wc_tr = X_train['WomenChild'].values.astype(float)
-_wc_va = X_val['WomenChild'].values.astype(float)
+# Use WomenChildPclass/3 instead of binary WomenChild: 4-level signal (0, 1/3, 2/3, 1)
+# capturing the survival gradient across classes — 3rd class women/children ~50%, 1st class ~97%
+# This allows the meta-learner to calibrate differently for high vs low class women/children
+_wc_tr = X_train['WomenChildPclass'].values.astype(float) / 3.0
+_wc_va = X_val['WomenChildPclass'].values.astype(float) / 3.0
 _tgs_tr = X_train['TicketGroupSurvival'].values.astype(float) if 'TicketGroupSurvival' in X_train.columns else np.full(len(X_train), y_train.mean())
 _tgs_va = X_val['TicketGroupSurvival'].values.astype(float) if 'TicketGroupSurvival' in X_val.columns else np.full(len(X_val), y_train.mean())
 
-# Extended interaction features for meta-learner:
-# - lgbm*cat: base nonlinear product (from exp 18)
-# - WomenChild, TGS: domain anchors (from exp 18)
-# - lgbm*WC, cat*WC: model-specific calibration for women/children subgroup
-#   (LR cannot learn "trust LGBM more than CatBoost for women/children" without this)
+# Extended interaction features for meta-learner (10 features, same structure as exp 19):
+# - lgbm*cat: base nonlinear product
+# - WCPclass (WomenChildPclass/3), TGS: domain anchors (richer than binary WomenChild)
+# - lgbm*WCPclass, cat*WCPclass: model-specific calibration across class-stratified sex/age groups
 # - lgbm*TGS, cat*TGS: model-specific calibration for ticket-group-survival signal
-# - WC*TGS: domain anchor for women/children in surviving groups (~100% survival rate)
+# - WCPclass*TGS: domain anchor for women/children in surviving groups
 meta_X_train = np.column_stack([
     lgbm_oof, cat_oof, lgbm_oof * cat_oof,
     _wc_tr, _tgs_tr,
@@ -501,8 +517,8 @@ print(f"Best meta C={best_c} (inner CV AUC={best_c_auc:.6f})")
 meta = LogisticRegression(C=best_c, random_state=42, max_iter=1000)
 meta.fit(meta_X_train, y_train)
 meta_coef = meta.coef_[0]
-_meta_feature_names = ['LGBM', 'CatBoost', 'LGBM*Cat', 'WomenChild', 'TGS',
-                       'LGBM*WC', 'Cat*WC', 'LGBM*TGS', 'Cat*TGS', 'WC*TGS']
+_meta_feature_names = ['LGBM', 'CatBoost', 'LGBM*Cat', 'WCPclass', 'TGS',
+                       'LGBM*WCPclass', 'Cat*WCPclass', 'LGBM*TGS', 'Cat*TGS', 'WCPclass*TGS']
 _coef_str = ', '.join([f"{n}={v:.4f}" for n, v in zip(_meta_feature_names, meta_coef)])
 print(f"Meta-learner weights: {_coef_str}")
 
