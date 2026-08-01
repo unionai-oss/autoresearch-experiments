@@ -91,7 +91,6 @@ train_transform = transforms.Compose(
             ])
         ], p=0.5),
         transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1),
-        transforms.RandomRotation(10),
         transforms.ToTensor(),
         transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
         transforms.RandomErasing(p=0.25),
@@ -130,14 +129,17 @@ val_loader = DataLoader(
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"[TRAIN] Device: {device}")
 
-# ConvNeXt V2-Tiny — 28M params, same scale as V1-Tiny but:
-#   - Global Response Normalization (GRN) layers replace Channel LayerNorm → better feature diversity
-#   - Pretrained with FCMAE (Fully Convolutional Masked Autoencoder) on ImageNet
-#   - Achieves 82.9% IN1K top-1 vs ConvNeXt V1-Tiny 82.1%
-# This is a direct architecture upgrade over the best exp 1 backbone at identical inference cost.
-model = timm.create_model("convnextv2_tiny", pretrained=True, num_classes=num_classes)
+# ConvNeXt-Small with IN22K pretraining — 50M params:
+#   - 1.75× more parameters than ConvNeXt V2-Tiny (28M) → greater model capacity
+#   - IN22K supervised pretraining on 14M images / 21K classes → much richer feature diversity
+#     than IN1K-only (1.28M images / 1K classes); satellite imagery benefits from broader
+#     object/texture vocabulary (vegetation, buildings, water, roads all present in IN22K)
+#   - fb_in22k_ft_in1k: Facebook's IN22K→IN1K fine-tune, well-validated transfer recipe
+#   - At 64×64 input, wall-clock is overhead-dominated: exp 4 showed 50M-param small model
+#     runs in 1475s (same budget as tiny's 1538s) — safe within 1800s limit
+model = timm.create_model("convnext_small.fb_in22k_ft_in1k", pretrained=True, num_classes=num_classes)
 model = model.to(device)
-print(f"[MODEL] convnextv2_tiny | params={sum(p.numel() for p in model.parameters()):,}")
+print(f"[MODEL] convnext_small.fb_in22k_ft_in1k | params={sum(p.numel() for p in model.parameters()):,}")
 
 # Mixed precision for faster training
 scaler = torch.cuda.amp.GradScaler()
