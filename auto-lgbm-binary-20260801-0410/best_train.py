@@ -107,6 +107,9 @@ def engineer(df_tr: pd.DataFrame, df_va: pd.DataFrame):
             df['WomenChild'] = (
                 (df['Sex'] == 'female') | (df['Age'] < 14)
             ).astype(np.int8)
+            if 'Pclass' in df.columns:
+                # Explicit class-stratified survival advantage: 1st class women/children ~97%, 3rd class ~50%
+                df['WomenChildPclass'] = df['WomenChild'] * (4 - df['Pclass'])
             if 'Parch' in df.columns and 'Pclass' in df.columns:
                 df['IsMother'] = (
                     (df['Sex'] == 'female') &
@@ -162,6 +165,10 @@ def engineer(df_tr: pd.DataFrame, df_va: pd.DataFrame):
     return frames[0], frames[1]
 
 
+# Save tickets before engineer() drops them — needed for OOF TicketGroupSurvival
+tickets_tr = X_tr_raw['Ticket'].reset_index(drop=True).copy() if 'Ticket' in X_tr_raw.columns else None
+tickets_va = X_va_raw['Ticket'].reset_index(drop=True).copy() if 'Ticket' in X_va_raw.columns else None
+
 X_train_raw_eng, X_val_raw_eng = engineer(X_tr_raw, X_va_raw)
 print(f"Engineered features ({len(X_train_raw_eng.columns)}): {X_train_raw_eng.columns.tolist()}")
 
@@ -216,6 +223,45 @@ for col in cat_cols:
 
 X_train_np = X_train.values.astype(np.float64)
 X_val_np = X_val.values.astype(np.float64)
+
+# OOF TicketGroupSurvival: leak-free target encoding by ticket group
+# Passengers sharing a ticket had correlated fates — this captures group survival signal
+# different from TicketFreq (group size) which doesn't tell you WHO survived
+if tickets_tr is not None:
+    _tgs_skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    tgs_train_arr = np.full(len(X_train), y_train.mean())
+
+    for _tr_idx, _va_idx in _tgs_skf.split(X_train, y_train):
+        _tr_tix = tickets_tr.iloc[_tr_idx]
+        _tr_y = y_train[_tr_idx]
+        _surv_map = {}
+        for _tix in _tr_tix.unique():
+            _m = (_tr_tix == _tix).values
+            if _m.sum() > 1:
+                _surv_map[_tix] = float(_tr_y[_m].mean())
+        _overall = float(_tr_y.mean())
+        _va_tix = tickets_tr.iloc[_va_idx]
+        tgs_train_arr[_va_idx] = np.array([_surv_map.get(t, _overall) for t in _va_tix])
+
+    # Val set: use full training ticket survival rates (leak-free — val labels not used)
+    _full_surv = {}
+    for _tix in tickets_tr.unique():
+        _m = (tickets_tr == _tix).values
+        if _m.sum() > 1:
+            _full_surv[_tix] = float(y_train[_m].mean())
+    _overall_full = float(y_train.mean())
+    if tickets_va is not None:
+        tgs_val_arr = np.array([_full_surv.get(t, _overall_full) for t in tickets_va])
+    else:
+        tgs_val_arr = np.full(len(X_val), _overall_full)
+
+    X_train['TicketGroupSurvival'] = tgs_train_arr
+    X_val['TicketGroupSurvival'] = tgs_val_arr
+    X_train_cat['TicketGroupSurvival'] = tgs_train_arr
+    X_val_cat['TicketGroupSurvival'] = tgs_val_arr
+    X_train_np = X_train.values.astype(np.float64)
+    X_val_np = X_val.values.astype(np.float64)
+    print(f"TicketGroupSurvival: train mean={tgs_train_arr.mean():.4f}, val mean={tgs_val_arr.mean():.4f}")
 
 LGBM_FIXED = {
     'objective': 'binary',
