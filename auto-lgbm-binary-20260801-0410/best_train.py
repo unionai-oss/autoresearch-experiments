@@ -28,7 +28,6 @@ class_mapping = {orig: encoded for encoded, orig in enumerate(le.classes_)}
 print(f"Class mapping: {class_mapping}")
 print(f"Raw columns: {X_raw.columns.tolist()}")
 
-# ── Train/val split on raw data ─────────────────────────────────────────────
 X_tr_raw, X_va_raw, y_train, y_val = train_test_split(
     X_raw, y_encoded, test_size=0.2, random_state=42, stratify=y_encoded
 )
@@ -39,7 +38,6 @@ y_train = np.asarray(y_train)
 y_val = np.asarray(y_val)
 
 
-# ── Feature Engineering ──────────────────────────────────────────────────────
 def get_title(name):
     m = re.search(r' ([A-Za-z]+)\.', str(name))
     title = m.group(1) if m else 'Unknown'
@@ -54,13 +52,8 @@ def get_title(name):
 
 
 def engineer(df_tr: pd.DataFrame, df_va: pd.DataFrame):
-    """
-    Compute group statistics from df_tr, apply to both.
-    Returns (X_train_eng, X_val_eng)
-    """
     frames = [df_tr.copy(), df_va.copy()]
 
-    # ── Step 1: Drop IDs and extract Title (needed for Age imputation) ─────────
     for i, df in enumerate(frames):
         if 'PassengerId' in df.columns:
             df = df.drop(columns=['PassengerId'])
@@ -69,8 +62,6 @@ def engineer(df_tr: pd.DataFrame, df_va: pd.DataFrame):
             df = df.drop(columns=['Name'])
         frames[i] = df
 
-    # ── Step 2: Smart Age imputation from training group medians ─────────────
-    # Must be computed from train only to avoid data leakage
     if 'Age' in frames[0].columns:
         age_group_med = frames[0].groupby(['Title', 'Pclass'])['Age'].median()
         overall_age_med = frames[0]['Age'].median()
@@ -88,40 +79,31 @@ def engineer(df_tr: pd.DataFrame, df_va: pd.DataFrame):
             df['Age'] = df.apply(fill_age, axis=1)
             frames[i] = df
 
-    # ── Step 3: Remaining features ────────────────────────────────────────────
     for i, df in enumerate(frames):
-        # Family size & groups
         if 'SibSp' in df.columns and 'Parch' in df.columns:
             df['FamilySize'] = df['SibSp'] + df['Parch'] + 1
             df['IsAlone'] = (df['FamilySize'] == 1).astype(np.int8)
-            # Alone=0, Small (2-4)=1, Large (5+)=2
             df['FamilyGroup'] = np.where(df['FamilySize'] == 1, 0,
                                  np.where(df['FamilySize'] <= 4, 1, 2)).astype(np.int8)
 
-        # Fare features
         if 'Fare' in df.columns:
             df['FareLog'] = np.log1p(df['Fare'])
             if 'FamilySize' in df.columns:
                 df['FarePerPerson'] = df['Fare'] / df['FamilySize'].clip(lower=1)
                 df['FarePerPersonLog'] = np.log1p(df['FarePerPerson'])
 
-        # Age features (now using properly imputed Age)
         if 'Age' in df.columns:
             df['IsChild'] = (df['Age'] < 14).astype(np.int8)
-            # Age bins: 0=child(0-12), 1=teen(13-18), 2=young(19-35), 3=mid(36-60), 4=senior(61+)
             df['AgeBin'] = pd.cut(
                 df['Age'], bins=[0, 12, 18, 35, 60, 150], labels=False
             ).fillna(0).astype(np.int8)
             if 'Pclass' in df.columns:
                 df['AgePclass'] = df['Age'] * df['Pclass']
 
-        # Adult male / mother flags — strong "women and children first" signals
         if 'Sex' in df.columns and 'Age' in df.columns:
             df['IsAdultMale'] = (
                 (df['Sex'] == 'male') & (df['Age'] >= 16)
             ).astype(np.int8)
-            # Combined "protected group" flag: captures interaction that
-            # IsAdultMale + IsChild alone don't cover (e.g. male teens 14-15)
             df['WomenChild'] = (
                 (df['Sex'] == 'female') | (df['Age'] < 14)
             ).astype(np.int8)
@@ -133,7 +115,6 @@ def engineer(df_tr: pd.DataFrame, df_va: pd.DataFrame):
                     (df['Pclass'] != 3)
                 ).astype(np.int8)
 
-        # Cabin: single-char 'D' is the unknown-cabin fill
         if 'Cabin' in df.columns:
             df['HasCabin'] = (df['Cabin'].str.len() > 1).astype(np.int8)
             df['Deck'] = df.apply(
@@ -142,22 +123,41 @@ def engineer(df_tr: pd.DataFrame, df_va: pd.DataFrame):
             )
             df = df.drop(columns=['Cabin'])
 
-        # Sex × Pclass interaction
         if 'Sex' in df.columns and 'Pclass' in df.columns:
             df['SexPclass'] = df['Sex'].astype(str) + '_' + df['Pclass'].astype(str)
 
-        # Title × Pclass interaction (finer-grained than SexPclass)
         if 'Title' in df.columns and 'Pclass' in df.columns:
             df['TitlePclass'] = df['Title'].astype(str) + '_' + df['Pclass'].astype(str)
 
         frames[i] = df
 
-    # Ticket frequency: computed from train, applied to both
     if 'Ticket' in frames[0].columns:
         ticket_freq = frames[0]['Ticket'].value_counts().to_dict()
         for i, df in enumerate(frames):
             frames[i]['TicketFreq'] = df['Ticket'].map(ticket_freq).fillna(1).astype(float)
             frames[i] = frames[i].drop(columns=['Ticket'])
+
+    # FareRankByClass: within-Pclass fare percentile (computed from train only, applied to val)
+    # Captures relative wealth within class — orthogonal to raw Fare and FarePerPerson
+    if 'Fare' in frames[0].columns and 'Pclass' in frames[0].columns:
+        frames[0]['FareRankByClass'] = 0.5  # default
+        frames[1]['FareRankByClass'] = 0.5
+        for pclass_val in sorted(frames[0]['Pclass'].dropna().unique()):
+            tr_mask = frames[0]['Pclass'] == pclass_val
+            va_mask = frames[1]['Pclass'] == pclass_val
+            tr_fares = frames[0].loc[tr_mask, 'Fare'].fillna(0).values
+            if len(tr_fares) == 0:
+                continue
+            # Training: standard percentile rank
+            frames[0].loc[tr_mask, 'FareRankByClass'] = (
+                pd.Series(tr_fares).rank(pct=True).values
+            )
+            # Val: rank each val fare against the training distribution
+            va_fares = frames[1].loc[va_mask, 'Fare'].fillna(0).values
+            if len(va_fares) > 0:
+                frames[1].loc[va_mask, 'FareRankByClass'] = np.array([
+                    float(np.mean(tr_fares <= f)) for f in va_fares
+                ])
 
     return frames[0], frames[1]
 
@@ -165,7 +165,6 @@ def engineer(df_tr: pd.DataFrame, df_va: pd.DataFrame):
 X_train_raw_eng, X_val_raw_eng = engineer(X_tr_raw, X_va_raw)
 print(f"Engineered features ({len(X_train_raw_eng.columns)}): {X_train_raw_eng.columns.tolist()}")
 
-# Identify column types from engineered train
 cat_cols = [c for c in X_train_raw_eng.columns
             if X_train_raw_eng[c].dtype == object
             or pd.api.types.is_string_dtype(X_train_raw_eng[c])
@@ -177,20 +176,17 @@ print(f"Num cols: {num_cols}")
 X_train = X_train_raw_eng.copy()
 X_val = X_val_raw_eng.copy()
 
-# Missingness indicators for columns with >5% missing in train
 miss_thresh = 0.05
 for col in X_train.columns:
     if X_train[col].isna().mean() > miss_thresh:
         X_train[f'{col}_missing'] = X_train[col].isna().astype(np.int8)
         X_val[f'{col}_missing'] = X_val[col].isna().astype(np.int8)
 
-# Impute numeric with train median
 for col in num_cols:
     med = X_train[col].median()
     X_train[col] = X_train[col].fillna(med)
     X_val[col] = X_val[col].fillna(med)
 
-# Ordinal-encode categorical columns (for LightGBM)
 enc_map = {}
 for col in cat_cols:
     train_vals = X_train[col].astype(str).fillna('__NaN__')
@@ -206,15 +202,12 @@ for col in cat_cols:
     X_train[col] = X_train[col].astype(int)
     X_val[col] = X_val[col].astype(int)
 
-# Get categorical feature indices for CatBoost
 all_cols = X_train.columns.tolist()
 cat_col_indices = [all_cols.index(c) for c in cat_cols]
 
 y_train = np.asarray(y_train)
 y_val = np.asarray(y_val)
 
-# For CatBoost: use DataFrame with object dtype for categorical columns
-# so CatBoost can handle them properly (not float array)
 X_train_cat = X_train.copy()
 X_val_cat = X_val.copy()
 for col in cat_cols:
@@ -224,7 +217,6 @@ for col in cat_cols:
 X_train_np = X_train.values.astype(np.float64)
 X_val_np = X_val.values.astype(np.float64)
 
-# ── LightGBM Optuna search ─────────────────────────────────────────────────
 LGBM_FIXED = {
     'objective': 'binary',
     'metric': 'auc',
@@ -287,7 +279,7 @@ lgbm_best_cv_auc = lgbm_study.best_value
 lgbm_best_params = lgbm_study.best_params
 print(f"LightGBM best CV AUC: {lgbm_best_cv_auc:.6f}")
 
-# ── CatBoost Optuna search ─────────────────────────────────────────────────
+
 def catboost_objective(trial):
     params = {
         'depth': trial.suggest_int('depth', 3, 7),
@@ -335,7 +327,6 @@ cat_best_cv_auc = cat_study.best_value
 cat_best_params = cat_study.best_params
 print(f"CatBoost best CV AUC: {cat_best_cv_auc:.6f}")
 
-# ── Build final model parameters ──────────────────────────────────────────
 lgbm_final_params = {**LGBM_FIXED, **lgbm_best_params, 'bagging_freq': 1}
 
 cat_final_params = {
@@ -349,9 +340,6 @@ cat_final_params = {
     'train_dir': '/tmp/catboost_info',
 }
 
-# ── OOF predictions for stacking meta-learner ─────────────────────────────
-# Train models on 4/5 folds, predict on held-out 1/5 fold.
-# Meta-learner trained on OOF (no val leakage); seed ensemble used for val.
 skf_oof = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 lgbm_oof = np.zeros(len(X_train))
 cat_oof = np.zeros(len(X_train))
@@ -364,7 +352,6 @@ for fold_tr_idx, fold_va_idx in skf_oof.split(X_train, y_train):
     X_ft_cat = X_train_cat.iloc[fold_tr_idx]
     X_fv_cat = X_train_cat.iloc[fold_va_idx]
 
-    # LightGBM OOF
     dtrain_fold = lgb.Dataset(X_ft, label=y_ft, categorical_feature=cat_cols,
                               free_raw_data=False)
     dval_fold = lgb.Dataset(X_fv, label=y_fv, categorical_feature=cat_cols,
@@ -377,7 +364,6 @@ for fold_tr_idx, fold_va_idx in skf_oof.split(X_train, y_train):
     )
     lgbm_oof[fold_va_idx] = m_lgbm.predict(X_fv)
 
-    # CatBoost OOF
     tr_pool = Pool(X_ft_cat, label=y_ft, cat_features=cat_cols)
     va_pool = Pool(X_fv_cat, label=y_fv, cat_features=cat_cols)
     m_cat = CatBoostClassifier(**cat_final_params, random_seed=42)
@@ -389,7 +375,6 @@ cat_oof_auc = roc_auc_score(y_train, cat_oof)
 print(f"LightGBM OOF AUC: {lgbm_oof_auc:.6f}")
 print(f"CatBoost OOF AUC: {cat_oof_auc:.6f}")
 
-# ── Final LightGBM: seed ensemble for val predictions ─────────────────────
 dtrain_full = lgb.Dataset(X_train, label=y_train, categorical_feature=cat_cols)
 dval_full = lgb.Dataset(X_val, label=y_val, categorical_feature=cat_cols)
 
@@ -413,7 +398,6 @@ lgbm_val_preds = np.mean(lgbm_preds_list, axis=0)
 lgbm_val_auc = roc_auc_score(y_val, lgbm_val_preds)
 print(f"LightGBM seed-ensemble Val AUC: {lgbm_val_auc:.6f}")
 
-# ── Final CatBoost: seed ensemble for val predictions ─────────────────────
 train_pool_full = Pool(X_train_cat, label=y_train, cat_features=cat_cols)
 val_pool_full = Pool(X_val_cat, label=y_val, cat_features=cat_cols)
 
@@ -428,9 +412,6 @@ cat_val_preds = np.mean(cat_preds_list, axis=0)
 cat_val_auc = roc_auc_score(y_val, cat_val_preds)
 print(f"CatBoost seed-ensemble Val AUC: {cat_val_auc:.6f}")
 
-# ── Stacking meta-learner ─────────────────────────────────────────────────
-# Train on OOF predictions (training data only — no val leakage).
-# Apply to seed-ensemble val predictions for final AUC.
 meta_X_train = np.column_stack([lgbm_oof, cat_oof])
 meta_X_val = np.column_stack([lgbm_val_preds, cat_val_preds])
 
