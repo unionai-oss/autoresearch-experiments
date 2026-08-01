@@ -503,19 +503,22 @@ cat_oof_l = safe_logit(cat_oof)
 lgbm_val_l = safe_logit(lgbm_val_preds)
 cat_val_l = safe_logit(cat_val_preds)
 
-# 13-feature meta-learner: extends exp 25's 10-feature logit-space design with
-# Pclass_norm and its interactions with base model logits.
-# WCPclass covers class signal for women/children; Pclass_norm fills the gap for adult males.
-# lgbm_l*Pclass and cat_l*Pclass allow class-stratified calibration of each model's logit.
+# 14-feature meta-learner: extends exp 26's 13-feature logit-space design with
+# TGS × Pclass_norm interaction.
+# This captures class-stratified trust in the group survival signal:
+# 1st class passengers with high TGS → very strong survival signal (high class + group survived)
+# 3rd class passengers with same TGS → weaker signal (class drag reduces group priority effect)
+# Currently missing: all TGS interactions are with model logits or WCPclass, but NOT with Pclass directly.
 meta_X_train = np.column_stack([
     lgbm_oof_l, cat_oof_l, lgbm_oof_l * cat_oof_l,
     _wc_tr, _tgs_tr,
     lgbm_oof_l * _wc_tr, cat_oof_l * _wc_tr,
     lgbm_oof_l * _tgs_tr, cat_oof_l * _tgs_tr,
     _wc_tr * _tgs_tr,
-    _pclass_tr,                          # NEW: direct Pclass signal for all passengers
-    lgbm_oof_l * _pclass_tr,             # NEW: class-stratified LGBM logit calibration
-    cat_oof_l * _pclass_tr,              # NEW: class-stratified CatBoost logit calibration
+    _pclass_tr,                          # direct Pclass signal for all passengers
+    lgbm_oof_l * _pclass_tr,             # class-stratified LGBM logit calibration
+    cat_oof_l * _pclass_tr,              # class-stratified CatBoost logit calibration
+    _tgs_tr * _pclass_tr,                # NEW: class-stratified group survival trust
 ])
 meta_X_val = np.column_stack([
     lgbm_val_l, cat_val_l, lgbm_val_l * cat_val_l,
@@ -526,10 +529,11 @@ meta_X_val = np.column_stack([
     _pclass_va,
     lgbm_val_l * _pclass_va,
     cat_val_l * _pclass_va,
+    _tgs_va * _pclass_va,                # NEW: class-stratified group survival trust
 ])
 
 # Tune meta-learner C via inner 5-fold CV using a StandardScaler+LR pipeline.
-# StandardScaler ensures L2 regularization (C) penalizes all 13 features equally,
+# StandardScaler ensures L2 regularization (C) penalizes all 14 features equally,
 # critical because logit features (~[-4,4]) and domain anchors ([0,1]) have very different scales.
 # Pipeline fits scaler within each CV fold (no leakage).
 from sklearn.model_selection import cross_val_score
@@ -559,7 +563,8 @@ meta.fit(meta_X_train_s, y_train)
 meta_coef = meta.coef_[0]
 _meta_feature_names = ['logit_LGBM', 'logit_Cat', 'logit_LGBM*logit_Cat', 'WCPclass', 'TGS',
                        'logitLGBM*WCPclass', 'logitCat*WCPclass', 'logitLGBM*TGS', 'logitCat*TGS',
-                       'WCPclass*TGS', 'Pclass_norm', 'logitLGBM*Pclass', 'logitCat*Pclass']
+                       'WCPclass*TGS', 'Pclass_norm', 'logitLGBM*Pclass', 'logitCat*Pclass',
+                       'TGS*Pclass_norm']
 _coef_str = ', '.join([f"{n}={v:.4f}" for n, v in zip(_meta_feature_names, meta_coef)])
 print(f"Meta-learner weights: {_coef_str}")
 
