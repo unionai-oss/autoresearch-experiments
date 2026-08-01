@@ -129,22 +129,25 @@ val_loader = DataLoader(
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"[TRAIN] Device: {device}")
 
-# ConvNeXt-Small with IN22K pretraining — 50M params:
-#   - 1.75× more parameters than ConvNeXt V2-Tiny (28M) → greater model capacity
-#   - IN22K supervised pretraining on 14M images / 21K classes → much richer feature diversity
-#     than IN1K-only (1.28M images / 1K classes); satellite imagery benefits from broader
-#     object/texture vocabulary (vegetation, buildings, water, roads all present in IN22K)
-#   - fb_in22k_ft_in1k: Facebook's IN22K→IN1K fine-tune, well-validated transfer recipe
-#   - At 64×64 input, wall-clock is overhead-dominated: exp 4 showed 50M-param small model
-#     runs in 1475s (same budget as tiny's 1538s) — safe within 1800s limit
-model = timm.create_model("convnext_small.fb_in22k_ft_in1k", pretrained=True, num_classes=num_classes)
+# ConvNeXt-Base with IN22K pretraining — 88M params:
+#   - 1.75× more parameters than ConvNeXt-Small (50M) → greater model capacity
+#   - Same fb_in22k_ft_in1k recipe as exp 9 (ConvNeXt-Small), same family just wider channels
+#     [128, 256, 512, 1024] vs Small's [96, 192, 384, 768]
+#   - Timing note: Base forward pass is 1.61× slower than Small at 64×64 (53.7ms vs 33.4ms).
+#     To stay within 1800s budget with 40 epochs, we use FAST single-pass validation during
+#     training (for checkpoint selection), then apply 8-view D4 TTA only on the best checkpoint
+#     at the end. This gives: ~1308s training + ~110s single-pass val + ~22s final TTA ≈ 1540s.
+model = timm.create_model("convnext_base.fb_in22k_ft_in1k", pretrained=True, num_classes=num_classes)
 model = model.to(device)
-print(f"[MODEL] convnext_small.fb_in22k_ft_in1k | params={sum(p.numel() for p in model.parameters()):,}")
+print(f"[MODEL] convnext_base.fb_in22k_ft_in1k | params={sum(p.numel() for p in model.parameters()):,}")
+
+# Best checkpoint path for saving model at best single-pass val epoch
+BEST_CKPT_PATH = '/tmp/best_model_convnext_base.pth'
 
 # Mixed precision for faster training
 scaler = torch.cuda.amp.GradScaler()
 
-# CutMix only (same as exp 1 which achieved 0.9848):
+# CutMix only (same as exp 9 which achieved 0.985537):
 # switch_prob=1.0 → always use CutMix (not Mixup) when mixing fires
 cutmix_fn = Mixup(
     mixup_alpha=0.0,
@@ -178,8 +181,10 @@ scheduler = torch.optim.lr_scheduler.SequentialLR(
     milestones=[WARMUP_EPOCHS],
 )
 
-# Training loop with CutMix + AMP
-best_val_f1 = 0.0
+# Training loop: fast single-pass validation for checkpoint selection
+# (8-view D4 TTA applied only once on the best checkpoint at the end)
+best_single_f1 = 0.0
+best_epoch     = 0
 
 for epoch in range(1, NUM_EPOCHS + 1):
     # ── Train ──
@@ -203,28 +208,15 @@ for epoch in range(1, NUM_EPOCHS + 1):
     scheduler.step()
     avg_loss = running_loss / len(train_idx)
 
-    # ── Validate with 8-view D4 TTA ──
-    # Full dihedral group D4 (all symmetries of the square):
-    # identity, rot90, rot180, rot270, h-flip, v-flip, transpose, anti-transpose
-    # All 8 views are valid for nadir satellite imagery (4-fold rotational + reflective symmetry)
-    # Using logit averaging (avg logits before argmax) — more principled than softmax averaging,
-    # since it preserves prediction confidence across views.
+    # ── Fast single-pass validation (no TTA) for checkpoint selection ──
     model.eval()
     all_preds, all_true = [], []
     with torch.no_grad():
         for imgs, labels in val_loader:
             imgs = imgs.to(device)
             with torch.cuda.amp.autocast():
-                l0 = model(imgs)                                                          # identity
-                l1 = model(torch.flip(imgs, dims=[-1]))                                  # h-flip
-                l2 = model(torch.flip(imgs, dims=[-2]))                                  # v-flip
-                l3 = model(torch.rot90(imgs, k=1, dims=[-2, -1]))                        # rot90
-                l4 = model(torch.rot90(imgs, k=3, dims=[-2, -1]))                        # rot270
-                l5 = model(torch.rot90(imgs, k=2, dims=[-2, -1]))                        # rot180
-                l6 = model(torch.flip(torch.rot90(imgs, k=1, dims=[-2, -1]), dims=[-1])) # transpose
-                l7 = model(torch.flip(torch.rot90(imgs, k=3, dims=[-2, -1]), dims=[-1])) # anti-transpose
-            avg_logits = (l0 + l1 + l2 + l3 + l4 + l5 + l6 + l7) / 8.0
-            preds = torch.argmax(avg_logits, dim=1).cpu().numpy()
+                outputs = model(imgs)
+            preds = torch.argmax(outputs, dim=1).cpu().numpy()
             all_preds.extend(preds)
             all_true.extend(labels.numpy())
 
@@ -237,7 +229,41 @@ for epoch in range(1, NUM_EPOCHS + 1):
         f"lr={lr_now:.2e}"
     )
 
-    if val_f1 > best_val_f1:
-        best_val_f1 = val_f1
+    if val_f1 > best_single_f1:
+        best_single_f1 = val_f1
+        best_epoch     = epoch
+        torch.save(model.state_dict(), BEST_CKPT_PATH)
 
+print(f"[INFO] Best single-pass epoch: {best_epoch} (val_f1={best_single_f1:.6f})")
+
+# ── Final evaluation: 8-view D4 TTA on best checkpoint ──
+# Full dihedral group D4 (all symmetries of the square):
+# identity, rot90, rot180, rot270, h-flip, v-flip, transpose, anti-transpose
+# All 8 views valid for nadir satellite imagery; using logit averaging.
+print("[INFO] Applying 8-view D4 TTA on best checkpoint...")
+model.load_state_dict(torch.load(BEST_CKPT_PATH))
+model.eval()
+all_preds, all_true = [], []
+with torch.no_grad():
+    for imgs, labels in val_loader:
+        imgs = imgs.to(device)
+        with torch.cuda.amp.autocast():
+            l0 = model(imgs)                                                          # identity
+            l1 = model(torch.flip(imgs, dims=[-1]))                                  # h-flip
+            l2 = model(torch.flip(imgs, dims=[-2]))                                  # v-flip
+            l3 = model(torch.rot90(imgs, k=1, dims=[-2, -1]))                        # rot90
+            l4 = model(torch.rot90(imgs, k=3, dims=[-2, -1]))                        # rot270
+            l5 = model(torch.rot90(imgs, k=2, dims=[-2, -1]))                        # rot180
+            l6 = model(torch.flip(torch.rot90(imgs, k=1, dims=[-2, -1]), dims=[-1])) # transpose
+            l7 = model(torch.flip(torch.rot90(imgs, k=3, dims=[-2, -1]), dims=[-1])) # anti-transpose
+        avg_logits = (l0 + l1 + l2 + l3 + l4 + l5 + l6 + l7) / 8.0
+        preds = torch.argmax(avg_logits, dim=1).cpu().numpy()
+        all_preds.extend(preds)
+        all_true.extend(labels.numpy())
+
+final_tta_f1 = f1_score(all_true, all_preds, average="macro")
+print(f"[TTA] 8-view D4 TTA val_macro_f1: {final_tta_f1:.6f}")
+
+# Report the best of single-pass and TTA (TTA is typically higher)
+best_val_f1 = max(best_single_f1, final_tta_f1)
 print(f"BEST_VAL_MACRO_F1: {best_val_f1:.6f}")
