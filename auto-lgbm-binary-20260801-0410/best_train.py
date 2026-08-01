@@ -487,6 +487,11 @@ _wc_tr = X_train['WomenChildPclass'].values.astype(float) / 3.0
 _wc_va = X_val['WomenChildPclass'].values.astype(float) / 3.0
 _tgs_tr = X_train['TicketGroupSurvival'].values.astype(float) if 'TicketGroupSurvival' in X_train.columns else np.full(len(X_train), y_train.mean())
 _tgs_va = X_val['TicketGroupSurvival'].values.astype(float) if 'TicketGroupSurvival' in X_val.columns else np.full(len(X_val), y_train.mean())
+# Pclass_norm: direct class signal for ALL passengers (not just women/children like WCPclass)
+# Maps 1st→1.0, 2nd→0.67, 3rd→0.33 — crucial for calibrating adult male predictions
+# where 1st class (~37% survival) vs 3rd class (~15%) is not captured by WCPclass alone
+_pclass_tr = (4.0 - X_train['Pclass'].values.astype(float)) / 3.0
+_pclass_va = (4.0 - X_val['Pclass'].values.astype(float)) / 3.0
 
 # Transform base model predictions to logit (log-odds) space before meta-learner.
 # LR is a linear classifier in log-odds space — feeding logit(p) makes the relationship
@@ -498,18 +503,19 @@ cat_oof_l = safe_logit(cat_oof)
 lgbm_val_l = safe_logit(lgbm_val_preds)
 cat_val_l = safe_logit(cat_val_preds)
 
-# 10-feature meta-learner (same structure as exp 19/24) but with logit base predictions:
-# - logit_lgbm, logit_cat: log-odds of base model predictions
-# - logit_lgbm * logit_cat: captures agreement (both high/low = positive, disagreement = negative)
-# - WCPclass, TGS: domain anchors (bounded [0,1] — not logit-transformed, kept in original scale)
-# - logit*WCPclass, logit*TGS interactions: subgroup-specific calibration
-# - WCPclass*TGS: domain anchor interaction
+# 13-feature meta-learner: extends exp 25's 10-feature logit-space design with
+# Pclass_norm and its interactions with base model logits.
+# WCPclass covers class signal for women/children; Pclass_norm fills the gap for adult males.
+# lgbm_l*Pclass and cat_l*Pclass allow class-stratified calibration of each model's logit.
 meta_X_train = np.column_stack([
     lgbm_oof_l, cat_oof_l, lgbm_oof_l * cat_oof_l,
     _wc_tr, _tgs_tr,
     lgbm_oof_l * _wc_tr, cat_oof_l * _wc_tr,
     lgbm_oof_l * _tgs_tr, cat_oof_l * _tgs_tr,
     _wc_tr * _tgs_tr,
+    _pclass_tr,                          # NEW: direct Pclass signal for all passengers
+    lgbm_oof_l * _pclass_tr,             # NEW: class-stratified LGBM logit calibration
+    cat_oof_l * _pclass_tr,              # NEW: class-stratified CatBoost logit calibration
 ])
 meta_X_val = np.column_stack([
     lgbm_val_l, cat_val_l, lgbm_val_l * cat_val_l,
@@ -517,10 +523,13 @@ meta_X_val = np.column_stack([
     lgbm_val_l * _wc_va, cat_val_l * _wc_va,
     lgbm_val_l * _tgs_va, cat_val_l * _tgs_va,
     _wc_va * _tgs_va,
+    _pclass_va,
+    lgbm_val_l * _pclass_va,
+    cat_val_l * _pclass_va,
 ])
 
 # Tune meta-learner C via inner 5-fold CV using a StandardScaler+LR pipeline.
-# StandardScaler ensures L2 regularization (C) penalizes all 10 features equally,
+# StandardScaler ensures L2 regularization (C) penalizes all 13 features equally,
 # critical because logit features (~[-4,4]) and domain anchors ([0,1]) have very different scales.
 # Pipeline fits scaler within each CV fold (no leakage).
 from sklearn.model_selection import cross_val_score
@@ -549,7 +558,8 @@ meta = LogisticRegression(C=best_c, random_state=42, max_iter=1000)
 meta.fit(meta_X_train_s, y_train)
 meta_coef = meta.coef_[0]
 _meta_feature_names = ['logit_LGBM', 'logit_Cat', 'logit_LGBM*logit_Cat', 'WCPclass', 'TGS',
-                       'logitLGBM*WCPclass', 'logitCat*WCPclass', 'logitLGBM*TGS', 'logitCat*TGS', 'WCPclass*TGS']
+                       'logitLGBM*WCPclass', 'logitCat*WCPclass', 'logitLGBM*TGS', 'logitCat*TGS',
+                       'WCPclass*TGS', 'Pclass_norm', 'logitLGBM*Pclass', 'logitCat*Pclass']
 _coef_str = ', '.join([f"{n}={v:.4f}" for n, v in zip(_meta_feature_names, meta_coef)])
 print(f"Meta-learner weights: {_coef_str}")
 
