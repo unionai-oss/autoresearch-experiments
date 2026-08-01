@@ -18,10 +18,8 @@ print(f"[DATA] Native image size: {native_w}x{native_h}, channels={n_channels}")
 # Handle grayscale vs RGB
 if n_channels == 1:
     img_channels = 1
-    grayscale_transform = [transforms.Grayscale(num_output_channels=1)]
 else:
     img_channels = n_channels
-    grayscale_transform = []
 
 # Build full dataset (no transform yet — used for splitting)
 dataset = ImageFolder(DATA_PATH)
@@ -64,6 +62,8 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.utils.data.sampler import SubsetRandomSampler
 import timm
+from timm.data.mixup import Mixup
+from timm.loss import SoftTargetCrossEntropy
 from sklearn.metrics import f1_score
 
 # ImageNet normalization for ImageNet-pretrained backbone
@@ -76,13 +76,14 @@ if img_channels == 1:
 else:
     _ch_pre = []
 
-# Override skeleton transforms with ImageNet normalization + Tier-C augmentation
+# Training transform — augmentation including random crop, flip, jitter, erasing
 train_transform = transforms.Compose(
     _ch_pre + [
         transforms.Resize((native_h, native_w)),
         transforms.RandomHorizontalFlip(),
         transforms.RandomVerticalFlip(),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+        transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1),
+        transforms.RandomRotation(15),
         transforms.ToTensor(),
         transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
         transforms.RandomErasing(p=0.25),
@@ -121,20 +122,36 @@ val_loader = DataLoader(
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"[TRAIN] Device: {device}")
 
-# EfficientNet-B2 — Tier C backbone for N=10k–50k satellite imagery
-model = timm.create_model("efficientnet_b2", pretrained=True, num_classes=num_classes)
+# ConvNeXt-Tiny — 28M params, stronger than EfficientNet-B2 on benchmarks
+# Modern architecture with depthwise convolutions, outperforms EfficientNet at similar speed
+model = timm.create_model("convnext_tiny", pretrained=True, num_classes=num_classes)
 model = model.to(device)
-print(f"[MODEL] efficientnet_b2 | params={sum(p.numel() for p in model.parameters()):,}")
+print(f"[MODEL] convnext_tiny | params={sum(p.numel() for p in model.parameters()):,}")
 
-# Optimizer + cosine LR schedule — full fine-tune from epoch 0
+# Mixed precision for faster training (reduces memory, allows AMP speedup)
+scaler = torch.cuda.amp.GradScaler()
+
+# CutMix augmentation — proven to push classification benchmarks 0.5-1% higher
+# switch_prob=1.0 → always use CutMix (not Mixup) when mixing fires
+cutmix_fn = Mixup(
+    mixup_alpha=0.0,
+    cutmix_alpha=1.0,
+    prob=0.5,
+    switch_prob=1.0,
+    mode='batch',
+    label_smoothing=0.1,
+    num_classes=num_classes,
+)
+
+# SoftTargetCrossEntropy handles the soft labels produced by CutMix
+criterion = SoftTargetCrossEntropy()
+
+# Optimizer + cosine LR — full fine-tune from epoch 0
 NUM_EPOCHS = 40
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS, eta_min=1e-6)
 
-# Loss: standard CE (class ratio 1863/1195 ≈ 1.56× — below 2× threshold)
-criterion = nn.CrossEntropyLoss()
-
-# Training loop
+# Training loop with CutMix + AMP
 best_val_f1 = 0.0
 
 for epoch in range(1, NUM_EPOCHS + 1):
@@ -143,24 +160,39 @@ for epoch in range(1, NUM_EPOCHS + 1):
     running_loss = 0.0
     for imgs, labels in train_loader:
         imgs, labels = imgs.to(device), labels.to(device)
+
+        # Apply CutMix — converts integer labels to soft one-hot targets
+        imgs, soft_labels = cutmix_fn(imgs, labels)
+
         optimizer.zero_grad()
-        outputs = model(imgs)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
+        with torch.cuda.amp.autocast():
+            outputs = model(imgs)
+            loss = criterion(outputs, soft_labels)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
         running_loss += loss.item() * imgs.size(0)
 
     scheduler.step()
     avg_loss = running_loss / len(train_idx)
 
-    # ── Validate ──
+    # ── Validate with 3-view TTA (original + h-flip + v-flip) ──
     model.eval()
     all_preds = []
     all_true  = []
     with torch.no_grad():
         for imgs, labels in val_loader:
             imgs = imgs.to(device)
-            preds = torch.argmax(model(imgs), dim=1).cpu().numpy()
+            with torch.cuda.amp.autocast():
+                # Original view
+                probs_orig  = torch.softmax(model(imgs), dim=1)
+                # Horizontal flip
+                probs_hflip = torch.softmax(model(torch.flip(imgs, dims=[-1])), dim=1)
+                # Vertical flip
+                probs_vflip = torch.softmax(model(torch.flip(imgs, dims=[-2])), dim=1)
+            # Average TTA predictions
+            avg_probs = (probs_orig + probs_hflip + probs_vflip) / 3.0
+            preds = torch.argmax(avg_probs, dim=1).cpu().numpy()
             all_preds.extend(preds)
             all_true.extend(labels.numpy())
 

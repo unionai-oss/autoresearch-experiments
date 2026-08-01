@@ -1,1 +1,2 @@
 experiment_id,description,model_name,metric_name,metric_value,improved,duration_s,commit,notes
+0,"baseline: EfficientNet-B2 full fine-tune (timm, ImageNet pretrained) with AdamW + cosine LR for 40 epochs — Tier C choice for N=16,200 satellite imagery (EuroSAT-style 10-class land-use), with ImageNet normalization, flip/jitter/erase augmentation, and standard CrossEntropy (class ratio 1.56×, below focal-loss threshold)",,macro_f1,0.961997,true,1256.0,2d6d5ff,
