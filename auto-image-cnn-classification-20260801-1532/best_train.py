@@ -201,22 +201,28 @@ for epoch in range(1, NUM_EPOCHS + 1):
     scheduler.step()
     avg_loss = running_loss / len(train_idx)
 
-    # ── Validate with 5-view TTA ──
-    # Views: original, h-flip, v-flip, rot90, rot270
-    # All 4 rotational symmetries are natural for nadir satellite imagery
+    # ── Validate with 8-view D4 TTA ──
+    # Full dihedral group D4 (all symmetries of the square):
+    # identity, rot90, rot180, rot270, h-flip, v-flip, transpose, anti-transpose
+    # All 8 views are valid for nadir satellite imagery (4-fold rotational + reflective symmetry)
+    # Using logit averaging (avg logits before argmax) — more principled than softmax averaging,
+    # since it preserves prediction confidence across views.
     model.eval()
     all_preds, all_true = [], []
     with torch.no_grad():
         for imgs, labels in val_loader:
             imgs = imgs.to(device)
             with torch.cuda.amp.autocast():
-                p0 = torch.softmax(model(imgs), dim=1)
-                p1 = torch.softmax(model(torch.flip(imgs, dims=[-1])), dim=1)
-                p2 = torch.softmax(model(torch.flip(imgs, dims=[-2])), dim=1)
-                p3 = torch.softmax(model(torch.rot90(imgs, k=1, dims=[-2, -1])), dim=1)
-                p4 = torch.softmax(model(torch.rot90(imgs, k=3, dims=[-2, -1])), dim=1)
-            avg_probs = (p0 + p1 + p2 + p3 + p4) / 5.0
-            preds = torch.argmax(avg_probs, dim=1).cpu().numpy()
+                l0 = model(imgs)                                                          # identity
+                l1 = model(torch.flip(imgs, dims=[-1]))                                  # h-flip
+                l2 = model(torch.flip(imgs, dims=[-2]))                                  # v-flip
+                l3 = model(torch.rot90(imgs, k=1, dims=[-2, -1]))                        # rot90
+                l4 = model(torch.rot90(imgs, k=3, dims=[-2, -1]))                        # rot270
+                l5 = model(torch.rot90(imgs, k=2, dims=[-2, -1]))                        # rot180
+                l6 = model(torch.flip(torch.rot90(imgs, k=1, dims=[-2, -1]), dims=[-1])) # transpose
+                l7 = model(torch.flip(torch.rot90(imgs, k=3, dims=[-2, -1]), dims=[-1])) # anti-transpose
+            avg_logits = (l0 + l1 + l2 + l3 + l4 + l5 + l6 + l7) / 8.0
+            preds = torch.argmax(avg_logits, dim=1).cpu().numpy()
             all_preds.extend(preds)
             all_true.extend(labels.numpy())
 
