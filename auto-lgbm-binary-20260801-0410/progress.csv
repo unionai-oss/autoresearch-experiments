@@ -1,1 +1,2 @@
 experiment_id,description,model_name,metric_name,metric_value,improved,duration_s,commit,notes
+0,"baseline: LightGBM binary classifier with Optuna TPE search (60 trials, 5-fold stratified CV) over num_leaves, learning_rate, min_child_samples, feature_fraction, bagging, L1/L2, max_depth — chosen because N=500 with 11 mixed features is squarely in Tier A where gradient boosting dominates; missing indicators added for high-miss columns, categorical features passed natively to LightGBM.",,roc_auc,0.917292,true,36.3,021031c,
