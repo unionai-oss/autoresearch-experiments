@@ -9,6 +9,7 @@ import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.preprocessing import LabelEncoder
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 import lightgbm as lgb
 from catboost import CatBoostClassifier, Pool
@@ -324,9 +325,61 @@ cat_best_cv_auc = cat_study.best_value
 cat_best_params = cat_study.best_params
 print(f"CatBoost best CV AUC: {cat_best_cv_auc:.6f}")
 
-# ── Final LightGBM: seed ensemble ─────────────────────────────────────────
+# ── Build final model parameters ──────────────────────────────────────────
 lgbm_final_params = {**LGBM_FIXED, **lgbm_best_params, 'bagging_freq': 1}
 
+cat_final_params = {
+    **cat_best_params,
+    'iterations': 600,
+    'eval_metric': 'AUC',
+    'od_type': 'Iter',
+    'od_wait': 50,
+    'verbose': False,
+    'task_type': 'CPU',
+    'train_dir': '/tmp/catboost_info',
+}
+
+# ── OOF predictions for stacking meta-learner ─────────────────────────────
+# Train models on 4/5 folds, predict on held-out 1/5 fold.
+# Meta-learner trained on OOF (no val leakage); seed ensemble used for val.
+skf_oof = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+lgbm_oof = np.zeros(len(X_train))
+cat_oof = np.zeros(len(X_train))
+
+for fold_tr_idx, fold_va_idx in skf_oof.split(X_train, y_train):
+    X_ft = X_train.iloc[fold_tr_idx]
+    y_ft = y_train[fold_tr_idx]
+    X_fv = X_train.iloc[fold_va_idx]
+    y_fv = y_train[fold_va_idx]
+    X_ft_cat = X_train_cat.iloc[fold_tr_idx]
+    X_fv_cat = X_train_cat.iloc[fold_va_idx]
+
+    # LightGBM OOF
+    dtrain_fold = lgb.Dataset(X_ft, label=y_ft, categorical_feature=cat_cols,
+                              free_raw_data=False)
+    dval_fold = lgb.Dataset(X_fv, label=y_fv, categorical_feature=cat_cols,
+                            free_raw_data=False)
+    m_lgbm = lgb.train(
+        lgbm_final_params, dtrain_fold, num_boost_round=2000,
+        valid_sets=[dval_fold],
+        callbacks=[lgb.early_stopping(stopping_rounds=50, verbose=False),
+                   lgb.log_evaluation(period=-1)],
+    )
+    lgbm_oof[fold_va_idx] = m_lgbm.predict(X_fv)
+
+    # CatBoost OOF
+    tr_pool = Pool(X_ft_cat, label=y_ft, cat_features=cat_cols)
+    va_pool = Pool(X_fv_cat, label=y_fv, cat_features=cat_cols)
+    m_cat = CatBoostClassifier(**cat_final_params, random_seed=42)
+    m_cat.fit(tr_pool, eval_set=va_pool, use_best_model=True, verbose=False)
+    cat_oof[fold_va_idx] = m_cat.predict_proba(X_fv_cat)[:, 1]
+
+lgbm_oof_auc = roc_auc_score(y_train, lgbm_oof)
+cat_oof_auc = roc_auc_score(y_train, cat_oof)
+print(f"LightGBM OOF AUC: {lgbm_oof_auc:.6f}")
+print(f"CatBoost OOF AUC: {cat_oof_auc:.6f}")
+
+# ── Final LightGBM: seed ensemble for val predictions ─────────────────────
 dtrain_full = lgb.Dataset(X_train, label=y_train, categorical_feature=cat_cols)
 dval_full = lgb.Dataset(X_val, label=y_val, categorical_feature=cat_cols)
 
@@ -350,18 +403,7 @@ lgbm_val_preds = np.mean(lgbm_preds_list, axis=0)
 lgbm_val_auc = roc_auc_score(y_val, lgbm_val_preds)
 print(f"LightGBM seed-ensemble Val AUC: {lgbm_val_auc:.6f}")
 
-# ── Final CatBoost: seed ensemble ─────────────────────────────────────────
-cat_final_params = {
-    **cat_best_params,
-    'iterations': 600,
-    'eval_metric': 'AUC',
-    'od_type': 'Iter',
-    'od_wait': 50,
-    'verbose': False,
-    'task_type': 'CPU',
-    'train_dir': '/tmp/catboost_info',
-}
-
+# ── Final CatBoost: seed ensemble for val predictions ─────────────────────
 train_pool_full = Pool(X_train_cat, label=y_train, cat_features=cat_cols)
 val_pool_full = Pool(X_val_cat, label=y_val, cat_features=cat_cols)
 
@@ -376,13 +418,20 @@ cat_val_preds = np.mean(cat_preds_list, axis=0)
 cat_val_auc = roc_auc_score(y_val, cat_val_preds)
 print(f"CatBoost seed-ensemble Val AUC: {cat_val_auc:.6f}")
 
-# ── Blend LightGBM + CatBoost ─────────────────────────────────────────────
-# Weight by CV AUC performance (determined from CV, not val set)
-lgbm_w = lgbm_best_cv_auc / (lgbm_best_cv_auc + cat_best_cv_auc)
-cat_w = 1.0 - lgbm_w
-val_preds = lgbm_w * lgbm_val_preds + cat_w * cat_val_preds
+# ── Stacking meta-learner ─────────────────────────────────────────────────
+# Train on OOF predictions (training data only — no val leakage).
+# Apply to seed-ensemble val predictions for final AUC.
+meta_X_train = np.column_stack([lgbm_oof, cat_oof])
+meta_X_val = np.column_stack([lgbm_val_preds, cat_val_preds])
+
+meta = LogisticRegression(C=1.0, random_state=42, max_iter=1000)
+meta.fit(meta_X_train, y_train)
+meta_coef = meta.coef_[0]
+print(f"Meta-learner weights: LGBM={meta_coef[0]:.4f}, CatBoost={meta_coef[1]:.4f}")
+
+val_preds = meta.predict_proba(meta_X_val)[:, 1]
 val_auc = roc_auc_score(y_val, val_preds)
-print(f"Blend ({lgbm_w:.2f} LGBM + {cat_w:.2f} CatBoost) Val AUC: {val_auc:.6f}")
+print(f"Stacked Val AUC: {val_auc:.6f}")
 print(f"Individual: LGBM={lgbm_val_auc:.6f}, CatBoost={cat_val_auc:.6f}")
 
 print(f"BEST_VAL_ROC_AUC: {val_auc:.6f}")
