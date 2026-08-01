@@ -458,13 +458,22 @@ cat_val_preds = np.mean(cat_preds_list, axis=0)
 cat_val_auc = roc_auc_score(y_val, cat_val_preds)
 print(f"CatBoost seed-ensemble Val AUC: {cat_val_auc:.6f}")
 
-meta_X_train = np.column_stack([lgbm_oof, cat_oof])
-meta_X_val = np.column_stack([lgbm_val_preds, cat_val_preds])
+# Enrich meta-learner with nonlinear term and domain anchors
+_wc_tr = X_train['WomenChild'].values.astype(float)
+_wc_va = X_val['WomenChild'].values.astype(float)
+_tgs_tr = X_train['TicketGroupSurvival'].values.astype(float) if 'TicketGroupSurvival' in X_train.columns else np.full(len(X_train), y_train.mean())
+_tgs_va = X_val['TicketGroupSurvival'].values.astype(float) if 'TicketGroupSurvival' in X_val.columns else np.full(len(X_val), y_train.mean())
+
+# Product term: LR cannot learn lgbm*cat interaction from [lgbm, cat] alone
+# WomenChild: domain anchor — strongest survival predictor, corrects edge-case mispredictions
+# TicketGroupSurvival: group-level survival anchor for confused individual predictions
+meta_X_train = np.column_stack([lgbm_oof, cat_oof, lgbm_oof * cat_oof, _wc_tr, _tgs_tr])
+meta_X_val = np.column_stack([lgbm_val_preds, cat_val_preds, lgbm_val_preds * cat_val_preds, _wc_va, _tgs_va])
 
 meta = LogisticRegression(C=1.0, random_state=42, max_iter=1000)
 meta.fit(meta_X_train, y_train)
 meta_coef = meta.coef_[0]
-print(f"Meta-learner weights: LGBM={meta_coef[0]:.4f}, CatBoost={meta_coef[1]:.4f}")
+print(f"Meta-learner weights: LGBM={meta_coef[0]:.4f}, CatBoost={meta_coef[1]:.4f}, Product={meta_coef[2]:.4f}, WomenChild={meta_coef[3]:.4f}, TGS={meta_coef[4]:.4f}")
 
 val_preds = meta.predict_proba(meta_X_val)[:, 1]
 val_auc = roc_auc_score(y_val, val_preds)
