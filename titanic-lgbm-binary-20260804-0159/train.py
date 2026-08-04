@@ -159,6 +159,9 @@ def engineer_features(X):
     df['LogFare'] = np.log1p(df['Fare'])
     df['FarePerPerson'] = df['Fare'] / df['FamilySize']
     df['LogFarePerPerson'] = np.log1p(df['FarePerPerson'])
+    # Fare rank within Pclass — within each class, higher fare → better deck/cabin position
+    # Captures cabin quality proxy orthogonal to absolute fare scale (LogFare) and class (Pclass)
+    df['FareRankInClass'] = df.groupby('Pclass')['Fare'].transform(lambda x: x.rank(pct=True))
 
     # Age bin categories
     df['AgeBin'] = pd.cut(
