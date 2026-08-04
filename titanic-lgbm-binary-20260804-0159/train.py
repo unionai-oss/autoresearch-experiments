@@ -23,6 +23,87 @@ print(f"Dataset: {len(df)} samples, {X_raw.shape[1]} raw features")
 print(f"Class distribution: {dict(zip(*np.unique(y, return_counts=True)))}")
 
 # ================================================
+# Pre-compute raw identifiers for fold-aware survival features
+# Stored as numpy arrays (positional), NOT added to X_raw to avoid polluting features
+# ================================================
+_surnames = X_raw['Name'].str.extract(r'^([^,]+),', expand=False).fillna('Unknown').values
+_tickets = X_raw['Ticket'].fillna('UNKNOWN').values
+
+
+def get_fold_survival_features(tr_idx, va_idx):
+    """
+    Compute family (surname) and ticket group survival rates using ONLY training fold data.
+    This is cross-validated Bayesian target encoding — no target leakage.
+
+    Training data: LOO encoding — self excluded from group stat to prevent memorization.
+    Validation data: standard smoothed encoding using all training stats.
+    Smoothing: rate = (n*obs_rate + k*global_mean) / (n + k), k=3
+    """
+    y_tr = y[tr_idx]
+    global_mean = float(y_tr.mean())
+    smooth_k = 3.0
+
+    def compute_encoding(keys_tr, keys_va, y_tr_vals):
+        keys_tr_arr = np.asarray(keys_tr)
+        keys_va_arr = np.asarray(keys_va)
+        y_tr_arr = np.asarray(y_tr_vals, dtype=float)
+
+        # Map string keys to integer group indices
+        unique_keys = np.unique(keys_tr_arr)
+        key_to_int = {k: i for i, k in enumerate(unique_keys)}
+
+        tr_int_idx = np.array([key_to_int[k] for k in keys_tr_arr])
+
+        # Accumulate group-level sum and count
+        n_groups = len(unique_keys)
+        group_sum = np.zeros(n_groups)
+        group_count = np.zeros(n_groups, dtype=float)
+        np.add.at(group_sum, tr_int_idx, y_tr_arr)
+        np.add.at(group_count, tr_int_idx, 1.0)
+
+        # Training: LOO — subtract self from group stats
+        loo_sum = group_sum[tr_int_idx] - y_tr_arr
+        loo_count = group_count[tr_int_idx] - 1.0
+        # Smoothed LOO rate; for singletons (loo_count==0), fall back to global mean
+        with np.errstate(invalid='ignore', divide='ignore'):
+            loo_rate = np.where(loo_count > 0, loo_sum / loo_count, global_mean)
+        tr_encoded = np.where(
+            loo_count > 0,
+            (loo_count * loo_rate + smooth_k * global_mean) / (loo_count + smooth_k),
+            global_mean
+        )
+
+        # Validation: use full training group stats with smoothing
+        va_encoded = np.full(len(keys_va_arr), global_mean)
+        for i, kv in enumerate(keys_va_arr):
+            if kv in key_to_int:
+                gi = key_to_int[kv]
+                n = group_count[gi]
+                r = group_sum[gi] / n
+                va_encoded[i] = (n * r + smooth_k * global_mean) / (n + smooth_k)
+
+        return tr_encoded, va_encoded
+
+    surname_tr_feat, surname_va_feat = compute_encoding(
+        _surnames[tr_idx], _surnames[va_idx], y_tr
+    )
+    ticket_tr_feat, ticket_va_feat = compute_encoding(
+        _tickets[tr_idx], _tickets[va_idx], y_tr
+    )
+
+    tr_features = pd.DataFrame({
+        'FamilySurvRate': surname_tr_feat,
+        'TicketSurvRate': ticket_tr_feat,
+    })
+    va_features = pd.DataFrame({
+        'FamilySurvRate': surname_va_feat,
+        'TicketSurvRate': ticket_va_feat,
+    })
+
+    return tr_features, va_features
+
+
+# ================================================
 # Feature Engineering (Titanic-specific)
 # ================================================
 CABIN_FILL = "B96 B98"  # fill value used for missing cabins in this dataset
@@ -43,7 +124,6 @@ def engineer_features(X):
     df['Title'] = df['Title'].map(title_map).fillna('Rare')
 
     # Age imputation by Title group median (Master ~ 4.5, Miss ~ 22, Mr ~ 30, etc.)
-    # This is more accurate than global median imputation for Titanic
     df['AgeIsNull'] = df['Age'].isna().astype(int)
     title_age_medians = df.groupby('Title')['Age'].median()
     global_age_median = df['Age'].median()
@@ -122,6 +202,7 @@ print(f"Final feature matrix: {X_final.shape}")
 
 # ================================================
 # Optuna TPE HPO with LightGBM (5-fold CV)
+# Includes fold-aware survival features computed without leakage
 # ================================================
 class_counts = np.bincount(y)
 scale_pos_weight = float(class_counts[0]) / float(class_counts[1])
@@ -151,19 +232,24 @@ def objective(trial):
     cv_scores = []
 
     for tr_idx, va_idx in skf.split(X_final, y):
-        X_tr = X_final.iloc[tr_idx]
-        y_tr = y[tr_idx]
-        X_va = X_final.iloc[va_idx]
-        y_va = y[va_idx]
+        # Compute fold-aware family/ticket survival rates (no leakage)
+        tr_surv, va_surv = get_fold_survival_features(tr_idx, va_idx)
+
+        X_tr = pd.concat(
+            [X_final.iloc[tr_idx].reset_index(drop=True), tr_surv], axis=1
+        )
+        X_va = pd.concat(
+            [X_final.iloc[va_idx].reset_index(drop=True), va_surv], axis=1
+        )
 
         model = lgb.LGBMClassifier(**params)
         model.fit(
-            X_tr, y_tr,
-            eval_set=[(X_va, y_va)],
+            X_tr, y[tr_idx],
+            eval_set=[(X_va, y[va_idx])],
             callbacks=[lgb.early_stopping(stopping_rounds=40, verbose=False)],
         )
         preds = model.predict_proba(X_va)[:, 1]
-        cv_scores.append(roc_auc_score(y_va, preds))
+        cv_scores.append(roc_auc_score(y[va_idx], preds))
 
     return float(np.mean(cv_scores))
 
@@ -181,8 +267,7 @@ print(f"Best params: {best_params}")
 
 # ================================================
 # Final OOF evaluation: multi-seed LightGBM ensemble
-# Train 5 independent seeds of the best params, average OOF predictions
-# to reduce variance — simple and reliable for small tabular datasets
+# Includes fold-aware survival features — same CV structure as Optuna HPO
 # ================================================
 base_params = {
     "objective": "binary",
@@ -211,15 +296,20 @@ for seed_i, seed in enumerate(SEEDS):
     oof_preds_seed = np.zeros(len(y))
 
     for fold_i, (tr_idx, va_idx) in enumerate(skf.split(X_final, y)):
-        X_tr = X_final.iloc[tr_idx]
-        y_tr = y[tr_idx]
-        X_va = X_final.iloc[va_idx]
-        y_va = y[va_idx]
+        # Compute fold-aware family/ticket survival rates (no leakage)
+        tr_surv, va_surv = get_fold_survival_features(tr_idx, va_idx)
+
+        X_tr = pd.concat(
+            [X_final.iloc[tr_idx].reset_index(drop=True), tr_surv], axis=1
+        )
+        X_va = pd.concat(
+            [X_final.iloc[va_idx].reset_index(drop=True), va_surv], axis=1
+        )
 
         model = lgb.LGBMClassifier(**params)
         model.fit(
-            X_tr, y_tr,
-            eval_set=[(X_va, y_va)],
+            X_tr, y[tr_idx],
+            eval_set=[(X_va, y[va_idx])],
             callbacks=[lgb.early_stopping(stopping_rounds=50, verbose=False)],
         )
         oof_preds_seed[va_idx] = model.predict_proba(X_va)[:, 1]
