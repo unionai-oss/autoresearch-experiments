@@ -276,59 +276,60 @@ print(f"Best CV ROC-AUC (Optuna, 80 trials): {best_cv_score:.6f}")
 print(f"Best params: {best_params}")
 
 # ================================================
-# Final OOF evaluation: multi-seed LightGBM ensemble
-# Includes fold-aware survival features — same CV structure as Optuna HPO
+# Final OOF evaluation: top-K Optuna params × multi-seed ensemble
+# Uses top-5 distinct parameter configs × 3 seeds = 15 diverse models
+# Hyperparameter diversity (different tree structures) + seed diversity → lower correlation
 # ================================================
-base_params = {
+FIXED_PARAMS = {
     "objective": "binary",
     "metric": "auc",
     "verbosity": -1,
     "boosting_type": "gbdt",
-    "num_leaves": best_params["num_leaves"],
-    "learning_rate": best_params["learning_rate"],
-    "min_child_samples": best_params["min_child_samples"],
-    "feature_fraction": best_params["feature_fraction"],
-    "bagging_fraction": best_params["bagging_fraction"],
     "bagging_freq": 1,
-    "reg_alpha": best_params["reg_alpha"],
-    "reg_lambda": best_params["reg_lambda"],
-    "min_split_gain": best_params["min_split_gain"],
     "n_estimators": 2000,
     "scale_pos_weight": scale_pos_weight,
 }
 
-SEEDS = [42, 123, 456, 789, 1024]
+# Extract top-5 Optuna trials sorted by CV AUC (descending)
+valid_trials = [t for t in study.trials if t.value is not None]
+top_trials = sorted(valid_trials, key=lambda t: t.value, reverse=True)[:5]
+print(f"Top-5 Optuna trial values: {[round(t.value, 6) for t in top_trials]}")
+
+SEEDS = [42, 123, 456]  # 3 seeds × 5 configs = 15 models
 skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
 all_oof_preds = []
 
-for seed_i, seed in enumerate(SEEDS):
-    params = {**base_params, "random_state": seed}
-    oof_preds_seed = np.zeros(len(y))
+for config_i, trial in enumerate(top_trials):
+    trial_base_params = {**FIXED_PARAMS, **trial.params}
 
-    for fold_i, (tr_idx, va_idx) in enumerate(skf.split(X_final, y)):
-        # Compute fold-aware family/ticket survival rates (no leakage)
-        tr_surv, va_surv = get_fold_survival_features(tr_idx, va_idx)
+    for seed in SEEDS:
+        params = {**trial_base_params, "random_state": seed}
+        oof_preds_config_seed = np.zeros(len(y))
 
-        X_tr = pd.concat(
-            [X_final.iloc[tr_idx].reset_index(drop=True), tr_surv], axis=1
-        )
-        X_va = pd.concat(
-            [X_final.iloc[va_idx].reset_index(drop=True), va_surv], axis=1
-        )
+        for tr_idx, va_idx in skf.split(X_final, y):
+            # Compute fold-aware family/ticket survival rates (no leakage)
+            tr_surv, va_surv = get_fold_survival_features(tr_idx, va_idx)
 
-        model = lgb.LGBMClassifier(**params)
-        model.fit(
-            X_tr, y[tr_idx],
-            eval_set=[(X_va, y[va_idx])],
-            callbacks=[lgb.early_stopping(stopping_rounds=50, verbose=False)],
-        )
-        oof_preds_seed[va_idx] = model.predict_proba(X_va)[:, 1]
+            X_tr = pd.concat(
+                [X_final.iloc[tr_idx].reset_index(drop=True), tr_surv], axis=1
+            )
+            X_va = pd.concat(
+                [X_final.iloc[va_idx].reset_index(drop=True), va_surv], axis=1
+            )
 
-    seed_auc = roc_auc_score(y, oof_preds_seed)
-    print(f"  Seed {seed} OOF AUC: {seed_auc:.6f}")
-    all_oof_preds.append(oof_preds_seed)
+            model = lgb.LGBMClassifier(**params)
+            model.fit(
+                X_tr, y[tr_idx],
+                eval_set=[(X_va, y[va_idx])],
+                callbacks=[lgb.early_stopping(stopping_rounds=50, verbose=False)],
+            )
+            oof_preds_config_seed[va_idx] = model.predict_proba(X_va)[:, 1]
 
-# Average across seeds for variance reduction
+        config_seed_auc = roc_auc_score(y, oof_preds_config_seed)
+        print(f"  Config {config_i+1} (val={trial.value:.4f}), seed {seed} OOF AUC: {config_seed_auc:.6f}")
+        all_oof_preds.append(oof_preds_config_seed)
+
+# Average across all 15 models (hyperparameter diversity + seed diversity)
 oof_preds = np.mean(all_oof_preds, axis=0)
 val_roc_auc = roc_auc_score(y, oof_preds)
 print(f"BEST_VAL_ROC_AUC: {val_roc_auc:.6f}")
