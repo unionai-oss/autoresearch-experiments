@@ -139,6 +139,16 @@ def engineer_features(X):
     df['SmallFamily'] = ((df['FamilySize'] >= 2) & (df['FamilySize'] <= 4)).astype(int)
     df['LargeFamily'] = (df['FamilySize'] >= 5).astype(int)
 
+    # Group size features (using full dataset counts — no target leakage, just group cardinality)
+    # These act as reliability indicators for the fold-aware survival rate encodings:
+    # a singleton's FamilySurvRate = global_mean (low confidence), a group of 4 = high confidence
+    df['_Surname'] = df['Name'].str.extract(r'^([^,]+),', expand=False).fillna('Unknown')
+    df['SurnameGroupSize'] = df.groupby('_Surname')['_Surname'].transform('count')
+    df['TicketGroupSize'] = df.groupby('Ticket')['Ticket'].transform('count')
+    df['IsAloneFamily'] = (df['SurnameGroupSize'] == 1).astype(int)
+    df['IsAloneTicket'] = (df['TicketGroupSize'] == 1).astype(int)
+    df = df.drop(columns=['_Surname'])
+
     # Cabin features — "B96 B98" is the fill for missing cabin
     df['HasCabin'] = (df['Cabin'] != CABIN_FILL).astype(int)
     df['Deck'] = df.apply(
