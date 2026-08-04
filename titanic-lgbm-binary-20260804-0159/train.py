@@ -1,135 +1,145 @@
 import os
 DATA_PATH = os.environ.get("DATA_PATH", "/tmp/data")
 
+import sys
+sys.path.insert(0, '/home/flyte/.local/lib/python3.12/site-packages')
+
 import pandas as pd
-from sklearn.model_selection import train_test_split
+import numpy as np
+from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import roc_auc_score
+import lightgbm as lgb
+import optuna
+
+optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 df = pd.read_parquet(DATA_PATH)
-
 target_col = "Survived"
-X = df.drop(columns=[target_col])
-y = df[target_col]
+y = df[target_col].values.astype(int)
+X_raw = df.drop(columns=[target_col]).copy()
 
-le = LabelEncoder()
-y_encoded = le.fit_transform(y)
-class_mapping = {cls: idx for idx, cls in enumerate(le.classes_)}
-print(f"Class mapping: {class_mapping}")
+print(f"Dataset: {len(df)} samples, {X_raw.shape[1]} raw features")
+print(f"Class distribution: {dict(zip(*np.unique(y, return_counts=True)))}")
 
-X_train, X_val, y_train, y_val = train_test_split(
-    X, y_encoded, test_size=0.2, random_state=42, stratify=y_encoded
-)
+# ================================================
+# Feature Engineering (Titanic-specific)
+# ================================================
+CABIN_FILL = "B96 B98"  # fill value used for missing cabins in this dataset
 
-import numpy as np
-unique, counts = np.unique(y_encoded, return_counts=True)
-class_dist = {int(k): int(v) for k, v in zip(unique, counts)}
-print(f"Dataset summary: total samples={len(df)}, class distribution={class_dist}, train={len(X_train)}, val={len(X_val)}")
 
-# ---------- Feature Engineering ----------
-import lightgbm as lgb
-from sklearn.metrics import roc_auc_score
-from sklearn.model_selection import StratifiedKFold
-from sklearn.impute import SimpleImputer
+def engineer_features(X):
+    df = X.copy()
 
-# Make explicit copies to avoid SettingWithCopyWarning
-X_train = X_train.copy()
-X_val = X_val.copy()
-y_train = np.array(y_train)
-y_val = np.array(y_val)
+    # Title from Name — highly predictive for Titanic survival
+    df['Title'] = df['Name'].str.extract(r' ([A-Za-z]+)\.', expand=False)
+    title_map = {
+        'Mr': 'Mr', 'Miss': 'Miss', 'Mrs': 'Mrs', 'Master': 'Master',
+        'Dr': 'Rare', 'Rev': 'Rare', 'Col': 'Rare', 'Major': 'Rare',
+        'Mlle': 'Miss', 'Mme': 'Mrs', 'Don': 'Rare', 'Jonkheer': 'Rare',
+        'Lady': 'Rare', 'Countess': 'Rare', 'Capt': 'Rare', 'Sir': 'Rare',
+        'Ms': 'Mrs'
+    }
+    df['Title'] = df['Title'].map(title_map).fillna('Rare')
 
-# Identify column types
-cat_cols = X_train.select_dtypes(include=["object", "category"]).columns.tolist()
-num_cols = X_train.select_dtypes(include=[np.number]).columns.tolist()
-print(f"Categorical columns: {cat_cols}")
-print(f"Numeric columns: {num_cols}")
+    # Family size features
+    df['FamilySize'] = df['SibSp'] + df['Parch'] + 1
+    df['IsAlone'] = (df['FamilySize'] == 1).astype(int)
+    df['SmallFamily'] = ((df['FamilySize'] >= 2) & (df['FamilySize'] <= 4)).astype(int)
+    df['LargeFamily'] = (df['FamilySize'] >= 5).astype(int)
 
-# Add binary missingness-indicator flags for columns with >5% missing (computed on train)
-miss_thresh = 0.05
-for col in list(X_train.columns):
-    miss_rate = X_train[col].isna().mean()
-    if miss_rate > miss_thresh:
-        miss_col = f"{col}_missing"
-        X_train[miss_col] = X_train[col].isna().astype(int)
-        X_val[miss_col] = X_val[col].isna().astype(int)
-        print(f"  Added missingness indicator '{miss_col}' (train miss rate: {miss_rate:.1%})")
+    # Cabin features — "B96 B98" is the fill for missing cabin
+    df['HasCabin'] = (df['Cabin'] != CABIN_FILL).astype(int)
+    df['Deck'] = df.apply(
+        lambda r: r['Cabin'][0] if r['Cabin'] != CABIN_FILL else 'U', axis=1
+    )
 
-# Impute numeric columns with median (fit on train only)
-if num_cols:
-    num_imputer = SimpleImputer(strategy="median")
-    X_train[num_cols] = num_imputer.fit_transform(X_train[num_cols])
-    X_val[num_cols] = num_imputer.transform(X_val[num_cols])
+    # Fare features
+    df['LogFare'] = np.log1p(df['Fare'])
+    df['FarePerPerson'] = df['Fare'] / df['FamilySize']
+    df['LogFarePerPerson'] = np.log1p(df['FarePerPerson'])
 
-# Impute categorical columns with most-frequent, then label-encode for LightGBM
-if cat_cols:
-    cat_imputer = SimpleImputer(strategy="most_frequent")
-    X_train[cat_cols] = cat_imputer.fit_transform(X_train[cat_cols])
-    X_val[cat_cols] = cat_imputer.transform(X_val[cat_cols])
+    # Age bin categories
+    df['AgeBin'] = pd.cut(
+        df['Age'],
+        bins=[0, 12, 18, 35, 60, 200],
+        labels=['Child', 'Teen', 'YoungAdult', 'Adult', 'Senior']
+    )
 
-    for col in cat_cols:
-        le_cat = LabelEncoder()
-        X_train[col] = le_cat.fit_transform(X_train[col].astype(str))
-        # Handle any unseen categories in val
-        val_str = X_val[col].astype(str)
-        unseen = ~val_str.isin(le_cat.classes_)
-        if unseen.any():
-            val_str = val_str.copy()
-            val_str[unseen] = le_cat.classes_[0]
-        X_val[col] = le_cat.transform(val_str)
-        # Mark as categorical so LightGBM handles splits natively
-        X_train[col] = X_train[col].astype("category")
-        X_val[col] = X_val[col].astype("category")
+    # Interaction features
+    df['AgeClass'] = df['Age'] * df['Pclass']
+    df['LogFareClass'] = df['LogFare'] / (df['Pclass'] + 1e-6)
+    df['SexMale'] = (df['Sex'] == 'male').astype(int)
+    df['SexPclass'] = df['SexMale'] * df['Pclass']
+    df['MasterOrMiss'] = (df['Title'].isin(['Master', 'Miss'])).astype(int)
 
-# Class imbalance weight (549 vs 342 → ratio ~1.6, mild but worth setting)
-scale_pos_weight = class_dist[0] / class_dist[1]
+    # Ticket prefix — some tickets have letter prefixes (PC, SOTON, etc.)
+    df['TicketPrefix'] = (
+        df['Ticket'].str.extract(r'^([A-Za-z/. ]+)', expand=False)
+        .str.strip()
+        .fillna('N')
+    )
 
-# ---------- Grid-based HPO: 5-fold stratified CV on training set ----------
-import itertools
+    # Drop raw text/ID columns
+    df = df.drop(columns=['Name', 'Ticket', 'Cabin', 'PassengerId'])
 
-param_grid = {
-    "num_leaves": [31, 63, 127],
-    "learning_rate": [0.05, 0.1],
-    "min_child_samples": [10, 30],
-    "feature_fraction": [0.7, 1.0],
-    "bagging_fraction": [0.7, 1.0],
-    "reg_alpha": [0.0, 0.1],
-    "reg_lambda": [0.0, 0.1],
-}
+    return df
 
-keys = list(param_grid.keys())
-values = list(param_grid.values())
-all_combinations = list(itertools.product(*values))
 
-# Randomly sample up to 60 combinations
-rng = np.random.RandomState(42)
-indices = rng.choice(len(all_combinations), size=min(60, len(all_combinations)), replace=False)
-sampled_combinations = [all_combinations[i] for i in indices]
+X_eng = engineer_features(X_raw)
+print(f"Features after engineering: {X_eng.shape[1]}")
+print(f"Columns: {list(X_eng.columns)}")
 
-print(f"Starting grid search ({len(sampled_combinations)} trials, 5-fold CV)...")
+# Encode categoricals for LightGBM
+cat_cols = X_eng.select_dtypes(include=["object", "category"]).columns.tolist()
+num_cols = X_eng.select_dtypes(include=[np.number]).columns.tolist()
+print(f"Categorical cols: {cat_cols}")
+print(f"Numeric cols: {num_cols}")
 
-best_cv_score = -1.0
-best_params = None
+X_final = X_eng.copy()
+for col in cat_cols:
+    X_final[col] = X_final[col].astype(str)
+    le = LabelEncoder()
+    X_final[col] = le.fit_transform(X_final[col])
+    X_final[col] = X_final[col].astype('category')
 
-skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+print(f"Final feature matrix: {X_final.shape}")
 
-for combo in sampled_combinations:
-    params = dict(zip(keys, combo))
-    params.update({
+# ================================================
+# Optuna TPE HPO with LightGBM (5-fold CV)
+# ================================================
+class_counts = np.bincount(y)
+scale_pos_weight = float(class_counts[0]) / float(class_counts[1])
+
+
+def objective(trial):
+    params = {
         "objective": "binary",
         "metric": "auc",
         "verbosity": -1,
         "boosting_type": "gbdt",
+        "num_leaves": trial.suggest_int("num_leaves", 15, 150),
+        "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+        "min_child_samples": trial.suggest_int("min_child_samples", 5, 60),
+        "feature_fraction": trial.suggest_float("feature_fraction", 0.5, 1.0),
+        "bagging_fraction": trial.suggest_float("bagging_fraction", 0.5, 1.0),
         "bagging_freq": 1,
-        "scale_pos_weight": scale_pos_weight,
+        "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 5.0, log=True),
+        "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 5.0, log=True),
+        "min_split_gain": trial.suggest_float("min_split_gain", 0.0, 0.5),
         "n_estimators": 1000,
         "random_state": 42,
-    })
+        "scale_pos_weight": scale_pos_weight,
+    }
 
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     cv_scores = []
-    for tr_idx, va_idx in skf.split(X_train, y_train):
-        X_tr = X_train.iloc[tr_idx]
-        y_tr = y_train[tr_idx]
-        X_va = X_train.iloc[va_idx]
-        y_va = y_train[va_idx]
+
+    for tr_idx, va_idx in skf.split(X_final, y):
+        X_tr = X_final.iloc[tr_idx]
+        y_tr = y[tr_idx]
+        X_va = X_final.iloc[va_idx]
+        y_va = y[va_idx]
 
         model = lgb.LGBMClassifier(**params)
         model.fit(
@@ -140,29 +150,60 @@ for combo in sampled_combinations:
         preds = model.predict_proba(X_va)[:, 1]
         cv_scores.append(roc_auc_score(y_va, preds))
 
-    mean_score = float(np.mean(cv_scores))
-    if mean_score > best_cv_score:
-        best_cv_score = mean_score
-        best_params = params.copy()
+    return float(np.mean(cv_scores))
 
-print(f"Best CV ROC-AUC: {best_cv_score:.6f}")
+
+study = optuna.create_study(
+    direction="maximize",
+    sampler=optuna.samplers.TPESampler(seed=42)
+)
+study.optimize(objective, n_trials=80, show_progress_bar=False)
+
+best_cv_score = study.best_value
+best_params = study.best_params
+print(f"Best CV ROC-AUC (Optuna, 80 trials): {best_cv_score:.6f}")
 print(f"Best params: {best_params}")
 
-# ---------- Final model: best params, early-stopped on held-out val ----------
-final_params = best_params.copy()
-final_params["n_estimators"] = 2000
+# ================================================
+# Final OOF evaluation with best params (uses all 891 samples)
+# ================================================
+final_params = {
+    "objective": "binary",
+    "metric": "auc",
+    "verbosity": -1,
+    "boosting_type": "gbdt",
+    "num_leaves": best_params["num_leaves"],
+    "learning_rate": best_params["learning_rate"],
+    "min_child_samples": best_params["min_child_samples"],
+    "feature_fraction": best_params["feature_fraction"],
+    "bagging_fraction": best_params["bagging_fraction"],
+    "bagging_freq": 1,
+    "reg_alpha": best_params["reg_alpha"],
+    "reg_lambda": best_params["reg_lambda"],
+    "min_split_gain": best_params["min_split_gain"],
+    "n_estimators": 2000,
+    "random_state": 42,
+    "scale_pos_weight": scale_pos_weight,
+}
 
-final_model = lgb.LGBMClassifier(**final_params)
-final_model.fit(
-    X_train, y_train,
-    eval_set=[(X_val, y_val)],
-    callbacks=[
-        lgb.early_stopping(stopping_rounds=50, verbose=False),
-        lgb.log_evaluation(period=200),
-    ],
-)
+skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+oof_preds = np.zeros(len(y))
 
-val_preds = final_model.predict_proba(X_val)[:, 1]
-val_roc_auc = roc_auc_score(y_val, val_preds)
+for fold_i, (tr_idx, va_idx) in enumerate(skf.split(X_final, y)):
+    X_tr = X_final.iloc[tr_idx]
+    y_tr = y[tr_idx]
+    X_va = X_final.iloc[va_idx]
+    y_va = y[va_idx]
 
+    model = lgb.LGBMClassifier(**final_params)
+    model.fit(
+        X_tr, y_tr,
+        eval_set=[(X_va, y_va)],
+        callbacks=[lgb.early_stopping(stopping_rounds=50, verbose=False)],
+    )
+    oof_preds[va_idx] = model.predict_proba(X_va)[:, 1]
+    fold_auc = roc_auc_score(y_va, oof_preds[va_idx])
+    print(f"  Fold {fold_i + 1} AUC: {fold_auc:.6f}")
+
+val_roc_auc = roc_auc_score(y, oof_preds)
 print(f"BEST_VAL_ROC_AUC: {val_roc_auc:.6f}")
