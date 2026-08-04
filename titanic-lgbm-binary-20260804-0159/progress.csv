@@ -1,2 +1,4 @@
 experiment_id,description,model_name,metric_name,metric_value,improved,duration_s,commit,notes
 0,baseline: LightGBM with 60-trial Optuna TPO search (5-fold CV) — optimal for small tabular binary classification at N=891 with mixed numeric/categorical features,,roc_auc,0.838340,true,25.7,3979480,
+1,sdk_error_1,,roc_auc,0.885299,true,30.2,5436e51,
+2,"Enhanced feature engineering (ticket group size, title-based age imputation, WomanOrChild flag, cabin number, fare per ticket member) + added CatBoost with native categorical handling, ensembled 50/50 with LightGBM OOF predictions",,roc_auc,0.884061,false,29.4,,

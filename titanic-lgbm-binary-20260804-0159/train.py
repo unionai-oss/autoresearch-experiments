@@ -42,6 +42,17 @@ def engineer_features(X):
     }
     df['Title'] = df['Title'].map(title_map).fillna('Rare')
 
+    # Age imputation by Title group median (Master ~ 4.5, Miss ~ 22, Mr ~ 30, etc.)
+    # This is more accurate than global median imputation for Titanic
+    df['AgeIsNull'] = df['Age'].isna().astype(int)
+    title_age_medians = df.groupby('Title')['Age'].median()
+    global_age_median = df['Age'].median()
+    df['Age'] = df.apply(
+        lambda r: title_age_medians.get(r['Title'], global_age_median)
+        if pd.isna(r['Age']) else r['Age'],
+        axis=1
+    )
+
     # Family size features
     df['FamilySize'] = df['SibSp'] + df['Parch'] + 1
     df['IsAlone'] = (df['FamilySize'] == 1).astype(int)
@@ -72,6 +83,10 @@ def engineer_features(X):
     df['SexMale'] = (df['Sex'] == 'male').astype(int)
     df['SexPclass'] = df['SexMale'] * df['Pclass']
     df['MasterOrMiss'] = (df['Title'].isin(['Master', 'Miss'])).astype(int)
+    # Women and children first — strong survival signal
+    df['WomanOrChild'] = ((df['Sex'] == 'female') | (df['Age'] < 12)).astype(int)
+    # Age * Sex interaction: adult males far less likely to survive
+    df['AgeSexMale'] = df['Age'] * df['SexMale']
 
     # Ticket prefix — some tickets have letter prefixes (PC, SOTON, etc.)
     df['TicketPrefix'] = (
@@ -165,9 +180,11 @@ print(f"Best CV ROC-AUC (Optuna, 80 trials): {best_cv_score:.6f}")
 print(f"Best params: {best_params}")
 
 # ================================================
-# Final OOF evaluation with best params (uses all 891 samples)
+# Final OOF evaluation: multi-seed LightGBM ensemble
+# Train 5 independent seeds of the best params, average OOF predictions
+# to reduce variance — simple and reliable for small tabular datasets
 # ================================================
-final_params = {
+base_params = {
     "objective": "binary",
     "metric": "auc",
     "verbosity": -1,
@@ -182,28 +199,36 @@ final_params = {
     "reg_lambda": best_params["reg_lambda"],
     "min_split_gain": best_params["min_split_gain"],
     "n_estimators": 2000,
-    "random_state": 42,
     "scale_pos_weight": scale_pos_weight,
 }
 
+SEEDS = [42, 123, 456, 789, 1024]
 skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-oof_preds = np.zeros(len(y))
+all_oof_preds = []
 
-for fold_i, (tr_idx, va_idx) in enumerate(skf.split(X_final, y)):
-    X_tr = X_final.iloc[tr_idx]
-    y_tr = y[tr_idx]
-    X_va = X_final.iloc[va_idx]
-    y_va = y[va_idx]
+for seed_i, seed in enumerate(SEEDS):
+    params = {**base_params, "random_state": seed}
+    oof_preds_seed = np.zeros(len(y))
 
-    model = lgb.LGBMClassifier(**final_params)
-    model.fit(
-        X_tr, y_tr,
-        eval_set=[(X_va, y_va)],
-        callbacks=[lgb.early_stopping(stopping_rounds=50, verbose=False)],
-    )
-    oof_preds[va_idx] = model.predict_proba(X_va)[:, 1]
-    fold_auc = roc_auc_score(y_va, oof_preds[va_idx])
-    print(f"  Fold {fold_i + 1} AUC: {fold_auc:.6f}")
+    for fold_i, (tr_idx, va_idx) in enumerate(skf.split(X_final, y)):
+        X_tr = X_final.iloc[tr_idx]
+        y_tr = y[tr_idx]
+        X_va = X_final.iloc[va_idx]
+        y_va = y[va_idx]
 
+        model = lgb.LGBMClassifier(**params)
+        model.fit(
+            X_tr, y_tr,
+            eval_set=[(X_va, y_va)],
+            callbacks=[lgb.early_stopping(stopping_rounds=50, verbose=False)],
+        )
+        oof_preds_seed[va_idx] = model.predict_proba(X_va)[:, 1]
+
+    seed_auc = roc_auc_score(y, oof_preds_seed)
+    print(f"  Seed {seed} OOF AUC: {seed_auc:.6f}")
+    all_oof_preds.append(oof_preds_seed)
+
+# Average across seeds for variance reduction
+oof_preds = np.mean(all_oof_preds, axis=0)
 val_roc_auc = roc_auc_score(y, oof_preds)
 print(f"BEST_VAL_ROC_AUC: {val_roc_auc:.6f}")
